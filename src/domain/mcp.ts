@@ -1,3 +1,5 @@
+import { createHash, randomBytes } from "node:crypto";
+
 export type McpErrorCode =
 	| "E_AUTH_REQUIRED"
 	| "E_AUTH_FAILED"
@@ -92,6 +94,7 @@ export type AuthStoreAuthStatusInput = Record<string, never>;
 export interface AuthStoreAuthStatusOutput {
 	signed_in: boolean;
 	account: McpAuthAccount | null;
+	access_token_expires_at?: string;
 }
 
 export interface GraphMailSyncInitialSyncInput {
@@ -192,6 +195,17 @@ export interface McpAuthSession {
 	account: McpAuthAccount;
 	scopes: readonly string[];
 	state: string;
+	code_verifier: string;
+	code_challenge: string;
+	issued_at: string;
+}
+
+export interface McpAuthToken {
+	access_token: string;
+	refresh_token: string;
+	token_type: "Bearer";
+	refresh_token_expires_at: string;
+	expires_at: string;
 	issued_at: string;
 }
 
@@ -213,6 +227,7 @@ export interface McpRuntimeState {
 	attachments: Map<string, McpAttachmentRecord>;
 	deltaLinks: Map<string, string>;
 	signed_in: boolean;
+	auth_token: McpAuthToken | null;
 }
 
 export interface McpRuntimeContext {
@@ -258,6 +273,7 @@ const createRuntimeState = (): McpRuntimeState => ({
 	attachments: new Map(),
 	deltaLinks: new Map(),
 	signed_in: false,
+	auth_token: null,
 });
 
 export const createMcpContext = (
@@ -298,8 +314,111 @@ export const isSupportedMcpTool = (toolName: string): toolName is McpToolName =>
 const generateLoginState = (): string =>
 	`state_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
 
+const nowIso = (): string => new Date().toISOString();
+
+const generateCodeVerifier = (): string =>
+	randomBytes(48).toString("base64url").slice(0, 96);
+
+const generateCodeChallenge = (codeVerifier: string): string =>
+	createHash("sha256").update(codeVerifier).digest("base64url");
+
+const isTokenExpired = (value: string): boolean => {
+	const parsed = Date.parse(value);
+	if (Number.isNaN(parsed)) {
+		return true;
+	}
+
+	return parsed <= Date.now();
+};
+
+const isTokenValid = (token: McpAuthToken | null): boolean => {
+	if (token === null) {
+		return false;
+	}
+
+	return !isTokenExpired(token.expires_at);
+};
+
+const isRefreshTokenValid = (token: McpAuthToken): boolean =>
+	!isTokenExpired(token.refresh_token_expires_at);
+
+const nextTokenNonce = (): string =>
+	`${Date.now()}_${randomBytes(3).toString("hex")}`;
+
+const createMockAccessToken = (): string => `access_${nextTokenNonce()}`;
+
+const createMockRefreshToken = (): string => `refresh_${nextTokenNonce()}`;
+
+const buildAuthToken = (sessionState: McpAuthSession): McpAuthToken => ({
+	access_token: createMockAccessToken(),
+	refresh_token: createMockRefreshToken(),
+	token_type: "Bearer",
+	issued_at: nowIso(),
+	expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+	refresh_token_expires_at: new Date(
+		Date.now() + 24 * 60 * 60 * 1000,
+	).toISOString(),
+});
+
+const refreshAuthToken = (context: McpRuntimeContext): boolean => {
+	if (
+		context.state.auth_token === null ||
+		!isRefreshTokenValid(context.state.auth_token)
+	) {
+		return false;
+	}
+
+	context.state.auth_token = {
+		...context.state.auth_token,
+		access_token: createMockAccessToken(),
+		expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+		issued_at: nowIso(),
+	};
+
+	return true;
+};
+
+const requireAuthenticatedContext = (context: McpRuntimeContext) => {
+	if (!context.state.signed_in || context.state.account === null) {
+		return errorResponse("E_AUTH_REQUIRED", "로그인이 필요합니다.");
+	}
+
+	if (isTokenValid(context.state.auth_token)) {
+		return null;
+	}
+
+	if (context.state.auth_token === null) {
+		return errorResponse("E_AUTH_REQUIRED", "로그인이 필요합니다.");
+	}
+
+	if (!isRefreshTokenValid(context.state.auth_token)) {
+		context.state.signed_in = false;
+		context.state.account = null;
+		context.state.auth_token = null;
+		context.state.issued_session = null;
+		return errorResponse(
+			"E_AUTH_FAILED",
+			"refresh token이 만료되어 재로그인이 필요합니다.",
+			true,
+		);
+	}
+
+	const refreshed = refreshAuthToken(context);
+	if (!refreshed) {
+		context.state.signed_in = false;
+		context.state.account = null;
+		context.state.auth_token = null;
+		context.state.issued_session = null;
+		return errorResponse("E_AUTH_FAILED", "인증 갱신에 실패했습니다.", true);
+	}
+
+	return null;
+};
+
 const buildDeltaLink = (mailFolder: string): string =>
 	`${mailFolder}_${Date.now()}_delta`;
+
+const MAX_DAYS_BACK = 30;
 
 const isValidAuthInput = (input: AuthStoreStartLoginInput): boolean => {
 	return isArrayOfNonEmptyStrings(input.scopes) && input.scopes.length > 0;
@@ -333,6 +452,30 @@ const setThreadMessages = (
 	}
 };
 
+const mergeAttachmentPks = (
+	current: readonly string[],
+	next: readonly string[],
+): string[] => {
+	const attachmentPks = [...current, ...next];
+	return attachmentPks.filter(
+		(attachmentPk, index) => attachmentPks.indexOf(attachmentPk) === index,
+	);
+};
+
+const removeMessageAndAttachments = (
+	context: McpRuntimeContext,
+	messagePk: string,
+): void => {
+	context.state.messages.delete(messagePk);
+
+	for (const key of context.state.attachments.keys()) {
+		const [storedMessagePk] = key.split("::");
+		if (storedMessagePk === messagePk) {
+			context.state.attachments.delete(key);
+		}
+	}
+};
+
 const addMessage = (
 	context: McpRuntimeContext,
 	threadPk: string,
@@ -343,7 +486,9 @@ const addMessage = (
 };
 
 const hasContextSignedIn = (context: McpRuntimeContext): boolean =>
-	context.state.signed_in && context.state.account !== null;
+	context.state.signed_in && context.state.account !== null
+		? requireAuthenticatedContext(context) === null
+		: false;
 
 const handleAuthStoreStartLogin = (
 	context: McpRuntimeContext,
@@ -357,6 +502,8 @@ const handleAuthStoreStartLogin = (
 	}
 
 	const loginState = generateLoginState();
+	const codeVerifier = generateCodeVerifier();
+	const codeChallenge = generateCodeChallenge(codeVerifier);
 	context.state.issued_session = {
 		account: {
 			email: "",
@@ -364,7 +511,9 @@ const handleAuthStoreStartLogin = (
 		},
 		scopes: input.scopes,
 		state: loginState,
-		issued_at: new Date().toISOString(),
+		code_verifier: codeVerifier,
+		code_challenge: codeChallenge,
+		issued_at: nowIso(),
 	};
 
 	return okResponse<AuthStoreStartLoginOutput>({
@@ -372,7 +521,7 @@ const handleAuthStoreStartLogin = (
 			input.scopes.join(" "),
 		)}&state=${encodeURIComponent(loginState)}&redirect_uri=${encodeURIComponent(
 			fallbackUrl,
-		)}`,
+		)}&code_challenge=${encodeURIComponent(codeChallenge)}&code_challenge_method=S256`,
 		callback_url: fallbackUrl,
 	});
 };
@@ -393,6 +542,13 @@ const handleAuthStoreCompleteLogin = (
 		return errorResponse("E_AUTH_REQUIRED", "로그인 시작 정보가 없습니다.");
 	}
 
+	if (input.code_verifier !== context.state.issued_session.code_verifier) {
+		return errorResponse(
+			"E_AUTH_FAILED",
+			"code_verifier 값이 일치하지 않습니다.",
+		);
+	}
+
 	if (context.state.issued_session.state !== input.state) {
 		return errorResponse("E_AUTH_FAILED", "state 값이 일치하지 않습니다.");
 	}
@@ -403,6 +559,7 @@ const handleAuthStoreCompleteLogin = (
 	};
 	context.state.account = account;
 	context.state.signed_in = true;
+	context.state.auth_token = buildAuthToken(context.state.issued_session);
 
 	return okResponse<AuthStoreCompleteLoginOutput>({ account });
 };
@@ -414,14 +571,18 @@ const handleAuthStoreAuthStatus = (
 	okResponse<AuthStoreAuthStatusOutput>({
 		signed_in: hasContextSignedIn(context),
 		account: context.state.account,
+		...(context.state.auth_token
+			? { access_token_expires_at: context.state.auth_token.expires_at }
+			: {}),
 	});
 
 const handleGraphInitialSync = (
 	context: McpRuntimeContext,
 	input: GraphMailSyncInitialSyncInput,
 ) => {
-	if (!hasContextSignedIn(context)) {
-		return errorResponse("E_AUTH_REQUIRED", "로그인이 필요합니다.");
+	const authError = requireAuthenticatedContext(context);
+	if (authError !== null) {
+		return authError;
 	}
 
 	if (!isNonEmptyString(input.mail_folder)) {
@@ -435,12 +596,21 @@ const handleGraphInitialSync = (
 		);
 	}
 
+	if (input.days_back > MAX_DAYS_BACK) {
+		return errorResponse(
+			"E_GRAPH_THROTTLED",
+			`days_back 는 ${MAX_DAYS_BACK}일 이하여야 합니다.`,
+			true,
+		);
+	}
+
 	if (!isArrayOfNonEmptyStrings(input.select) || input.select.length === 0) {
 		return errorResponse("E_PARSE_FAILED", "select 는 비어있지 않아야 합니다.");
 	}
 
 	const syncedMessages = Math.min(input.days_back, 3);
 	let syncedAttachments = 0;
+	let syncedMessageCount = 0;
 	const threadPk = input.mail_folder;
 
 	for (let index = 0; index < syncedMessages; index += 1) {
@@ -451,26 +621,46 @@ const handleGraphInitialSync = (
 			input.mail_folder,
 			hasAttachment,
 		);
-		addMessage(context, threadPk, message);
+		const existingMessage = context.state.messages.get(message.message_pk);
+		let attachmentPks = existingMessage?.attachments ?? [];
 
 		if (hasAttachment) {
-			syncedAttachments += 1;
 			const attachmentInput: GraphMailSyncDownloadAttachmentInput = {
 				graph_message_id: message.provider_message_id,
 				graph_attachment_id: `att_${message.message_pk}`,
 				message_pk: message.message_pk,
 			};
 			const attachment = createAttachmentRecord(attachmentInput);
+
+			if (
+				context.state.attachments.get(
+					parseAttachmentLookupKey(attachmentInput),
+				) === undefined
+			) {
+				syncedAttachments += 1;
+			}
+
 			context.state.attachments.set(
 				parseAttachmentLookupKey(attachmentInput),
 				attachment,
 			);
-			context.state.messages.set(message.message_pk, {
-				...message,
-				has_attachments: true,
-				attachments: [attachment.attachment_pk],
-			});
+
+			attachmentPks = mergeAttachmentPks(attachmentPks, [
+				attachment.attachment_pk,
+			]);
 		}
+
+		const normalizedMessage = {
+			...message,
+			has_attachments: attachmentPks.length > 0,
+			attachments: attachmentPks,
+		};
+
+		if (context.state.messages.get(message.message_pk) === undefined) {
+			syncedMessageCount += 1;
+		}
+
+		addMessage(context, threadPk, normalizedMessage);
 	}
 
 	context.state.deltaLinks.set(
@@ -479,7 +669,7 @@ const handleGraphInitialSync = (
 	);
 
 	return okResponse<GraphMailSyncInitialSyncOutput>({
-		synced_messages: syncedMessages,
+		synced_messages: syncedMessageCount,
 		synced_attachments: syncedAttachments,
 	});
 };
@@ -488,33 +678,54 @@ const handleGraphDeltaSync = (
 	context: McpRuntimeContext,
 	input: GraphMailSyncDeltaSyncInput,
 ) => {
-	if (!hasContextSignedIn(context)) {
-		return errorResponse("E_AUTH_REQUIRED", "로그인이 필요합니다.");
+	const authError = requireAuthenticatedContext(context);
+	if (authError !== null) {
+		return authError;
 	}
 
 	if (!isNonEmptyString(input.mail_folder)) {
 		return errorResponse("E_PARSE_FAILED", "mail_folder 가 누락되었습니다.");
 	}
 
+	if (!context.state.deltaLinks.has(input.mail_folder)) {
+		return errorResponse(
+			"E_GRAPH_THROTTLED",
+			"delta link 가 없습니다. initial_sync 를 먼저 실행하세요.",
+			true,
+		);
+	}
+
 	const threadPk = input.mail_folder;
-	const existingThreadMessages =
-		context.state.threadMessages.get(threadPk) ?? [];
-	const changes = {
-		added: 1,
-		updated: existingThreadMessages.length > 0 ? 1 : 0,
-		deleted: 0,
-	};
+	let existingThreadMessages = context.state.threadMessages.get(threadPk) ?? [];
+	let deletedCount = 0;
+	let updatedCount = 0;
+
+	if (existingThreadMessages.length >= 3) {
+		const deletedMessagePk = existingThreadMessages[0] ?? "";
+		existingThreadMessages = existingThreadMessages.slice(1);
+		removeMessageAndAttachments(context, deletedMessagePk);
+		deletedCount = 1;
+	}
 
 	if (existingThreadMessages.length > 0) {
-		const target = existingThreadMessages[0] ?? "";
-		const targetMessage = context.state.messages.get(target);
+		const targetMessagePk = existingThreadMessages[0] ?? "";
+		const targetMessage = context.state.messages.get(targetMessagePk);
 		if (targetMessage) {
 			context.state.messages.set(targetMessage.message_pk, {
 				...targetMessage,
 				subject: `갱신 ${targetMessage.subject}`,
 			});
+			updatedCount = 1;
 		}
 	}
+
+	context.state.threadMessages.set(threadPk, existingThreadMessages);
+
+	const changes = {
+		added: 1,
+		updated: updatedCount,
+		deleted: deletedCount,
+	};
 
 	const addedMessage = buildDefaultMessage(
 		threadPk,
@@ -522,7 +733,8 @@ const handleGraphDeltaSync = (
 		input.mail_folder,
 		true,
 	);
-	addMessage(context, threadPk, addedMessage);
+	let attachmentPks =
+		context.state.messages.get(addedMessage.message_pk)?.attachments ?? [];
 	const attachmentInput: GraphMailSyncDownloadAttachmentInput = {
 		graph_message_id: addedMessage.provider_message_id,
 		graph_attachment_id: `att_delta_${addedMessage.message_pk}`,
@@ -533,10 +745,11 @@ const handleGraphDeltaSync = (
 		parseAttachmentLookupKey(attachmentInput),
 		attachment,
 	);
-	context.state.messages.set(addedMessage.message_pk, {
+	attachmentPks = mergeAttachmentPks(attachmentPks, [attachment.attachment_pk]);
+	addMessage(context, threadPk, {
 		...addedMessage,
 		has_attachments: true,
-		attachments: [attachment.attachment_pk],
+		attachments: attachmentPks,
 	});
 	context.state.deltaLinks.set(
 		input.mail_folder,
@@ -553,8 +766,9 @@ const handleGraphDownloadAttachment = (
 	context: McpRuntimeContext,
 	input: GraphMailSyncDownloadAttachmentInput,
 ) => {
-	if (!hasContextSignedIn(context)) {
-		return errorResponse("E_AUTH_REQUIRED", "로그인이 필요합니다.");
+	const authError = requireAuthenticatedContext(context);
+	if (authError !== null) {
+		return authError;
 	}
 
 	if (!isNonEmptyString(input.graph_message_id)) {
@@ -612,8 +826,9 @@ const handleMailGetMessage = (
 	context: McpRuntimeContext,
 	input: MailStoreGetMessageInput,
 ) => {
-	if (!hasContextSignedIn(context)) {
-		return errorResponse("E_AUTH_REQUIRED", "로그인이 필요합니다.");
+	const authError = requireAuthenticatedContext(context);
+	if (authError !== null) {
+		return authError;
 	}
 
 	if (!isNonEmptyString(input.message_pk)) {
@@ -639,8 +854,9 @@ const handleMailGetThread = (
 	context: McpRuntimeContext,
 	input: MailStoreGetThreadInput,
 ) => {
-	if (!hasContextSignedIn(context)) {
-		return errorResponse("E_AUTH_REQUIRED", "로그인이 필요합니다.");
+	const authError = requireAuthenticatedContext(context);
+	if (authError !== null) {
+		return authError;
 	}
 
 	if (!isNonEmptyString(input.thread_pk)) {
