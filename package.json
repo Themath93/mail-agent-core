@@ -1,0 +1,21 @@
+{
+  "name": "mail-agent-core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bunx tsc -p tsconfig.json --noEmit",
+    "typecheck": "bunx tsc -p tsconfig.json --noEmit",
+    "lint": "bunx biome check src tests",
+    "test": "bunx vitest run",
+    "coverage": "bunx vitest run --coverage",
+    "ci": "bun run lint && bun run typecheck && bun run test && bun run coverage"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
+    "@vitest/coverage-v8": "^2.1.2",
+    "@types/node": "^22.10.7",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.2"
+  }
+}
