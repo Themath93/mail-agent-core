@@ -219,12 +219,20 @@ export interface McpAttachmentRecord {
 	sha256: string;
 }
 
+interface McpAttachmentContentMeta {
+	attachment_pk: string;
+	relative_path: string;
+	size_bytes: number;
+	sha256: string;
+}
+
 export interface McpRuntimeState {
 	account: McpAuthAccount | null;
 	issued_session: McpAuthSession | null;
 	messages: Map<string, MailStoreMessage>;
 	threadMessages: Map<string, string[]>;
 	attachments: Map<string, McpAttachmentRecord>;
+	attachmentContentBySha: Map<string, McpAttachmentContentMeta>;
 	deltaLinks: Map<string, string>;
 	signed_in: boolean;
 	auth_token: McpAuthToken | null;
@@ -271,6 +279,7 @@ const createRuntimeState = (): McpRuntimeState => ({
 	messages: new Map(),
 	threadMessages: new Map(),
 	attachments: new Map(),
+	attachmentContentBySha: new Map(),
 	deltaLinks: new Map(),
 	signed_in: false,
 	auth_token: null,
@@ -426,15 +435,69 @@ const isValidAuthInput = (input: AuthStoreStartLoginInput): boolean => {
 
 const createAttachmentRecord = (
 	input: GraphMailSyncDownloadAttachmentInput,
+	sha256: string,
+	attachmentPk: string,
+	sizeBytes: number,
+	relativePath: string,
 ): McpAttachmentRecord => ({
-	attachment_pk: `att_${input.graph_attachment_id}`,
+	attachment_pk: attachmentPk,
 	graph_message_id: input.graph_message_id,
 	graph_attachment_id: input.graph_attachment_id,
 	message_pk: input.message_pk,
-	relative_path: `attachments/${input.message_pk}/${input.graph_attachment_id}.bin`,
-	sha256: `sha256_${input.graph_message_id.slice(0, 8)}`,
-	size_bytes: 1024,
+	relative_path: relativePath,
+	sha256,
+	size_bytes: sizeBytes,
 });
+
+const buildAttachmentSha256 = (
+	input: GraphMailSyncDownloadAttachmentInput,
+): string =>
+	createHash("sha256")
+		.update(`${input.graph_message_id}::${input.graph_attachment_id}`)
+		.digest("hex");
+
+const buildAttachmentMeta = (sha256: string): McpAttachmentContentMeta => {
+	const attachmentPk = `att_${sha256.slice(0, 16)}`;
+	return {
+		attachment_pk: attachmentPk,
+		relative_path: `attachments/${sha256.slice(0, 2)}/${sha256}.bin`,
+		size_bytes: 1024,
+		sha256,
+	};
+};
+
+const resolveAttachmentRecord = (
+	context: McpRuntimeContext,
+	input: GraphMailSyncDownloadAttachmentInput,
+) => {
+	const lookupKey = parseAttachmentLookupKey(input);
+	const existing = context.state.attachments.get(lookupKey);
+	if (existing !== undefined) {
+		return { record: existing, created: false };
+	}
+
+	const sha256 = buildAttachmentSha256(input);
+	const cached = context.state.attachmentContentBySha.get(sha256);
+	const baseMeta =
+		cached ??
+		(() => {
+			const next = buildAttachmentMeta(sha256);
+			context.state.attachmentContentBySha.set(sha256, next);
+			return next;
+		})();
+
+	const record = createAttachmentRecord(
+		input,
+		baseMeta.sha256,
+		baseMeta.attachment_pk,
+		baseMeta.size_bytes,
+		baseMeta.relative_path,
+	);
+
+	context.state.attachments.set(lookupKey, record);
+
+	return { record, created: cached === undefined };
+};
 
 const parseAttachmentLookupKey = (
 	input: GraphMailSyncDownloadAttachmentInput,
@@ -630,24 +693,16 @@ const handleGraphInitialSync = (
 				graph_attachment_id: `att_${message.message_pk}`,
 				message_pk: message.message_pk,
 			};
-			const attachment = createAttachmentRecord(attachmentInput);
+			const { created, record } = resolveAttachmentRecord(
+				context,
+				attachmentInput,
+			);
 
-			if (
-				context.state.attachments.get(
-					parseAttachmentLookupKey(attachmentInput),
-				) === undefined
-			) {
+			if (created) {
 				syncedAttachments += 1;
 			}
 
-			context.state.attachments.set(
-				parseAttachmentLookupKey(attachmentInput),
-				attachment,
-			);
-
-			attachmentPks = mergeAttachmentPks(attachmentPks, [
-				attachment.attachment_pk,
-			]);
+			attachmentPks = mergeAttachmentPks(attachmentPks, [record.attachment_pk]);
 		}
 
 		const normalizedMessage = {
@@ -740,12 +795,14 @@ const handleGraphDeltaSync = (
 		graph_attachment_id: `att_delta_${addedMessage.message_pk}`,
 		message_pk: addedMessage.message_pk,
 	};
-	const attachment = createAttachmentRecord(attachmentInput);
-	context.state.attachments.set(
-		parseAttachmentLookupKey(attachmentInput),
-		attachment,
+	const { record: deltaAttachment } = resolveAttachmentRecord(
+		context,
+		attachmentInput,
 	);
-	attachmentPks = mergeAttachmentPks(attachmentPks, [attachment.attachment_pk]);
+
+	attachmentPks = mergeAttachmentPks(attachmentPks, [
+		deltaAttachment.attachment_pk,
+	]);
 	addMessage(context, threadPk, {
 		...addedMessage,
 		has_attachments: true,
@@ -794,10 +851,17 @@ const handleGraphDownloadAttachment = (
 		);
 	}
 
+	if (message.provider_message_id !== input.graph_message_id) {
+		return errorResponse(
+			"E_NOT_FOUND",
+			"요청한 graph_message_id 와 message_pk 가 일치하지 않습니다.",
+		);
+	}
+
 	const existingAttachment = context.state.attachments.get(
 		parseAttachmentLookupKey(input),
 	);
-	if (existingAttachment) {
+	if (existingAttachment !== undefined) {
 		return okResponse<GraphMailSyncDownloadAttachmentOutput>({
 			attachment_pk: existingAttachment.attachment_pk,
 			sha256: existingAttachment.sha256,
@@ -806,12 +870,13 @@ const handleGraphDownloadAttachment = (
 		});
 	}
 
-	const record = createAttachmentRecord(input);
-	context.state.attachments.set(parseAttachmentLookupKey(input), record);
+	const { record } = resolveAttachmentRecord(context, input);
 	context.state.messages.set(input.message_pk, {
 		...message,
 		has_attachments: true,
-		attachments: [...message.attachments, record.attachment_pk],
+		attachments: mergeAttachmentPks(message.attachments, [
+			record.attachment_pk,
+		]),
 	});
 
 	return okResponse<GraphMailSyncDownloadAttachmentOutput>({

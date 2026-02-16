@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, test } from "vitest";
 import {
 	MCP_TOOL_NAMES,
@@ -606,9 +607,12 @@ describe("MCP tools", () => {
 
 		expect(first.ok).toBe(true);
 		if (first.ok) {
-			expect(first.data.attachment_pk).toBe("att_att_inbox_msg_inbox_1");
+			const sha256 = createHash("sha256")
+				.update("graph_inbox_msg_inbox_1::att_inbox_msg_inbox_1")
+				.digest("hex");
+			expect(first.data.attachment_pk).toBe(`att_${sha256.slice(0, 16)}`);
 			expect(first.data.relative_path).toBe(
-				"attachments/inbox_msg_inbox_1/att_inbox_msg_inbox_1.bin",
+				`attachments/${sha256.slice(0, 2)}/${sha256}.bin`,
 			);
 		}
 
@@ -622,6 +626,105 @@ describe("MCP tools", () => {
 			context,
 		);
 		expect(same.ok).toBe(true);
+	});
+
+	test("download_attachment는 동일한 sha256 기준으로 첨부를 dedupe 한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+
+		const baseline = invokeMcpTool(
+			"graph_mail_sync.download_attachment",
+			{
+				graph_message_id: "graph_inbox_msg_inbox_1",
+				graph_attachment_id: "att_inbox_msg_inbox_1",
+				message_pk: "inbox_msg_inbox_1",
+			},
+			context,
+		);
+		expect(baseline.ok).toBe(true);
+		if (!baseline.ok) {
+			throw new Error("기준 첨부 다운로드 실패");
+		}
+
+		const sharedMessage = {
+			message_pk: "inbox_msg_inbox_dup",
+			provider_message_id: "graph_inbox_msg_inbox_1",
+			provider_thread_id: "inbox",
+			internet_message_id: "<dup@outlook.example.com>",
+			web_link: "https://outlook.office.com/mail/inbox_msg_inbox_dup",
+			subject: "중복 대상 메시지",
+			from: "sender@local.test",
+			to: [],
+			cc: [],
+			received_at: new Date().toISOString(),
+			body_text: "샘플 본문 duplicate",
+			has_attachments: false,
+			attachments: [],
+		};
+		context.state.messages.set(sharedMessage.message_pk, sharedMessage);
+		context.state.threadMessages.set("inbox", [
+			...(context.state.threadMessages.get("inbox") ?? []),
+			sharedMessage.message_pk,
+		]);
+
+		const deduped = invokeMcpTool(
+			"graph_mail_sync.download_attachment",
+			{
+				graph_message_id: "graph_inbox_msg_inbox_1",
+				graph_attachment_id: "att_inbox_msg_inbox_1",
+				message_pk: "inbox_msg_inbox_dup",
+			},
+			context,
+		);
+
+		expect(deduped.ok).toBe(true);
+		if (deduped.ok) {
+			expect(deduped.data.attachment_pk).toBe(baseline.data.attachment_pk);
+			expect(deduped.data.sha256).toBe(baseline.data.sha256);
+			expect(deduped.data.relative_path).toBe(baseline.data.relative_path);
+		}
+	});
+
+	test("download_attachment는 message_pk와 graph_message_id 불일치 시 E_NOT_FOUND", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+
+		const mismatch = invokeMcpTool(
+			"graph_mail_sync.download_attachment",
+			{
+				graph_message_id: "graph_mismatch",
+				graph_attachment_id: "att_inbox_msg_inbox_1",
+				message_pk: "inbox_msg_inbox_1",
+			},
+			context,
+		);
+
+		expect(mismatch.ok).toBe(false);
+		if (!mismatch.ok) {
+			expect(mismatch.error_code).toBe("E_NOT_FOUND");
+		}
 	});
 
 	test("mail_store.get_message는 존재 확인과 조회를 수행한다", () => {
