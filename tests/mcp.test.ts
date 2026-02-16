@@ -37,7 +37,7 @@ const completeLogin = (context: McpRuntimeContext) => {
 		{
 			code: "code",
 			state: issued?.state ?? "",
-			code_verifier: "code_verifier",
+			code_verifier: issued?.code_verifier ?? "",
 		},
 		context,
 	);
@@ -119,6 +119,8 @@ describe("MCP tools", () => {
 		]);
 		expect(response.data.login_url).toContain("response_type=code");
 		expect(response.data.login_url).toContain("login.microsoftonline.com");
+		expect(response.data.login_url).toContain("code_challenge=");
+		expect(response.data.login_url).toContain("code_challenge_method=S256");
 		expect(response.data.callback_url).toBe(
 			"http://127.0.0.1:1270/mcp/callback",
 		);
@@ -159,13 +161,14 @@ describe("MCP tools", () => {
 	test("complete_login은 state 불일치 시 E_AUTH_FAILED 반환", () => {
 		const context = createToolContext();
 		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		const codeVerifier = context.state.issued_session?.code_verifier ?? "";
 
 		const response = invokeMcpTool(
 			"auth_store.complete_login",
 			{
 				code: "code",
 				state: "invalid",
-				code_verifier: "code_verifier",
+				code_verifier: codeVerifier,
 			},
 			context,
 		);
@@ -173,6 +176,27 @@ describe("MCP tools", () => {
 		expect(response.ok).toBe(false);
 		if (!response.ok) {
 			expect(response.error_code).toBe("E_AUTH_FAILED");
+		}
+	});
+
+	test("complete_login은 code_verifier 불일치 시 E_AUTH_FAILED를 반환한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+
+		const response = invokeMcpTool(
+			"auth_store.complete_login",
+			{
+				code: "code",
+				state: context.state.issued_session?.state ?? "state",
+				code_verifier: "mismatched",
+			},
+			context,
+		);
+
+		expect(response.ok).toBe(false);
+		if (!response.ok) {
+			expect(response.error_code).toBe("E_AUTH_FAILED");
+			expect(response.error_message).toContain("일치하지 않습니다");
 		}
 	});
 
@@ -209,6 +233,88 @@ describe("MCP tools", () => {
 		if (after.ok) {
 			expect(after.data.signed_in).toBe(true);
 			expect(after.data.account?.tenant).toBe("default");
+			expect(after.data.access_token_expires_at).toBeDefined();
+		}
+	});
+
+	test("만료된 액세스 토큰은 리프레시 토큰으로 갱신된다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		if (context.state.auth_token === null) {
+			throw new Error("예상치 못한 토큰 부재");
+		}
+		const beforeAccessToken = context.state.auth_token.access_token;
+		context.state.auth_token.expires_at = new Date(
+			Date.now() - 10_000,
+		).toISOString();
+
+		const after = invokeMcpTool("auth_store.auth_status", {}, context);
+		expect(after.ok).toBe(true);
+		if (after.ok) {
+			expect(after.data.signed_in).toBe(true);
+			expect(after.data.access_token_expires_at).toBeDefined();
+		}
+
+		if (context.state.auth_token === null) {
+			throw new Error("예상치 못한 갱신 실패");
+		}
+		expect(context.state.auth_token.access_token).not.toBe(beforeAccessToken);
+	});
+
+	test("만료된 갱신 토큰은 로그인 상태를 false로 전환한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		if (context.state.auth_token === null) {
+			throw new Error("예상치 못한 토큰 부재");
+		}
+		context.state.auth_token.expires_at = new Date(
+			Date.now() - 10_000,
+		).toISOString();
+		context.state.auth_token.refresh_token_expires_at = new Date(
+			Date.now() - 10_000,
+		).toISOString();
+
+		const after = invokeMcpTool("auth_store.auth_status", {}, context);
+		expect(after.ok).toBe(true);
+		if (after.ok) {
+			expect(after.data.signed_in).toBe(false);
+		}
+		expect(context.state.signed_in).toBe(false);
+		expect(context.state.account).toBeNull();
+	});
+
+	test("refresh 토큰 만료 시 동기화는 E_AUTH_FAILED를 반환한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		if (context.state.auth_token === null) {
+			throw new Error("예상치 못한 토큰 부재");
+		}
+		context.state.auth_token.expires_at = new Date(
+			Date.now() - 10_000,
+		).toISOString();
+		context.state.auth_token.refresh_token_expires_at = new Date(
+			Date.now() - 10_000,
+		).toISOString();
+
+		const response = invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+
+		expect(response.ok).toBe(false);
+		if (!response.ok) {
+			expect(response.error_code).toBe("E_AUTH_FAILED");
 		}
 	});
 
@@ -269,6 +375,52 @@ describe("MCP tools", () => {
 		}
 	});
 
+	test("initial_sync는 기존 메시지를 중복 계산하지 않는다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		const first = invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 3,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+
+		if (!first.ok) {
+			throw new Error("초기 동기화 실패");
+		}
+
+		const beforeMessages = context.state.threadMessages.get("inbox")?.length;
+		if (typeof beforeMessages !== "number") {
+			throw new Error("스레드 메시지 수 확인 실패");
+		}
+
+		const second = invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 3,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+
+		expect(second.ok).toBe(true);
+		if (!second.ok) {
+			throw new Error("두 번째 동기화 실패");
+		}
+
+		expect(second.data.synced_messages).toBe(0);
+		expect(second.data.synced_attachments).toBe(0);
+		expect(context.state.threadMessages.get("inbox")?.length).toBe(
+			beforeMessages,
+		);
+	});
+
 	test("graph_mail_sync.initial_sync는 잘못된 days_back를 거부한다", () => {
 		const context = createToolContext();
 		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
@@ -285,6 +437,27 @@ describe("MCP tools", () => {
 		);
 
 		expectParseFailure(response);
+	});
+
+	test("graph_mail_sync.initial_sync는 days_back가 정책 한도를 넘으면 E_GRAPH_THROTTLED", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		const response = invokeMcpToolByName(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 31,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+
+		expect(response.ok).toBe(false);
+		if (!response.ok) {
+			expect(response.error_code).toBe("E_GRAPH_THROTTLED");
+		}
 	});
 
 	test("graph_mail_sync.delta_sync는 변경 내역을 반환한다", () => {
@@ -312,7 +485,83 @@ describe("MCP tools", () => {
 		expect(response.ok).toBe(true);
 		if (response.ok) {
 			expect(response.data.changes.added).toBeGreaterThanOrEqual(1);
+			expect(response.data.changes.updated).toBeGreaterThanOrEqual(0);
+			expect(response.data.changes.deleted).toBeGreaterThanOrEqual(0);
 			expect(response.data.new_delta_link_saved).toBe(true);
+		}
+	});
+
+	test("graph_mail_sync.delta_sync는 initial_sync가 없으면 E_GRAPH_THROTTLED", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		const response = invokeMcpTool(
+			"graph_mail_sync.delta_sync",
+			{
+				mail_folder: "inbox",
+			},
+			context,
+		);
+
+		expect(response.ok).toBe(false);
+		if (!response.ok) {
+			expect(response.error_code).toBe("E_GRAPH_THROTTLED");
+		}
+	});
+
+	test("delta_sync는 삭제와 갱신 카운트를 포함한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 3,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+
+		const before = invokeMcpTool(
+			"mail_store.get_message",
+			{
+				message_pk: "inbox_msg_inbox_1",
+			},
+			context,
+		);
+		expect(before.ok).toBe(true);
+
+		const response = invokeMcpTool(
+			"graph_mail_sync.delta_sync",
+			{
+				mail_folder: "inbox",
+			},
+			context,
+		);
+
+		expect(response.ok).toBe(true);
+		if (!response.ok) {
+			throw new Error("delta 동기화 실패");
+		}
+
+		expect(response.data.changes.added).toBe(1);
+		expect(response.data.changes.updated).toBe(1);
+		expect(response.data.changes.deleted).toBe(1);
+
+		const deleted = invokeMcpTool(
+			"mail_store.get_message",
+			{
+				message_pk: "inbox_msg_inbox_1",
+			},
+			context,
+		);
+
+		expect(deleted.ok).toBe(false);
+		if (!deleted.ok) {
+			expect(deleted.error_code).toBe("E_NOT_FOUND");
 		}
 	});
 
