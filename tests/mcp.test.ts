@@ -840,6 +840,12 @@ describe("MCP tools", () => {
 			context,
 		);
 		expect(same.ok).toBe(true);
+		if (same.ok && first.ok) {
+			expect(same.data.attachment_pk).toBe(first.data.attachment_pk);
+			expect(same.data.sha256).toBe(first.data.sha256);
+			expect(same.data.relative_path).toBe(first.data.relative_path);
+			expect(same.data.size_bytes).toBe(first.data.size_bytes);
+		}
 	});
 
 	test("download_attachment는 동일한 sha256 기준으로 첨부를 dedupe 한다", () => {
@@ -870,6 +876,7 @@ describe("MCP tools", () => {
 		if (!baseline.ok) {
 			throw new Error("기준 첨부 다운로드 실패");
 		}
+		const attachmentsBefore = context.state.attachments.size;
 
 		const sharedMessage = {
 			message_pk: "inbox_msg_inbox_dup",
@@ -907,6 +914,71 @@ describe("MCP tools", () => {
 			expect(deduped.data.attachment_pk).toBe(baseline.data.attachment_pk);
 			expect(deduped.data.sha256).toBe(baseline.data.sha256);
 			expect(deduped.data.relative_path).toBe(baseline.data.relative_path);
+		}
+		expect(context.state.attachments.size).toBe(attachmentsBefore);
+	});
+
+	test("download_attachment는 메시지에 없는 첨부 요청 시 E_NOT_FOUND", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{ mail_folder: "inbox", days_back: 1, select: ["id", "subject"] },
+			context,
+		);
+
+		const missing = invokeMcpTool(
+			"graph_mail_sync.download_attachment",
+			{
+				graph_message_id: "graph_inbox_msg_inbox_1",
+				graph_attachment_id: "att_missing",
+				message_pk: "inbox_msg_inbox_1",
+			},
+			context,
+		);
+
+		expect(missing.ok).toBe(false);
+		if (!missing.ok) {
+			expect(missing.error_code).toBe("E_NOT_FOUND");
+		}
+	});
+
+	test("download_attachment는 저장된 sha256 불일치 시 E_PARSE_FAILED", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{ mail_folder: "inbox", days_back: 1, select: ["id", "subject"] },
+			context,
+		);
+
+		const lookupKey = "graph_inbox_msg_inbox_1::att_inbox_msg_inbox_1";
+		const stored = context.state.attachments.get(lookupKey);
+		if (!stored) {
+			throw new Error("테스트 첨부 레코드 준비 실패");
+		}
+		context.state.attachments.set(lookupKey, {
+			...stored,
+			sha256: "sha_mismatch",
+		});
+
+		const response = invokeMcpTool(
+			"graph_mail_sync.download_attachment",
+			{
+				graph_message_id: "graph_inbox_msg_inbox_1",
+				graph_attachment_id: "att_inbox_msg_inbox_1",
+				message_pk: "inbox_msg_inbox_1",
+			},
+			context,
+		);
+
+		expect(response.ok).toBe(false);
+		if (!response.ok) {
+			expect(response.error_code).toBe("E_PARSE_FAILED");
 		}
 	});
 

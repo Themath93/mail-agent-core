@@ -46,3 +46,12 @@
 ## 6) Deep Link 실패 대응
 - Outlook 메일은 webLink + quote 하이라이트(재시도/폴백)
 - 첨부는 로컬 뷰어가 표준(페이지/셀/슬라이드/문단/bbox)
+
+---
+
+## 7) 작업 로그 (2026-02-17)
+- Task 09: `graph_mail_sync.download_attachment` 정합성 마감
+- 첨부 dedupe/lookup key를 `graph_message_id::graph_attachment_id`로 통일
+- 중복 요청은 기존 `attachment_pk`/`sha256`/`relative_path`를 재사용하고 경로/메타 불일치 시 즉시 실패
+- 실패 케이스를 명시적으로 분리: message mismatch, attachment missing, sha mismatch
+- MCP 스펙 문서 예시의 성공 응답 포맷을 코드(`{ ok: true, data: ... }`)와 정합화

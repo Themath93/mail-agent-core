@@ -1,5 +1,6 @@
 # Outlook 로컬 업무 자동화 에이전트 — Specs v0.2
 - 작성일: 2026-02-16
+- 갱신일: 2026-02-17
 - 이 문서는 PRD v0.2를 구현하기 위한 **개발 스펙(1,2,3)** 입니다.
 - 범위: Evidence Schema / MCP Tools / Deep Link 규격 / (추가) Graph Sync 스펙
 
@@ -76,7 +77,9 @@
 ## 2) MCP Tools 스펙
 
 ### 2.1 공통 규약
-- 모든 응답은 `ok`(boolean)와 오류 정보를 포함할 수 있음: `error_code`, `error_message`, `retryable`
+- 모든 응답은 `ok`(boolean)로 성공/실패를 표시한다.
+- 성공 응답: `{ "ok": true, "data": { ... } }`
+- 실패 응답: `{ "ok": false, "error_code": "...", "error_message": "...", "retryable": false }`
 - 시간: ISO-8601(date-time)
 - ID: ULID/UUID 문자열
 
@@ -93,7 +96,7 @@
 ```
 - 출력:
 ```json
-{ "ok": true, "login_url": "…", "callback_url": "http://127.0.0.1:PORT/callback" }
+{ "ok": true, "data": { "login_url": "…", "callback_url": "http://127.0.0.1:PORT/callback" } }
 ```
 
 #### 2.2.2 complete_login
@@ -104,12 +107,12 @@
 ```
 - 출력:
 ```json
-{ "ok": true, "account": { "email": "me@…", "tenant": "…" } }
+{ "ok": true, "data": { "account": { "email": "me@…", "tenant": "…" } } }
 ```
 
 #### 2.2.3 auth_status
 - 입력: `{}`
-- 출력: `{"ok":true,"signed_in":true,"account":{...}}`
+- 출력: `{ "ok": true, "data": { "signed_in": true, "account": { "email": "...", "tenant": "..." } } }`
 
 ---
 
@@ -126,7 +129,7 @@
 ```
 - 출력:
 ```json
-{ "ok": true, "synced_messages": 123, "synced_attachments": 12 }
+{ "ok": true, "data": { "synced_messages": 123, "synced_attachments": 12 } }
 ```
 
 #### 2.3.2 delta_sync
@@ -137,7 +140,7 @@
 ```
 - 출력:
 ```json
-{ "ok": true, "changes": {"added": 5, "updated": 3, "deleted": 1}, "new_delta_link_saved": true }
+{ "ok": true, "data": { "changes": {"added": 5, "updated": 3, "deleted": 1}, "new_delta_link_saved": true } }
 ```
 
 #### 2.3.3 download_attachment
@@ -148,7 +151,7 @@
 ```
 - 출력:
 ```json
-{ "ok": true, "attachment_pk": "att_…", "sha256": "…", "relative_path": "attachments/…", "size_bytes": 123456 }
+{ "ok": true, "data": { "attachment_pk": "att_…", "sha256": "…", "relative_path": "attachments/…", "size_bytes": 123456 } }
 ```
 
 ---
@@ -160,27 +163,29 @@
 ```json
 {
   "ok": true,
-  "message": {
-    "message_pk": "msg_...",
-    "provider_message_id": "GRAPH_MESSAGE_ID",
-    "provider_thread_id": "conversationId",
-    "internet_message_id": "<…>",
-    "web_link": "https://outlook.office.com/…",
-    "subject": "…",
-    "from": "…",
-    "to": ["…"],
-    "cc": ["…"],
-    "received_at": "…",
-    "body_text": "…",
-    "has_attachments": true,
-    "attachments": ["att_1", "att_2"]
+  "data": {
+    "message": {
+      "message_pk": "msg_...",
+      "provider_message_id": "GRAPH_MESSAGE_ID",
+      "provider_thread_id": "conversationId",
+      "internet_message_id": "<…>",
+      "web_link": "https://outlook.office.com/…",
+      "subject": "…",
+      "from": "…",
+      "to": ["…"],
+      "cc": ["…"],
+      "received_at": "…",
+      "body_text": "…",
+      "has_attachments": true,
+      "attachments": ["att_1", "att_2"]
+    }
   }
 }
 ```
 
 #### 2.4.2 get_thread
 - 입력: `{"thread_pk":"th_...","depth":50}`
-- 출력: 메시지 목록(time-ordered)
+- 출력: `{ "ok": true, "data": [ {"message_pk":"..."}, {"message_pk":"..."} ] }` (메시지 목록, time-ordered)
 
 ---
 

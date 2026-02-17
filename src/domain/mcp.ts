@@ -620,8 +620,7 @@ const resolveAttachmentRecord = (
 
 const parseAttachmentLookupKey = (
 	input: GraphMailSyncDownloadAttachmentInput,
-): string =>
-	`${input.message_pk}::${input.graph_message_id}::${input.graph_attachment_id}`;
+): string => `${input.graph_message_id}::${input.graph_attachment_id}`;
 
 const setThreadMessages = (
 	context: McpRuntimeContext,
@@ -649,13 +648,6 @@ const removeMessageAndAttachments = (
 	messagePk: string,
 ): void => {
 	context.state.messages.delete(messagePk);
-
-	for (const key of context.state.attachments.keys()) {
-		const [storedMessagePk] = key.split("::");
-		if (storedMessagePk === messagePk) {
-			context.state.attachments.delete(key);
-		}
-	}
 };
 
 const addMessage = (
@@ -1008,19 +1000,60 @@ const handleGraphDownloadAttachment = (
 		);
 	}
 
-	const existingAttachment = context.state.attachments.get(
-		parseAttachmentLookupKey(input),
-	);
-	if (existingAttachment !== undefined) {
-		return okResponse<GraphMailSyncDownloadAttachmentOutput>({
-			attachment_pk: existingAttachment.attachment_pk,
-			sha256: existingAttachment.sha256,
-			relative_path: existingAttachment.relative_path,
-			size_bytes: existingAttachment.size_bytes,
+	const lookupKey = parseAttachmentLookupKey(input);
+	const record = context.state.attachments.get(lookupKey);
+	if (record === undefined) {
+		return errorResponse(
+			"E_NOT_FOUND",
+			"요청한 graph_attachment_id 를 찾을 수 없습니다.",
+		);
+	}
+
+	const expectedSha = buildAttachmentSha256(input);
+	if (record.sha256 !== expectedSha) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"저장된 첨부 sha256 값이 요청 값과 일치하지 않습니다.",
+		);
+	}
+
+	const expectedAttachmentPk = `att_${expectedSha.slice(0, 16)}`;
+	const expectedRelativePath = `attachments/${expectedSha.slice(0, 2)}/${expectedSha}.bin`;
+	if (record.attachment_pk !== expectedAttachmentPk) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"저장된 attachment_pk 값이 sha256 파생 규칙과 일치하지 않습니다.",
+		);
+	}
+	if (record.relative_path !== expectedRelativePath) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"저장된 relative_path 값이 sha256 파생 규칙과 일치하지 않습니다.",
+		);
+	}
+
+	const cachedMeta = context.state.attachmentContentBySha.get(expectedSha);
+	if (cachedMeta !== undefined) {
+		if (
+			cachedMeta.attachment_pk !== record.attachment_pk ||
+			cachedMeta.relative_path !== record.relative_path ||
+			cachedMeta.size_bytes !== record.size_bytes ||
+			cachedMeta.sha256 !== record.sha256
+		) {
+			return errorResponse(
+				"E_PARSE_FAILED",
+				"첨부 캐시 메타가 저장된 첨부 레코드와 일치하지 않습니다.",
+			);
+		}
+	} else {
+		context.state.attachmentContentBySha.set(expectedSha, {
+			attachment_pk: record.attachment_pk,
+			relative_path: record.relative_path,
+			size_bytes: record.size_bytes,
+			sha256: record.sha256,
 		});
 	}
 
-	const { record } = resolveAttachmentRecord(context, input);
 	context.state.messages.set(messagePk, {
 		...message,
 		has_attachments: true,
