@@ -14,6 +14,7 @@ Microsoft Graph API 기반으로 Outlook 메일과 첨부 파일을 로컬에서
 - 사용자 사용 설명서: `docs/chrome-extension-user-guide.md`
 - 설치 가이드: `docs/install-guide.md`
 - 크롬 확장 로드 경로: `extension/`
+- Native Host 등록 스크립트(macOS): `scripts/install-native-host-macos.sh`
 
 ### 실행 흐름
 

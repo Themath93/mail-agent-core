@@ -13,22 +13,23 @@
 - Microsoft 365/Outlook 계정
 - macOS/Linux/Windows 중 하나의 로컬 실행 환경
 - (개발/검증용) Bun 1.3+ 및 Git
+- Node.js 20+
 
 ## 3. 운영 사용자 설치(현재 저장소 기준)
 
 필수 준비물:
 
 - 이 저장소 로컬 경로
-- Native Host 실행 패키지(운영 환경에서 별도 제공)
+- Chrome 확장 ID
 
 설치 순서:
 
-1. Native Host를 먼저 설치/실행합니다.
-2. Chrome에서 `chrome://extensions`를 엽니다.
-3. 우측 상단 "개발자 모드"를 켭니다.
-4. "압축해제된 확장 프로그램 로드"로 `<repo>/extension` 디렉터리를 등록합니다.
-5. 확장 앱을 열고 로그인 상태/호스트 연결 상태를 확인합니다.
-6. 초기 동기화(initial sync)를 1회 실행합니다.
+1. Chrome에서 `chrome://extensions`를 엽니다.
+2. 우측 상단 "개발자 모드"를 켭니다.
+3. "압축해제된 확장 프로그램 로드"로 `<repo>/extension` 디렉터리를 등록합니다.
+4. 확장 카드에서 ID를 복사합니다.
+5. 터미널에서 `<repo>/scripts/install-native-host-macos.sh <확장ID>`를 실행합니다.
+6. Chrome 확장을 새로고침한 뒤 사이드패널에서 "로그인 상태 확인" 버튼을 누릅니다.
 
 ## 4. 개발/검증 설치(현재 저장소 기준)
 
@@ -43,20 +44,34 @@ bun run ci
 
 ## 5. 설치 후 기본 점검
 
-- 로그인 상태 확인(`auth_store.auth_status`)
-- 초기 동기화 실행(`graph_mail_sync.initial_sync`)
-- 변경 동기화 실행(`graph_mail_sync.delta_sync`)
-- 메일 조회 확인(`mail_store.get_message`, `mail_store.get_thread`)
+- 사이드패널에서 `Auth status: signed_in=false email=-` 표시 확인
+- Native Host 등록 파일 확인: `~/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.themath93.mail_agent_core.host.json`
 
-## 6. 자주 발생하는 설치 이슈
+## 6. 로그인 상태 시뮬레이션
+
+`native-host/state.json` 값을 수정하면 로그인 상태 응답을 확인할 수 있습니다.
+
+```json
+{
+  "signed_in": true,
+  "account": {
+    "email": "me@example.com",
+    "tenant": "default"
+  }
+}
+```
+
+저장 후 확장 새로고침 뒤 "로그인 상태 확인"을 다시 실행합니다.
+
+## 7. 자주 발생하는 설치 이슈
 
 - 확장 로드 실패
   - 확장 디렉터리 경로를 다시 선택하고, 권한 경고가 있으면 허용
-- 로그인 진행 불가
-  - 계정/브라우저 세션 확인 후 재로그인
+- `Auth status error: Specified native messaging host not found`
+  - 설치 스크립트를 다시 실행하고 확장 ID가 맞는지 확인
 - 동기화 실패
-  - 로그인 상태 재확인, 잠시 후 재시도
+  - 현재 단계에서는 Native Messaging 연결 및 auth status 확인까지만 지원
 
-## 7. 다음 문서
+## 8. 다음 문서
 
 - 사용 방법: `docs/chrome-extension-user-guide.md`
