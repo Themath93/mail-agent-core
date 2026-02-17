@@ -1,0 +1,5 @@
+{
+	"tenant": "common",
+	"client_id": "",
+	"redirect_uri": "http://127.0.0.1:1270/mcp/callback"
+}
