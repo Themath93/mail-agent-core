@@ -2,6 +2,7 @@ const loadedAt = document.getElementById("loaded-at");
 const authStatus = document.getElementById("auth-status");
 const loginUrlText = document.getElementById("login-url");
 const resultView = document.getElementById("result");
+const autoSyncStatus = document.getElementById("autosync-status");
 
 const startLoginButton = document.getElementById("start-login");
 const completeLoginButton = document.getElementById("complete-login");
@@ -14,12 +15,20 @@ const deltaSyncButton = document.getElementById("delta-sync");
 const syncFolderInput = document.getElementById("sync-folder");
 const syncDaysInput = document.getElementById("sync-days");
 
+const listMessagesButton = document.getElementById("list-messages");
+const listThreadsButton = document.getElementById("list-threads");
+const listLimitInput = document.getElementById("list-limit");
+const messageSelect = document.getElementById("message-select");
+const threadSelect = document.getElementById("thread-select");
+
 const getMessageButton = document.getElementById("get-message");
 const getThreadButton = document.getElementById("get-thread");
 const messageIdInput = document.getElementById("message-id");
 const threadIdInput = document.getElementById("thread-id");
 const threadDepthInput = document.getElementById("thread-depth");
 
+const listAttachmentsButton = document.getElementById("list-attachments");
+const attachmentSelect = document.getElementById("attachment-select");
 const downloadAttachmentButton = document.getElementById("download-attachment");
 const attachmentMessageIdInput = document.getElementById(
 	"attachment-message-id",
@@ -29,13 +38,44 @@ const attachmentMessagePkInput = document.getElementById(
 	"attachment-message-pk",
 );
 
+const autosyncMinutesInput = document.getElementById("autosync-minutes");
+const autosyncStartButton = document.getElementById("autosync-start");
+const autosyncStopButton = document.getElementById("autosync-stop");
+
+const systemHealthButton = document.getElementById("system-health");
+const resetSessionButton = document.getElementById("reset-session");
+const resetSessionFullButton = document.getElementById("reset-session-full");
+
+const evidenceMessagePkInput = document.getElementById("evidence-message-pk");
+const evidenceSnippetInput = document.getElementById("evidence-snippet");
+const evidenceConfidenceInput = document.getElementById("evidence-confidence");
+const createEvidenceButton = document.getElementById("create-evidence");
+
+const todoIdInput = document.getElementById("todo-id");
+const todoTitleInput = document.getElementById("todo-title");
+const todoStatusInput = document.getElementById("todo-status");
+const todoEvidenceIdInput = document.getElementById("todo-evidence-id");
+const upsertTodoButton = document.getElementById("upsert-todo");
+const workflowListButton = document.getElementById("workflow-list");
+
 const HOST_NAME = "com.themath93.mail_agent_core.host";
 const STORAGE_KEYS = {
 	state: "pending_login_state",
 	codeVerifier: "pending_login_code_verifier",
 };
 
+const AUTO_COMPLETE_MAX_ATTEMPTS = 300;
+const AUTO_COMPLETE_BASE_DELAY_MS = 1000;
+const AUTO_COMPLETE_MAX_DELAY_MS = 3000;
+const AUTO_COMPLETE_TIMEOUT_MS = 5 * 60 * 1000;
+
 let autoCompleteTimer = null;
+let autoCompleteAttempt = 0;
+let autoCompleteStartedAt = 0;
+let autoSyncTimer = null;
+let latestMessages = [];
+let latestThreads = [];
+let latestAttachments = [];
 
 if (loadedAt) {
 	loadedAt.textContent = `Loaded at: ${new Date().toLocaleString()}`;
@@ -59,6 +99,12 @@ const setResult = (payload) => {
 	}
 };
 
+const setAutoSyncStatus = (value) => {
+	if (autoSyncStatus) {
+		autoSyncStatus.textContent = value;
+	}
+};
+
 const parseAuthInput = (rawInput) => {
 	const trimmed = rawInput.trim();
 	if (trimmed.length === 0) {
@@ -78,7 +124,9 @@ const parseAuthInput = (rawInput) => {
 	try {
 		const callbackUrl = new URL(trimmed);
 		return parseQuery(callbackUrl.search);
-	} catch {}
+	} catch (error) {
+		void error;
+	}
 
 	if (trimmed.startsWith("?")) {
 		return parseQuery(trimmed);
@@ -129,17 +177,179 @@ const handleMcpResponse = (response) => {
 
 const stopAutoCompleteLoop = () => {
 	if (autoCompleteTimer) {
-		clearInterval(autoCompleteTimer);
+		clearTimeout(autoCompleteTimer);
 		autoCompleteTimer = null;
+	}
+	autoCompleteAttempt = 0;
+	autoCompleteStartedAt = 0;
+};
+
+const stopAutoSyncLoop = () => {
+	if (autoSyncTimer) {
+		clearInterval(autoSyncTimer);
+		autoSyncTimer = null;
+	}
+	setAutoSyncStatus("Auto sync: stopped");
+};
+
+const selectValue = (selectElement) =>
+	typeof selectElement?.value === "string" ? selectElement.value : "";
+
+const setSelectOptions = (selectElement, options) => {
+	if (!selectElement) {
+		return;
+	}
+	selectElement.innerHTML = "";
+	for (const option of options) {
+		const node = document.createElement("option");
+		node.value = option.value;
+		node.textContent = option.label;
+		selectElement.appendChild(node);
 	}
 };
 
+const fillMessageInputsFromSelection = () => {
+	const messagePk = selectValue(messageSelect);
+	if (!messagePk) {
+		return;
+	}
+	if (messageIdInput) {
+		messageIdInput.value = messagePk;
+	}
+	if (attachmentMessagePkInput) {
+		attachmentMessagePkInput.value = messagePk;
+	}
+	if (evidenceMessagePkInput) {
+		evidenceMessagePkInput.value = messagePk;
+	}
+};
+
+const fillThreadInputFromSelection = () => {
+	const threadPk = selectValue(threadSelect);
+	if (!threadPk) {
+		return;
+	}
+	if (threadIdInput) {
+		threadIdInput.value = threadPk;
+	}
+};
+
+const fillAttachmentInputsFromSelection = () => {
+	const attachmentPk = selectValue(attachmentSelect);
+	if (!attachmentPk) {
+		return;
+	}
+	const item = latestAttachments.find(
+		(row) => row.attachment_pk === attachmentPk,
+	);
+	if (!item) {
+		return;
+	}
+	if (attachmentMessageIdInput) {
+		attachmentMessageIdInput.value = item.graph_message_id;
+	}
+	if (attachmentIdInput) {
+		attachmentIdInput.value = item.graph_attachment_id;
+	}
+	if (attachmentMessagePkInput && item.message_pk) {
+		attachmentMessagePkInput.value = item.message_pk;
+	}
+};
+
+const nextAutoCompleteDelayMs = (attempt) =>
+	Math.min(
+		AUTO_COMPLETE_BASE_DELAY_MS * (1 + Math.floor(attempt / 10)),
+		AUTO_COMPLETE_MAX_DELAY_MS,
+	);
+
+const scheduleAutoComplete = (delayMs) => {
+	autoCompleteTimer = setTimeout(() => {
+		void runCompleteFromCallback();
+	}, delayMs);
+};
+
+const setManualFallbackStatus = (message) => {
+	if (message.length > 0) {
+		setAuthStatus(
+			`Auth status error: ${message}. callback URL 또는 code를 붙여넣고 로그인 완료를 수동 실행하세요.`,
+		);
+		return;
+	}
+	setAuthStatus(
+		"Auth status: 자동완료 대기 시간이 초과되었습니다. callback URL 또는 code를 붙여넣고 로그인 완료를 수동 실행하세요.",
+	);
+};
+
 const runCompleteFromCallback = async () => {
+	autoCompleteTimer = null;
+	if (autoCompleteStartedAt === 0) {
+		autoCompleteStartedAt = Date.now();
+	}
+	autoCompleteAttempt += 1;
+	const attempt = autoCompleteAttempt;
+	const elapsedMs = Date.now() - autoCompleteStartedAt;
+
 	try {
 		const response = await sendNativeMessage(
 			"auth_store.complete_login_auto",
 			{},
 		);
+		if (!response || typeof response !== "object") {
+			throw new Error("invalid host response");
+		}
+
+		if (response.ok !== true) {
+			const errorCode =
+				typeof response.error_code === "string"
+					? response.error_code
+					: "E_UNKNOWN";
+			const errorMessage =
+				typeof response.error_message === "string"
+					? response.error_message
+					: "unknown host error";
+
+			if (errorCode === "E_NOT_FOUND") {
+				if (
+					attempt >= AUTO_COMPLETE_MAX_ATTEMPTS ||
+					elapsedMs >= AUTO_COMPLETE_TIMEOUT_MS
+				) {
+					stopAutoCompleteLoop();
+					setManualFallbackStatus("");
+					setResult(response);
+					return;
+				}
+				if (attempt % 20 === 0) {
+					setAuthStatus(
+						`Auth status: callback 자동완료 대기 중 (${attempt}/${AUTO_COMPLETE_MAX_ATTEMPTS})`,
+					);
+				}
+				scheduleAutoComplete(nextAutoCompleteDelayMs(attempt));
+				return;
+			}
+
+			if (response.retryable === true) {
+				if (
+					attempt >= AUTO_COMPLETE_MAX_ATTEMPTS ||
+					elapsedMs >= AUTO_COMPLETE_TIMEOUT_MS
+				) {
+					stopAutoCompleteLoop();
+					setManualFallbackStatus(errorMessage);
+					setResult(response);
+					return;
+				}
+				setAuthStatus(
+					`Auth status: 자동완료 재시도 중 (${attempt}/${AUTO_COMPLETE_MAX_ATTEMPTS}) - ${errorMessage}`,
+				);
+				scheduleAutoComplete(nextAutoCompleteDelayMs(attempt));
+				return;
+			}
+
+			stopAutoCompleteLoop();
+			setManualFallbackStatus(errorMessage);
+			setResult(response);
+			return;
+		}
+
 		const data = handleMcpResponse(response);
 		stopAutoCompleteLoop();
 		chrome.storage.local.remove([
@@ -154,17 +364,26 @@ const runCompleteFromCallback = async () => {
 		}
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		if (message.includes("자동 완료 대기 중인 callback code가 없습니다")) {
+		if (
+			attempt >= AUTO_COMPLETE_MAX_ATTEMPTS ||
+			elapsedMs >= AUTO_COMPLETE_TIMEOUT_MS
+		) {
+			stopAutoCompleteLoop();
+			setManualFallbackStatus(message);
 			return;
 		}
-		stopAutoCompleteLoop();
-		setAuthStatus(`Auth status error: ${message}`);
+		setAuthStatus(
+			`Auth status: 자동완료 재시도 중 (${attempt}/${AUTO_COMPLETE_MAX_ATTEMPTS}) - ${message}`,
+		);
+		scheduleAutoComplete(nextAutoCompleteDelayMs(attempt));
 	}
 };
 
 const startAutoCompleteLoop = () => {
 	stopAutoCompleteLoop();
-	autoCompleteTimer = setInterval(runCompleteFromCallback, 1000);
+	autoCompleteStartedAt = Date.now();
+	autoCompleteAttempt = 0;
+	scheduleAutoComplete(0);
 };
 
 const requestAuthStatus = async () => {
@@ -172,9 +391,14 @@ const requestAuthStatus = async () => {
 		const response = await sendNativeMessage("auth_store.auth_status", {});
 		const data = handleMcpResponse(response);
 		const email = data?.account?.email ? data.account.email : "-";
-		setAuthStatus(
-			`Auth status: signed_in=${Boolean(data?.signed_in)} email=${email}`,
-		);
+		const signedIn = Boolean(data?.signed_in);
+		if (!signedIn && data?.pending_callback_received === true) {
+			setAuthStatus(
+				`Auth status: signed_in=false email=${email} callback 수신됨 (로그인 완료 수동 실행 가능)`,
+			);
+		} else {
+			setAuthStatus(`Auth status: signed_in=${signedIn} email=${email}`);
+		}
 		setResult(response);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
@@ -195,7 +419,7 @@ const startLogin = async () => {
 		});
 		setLoginUrlText(`Login URL: ${data.login_url}`);
 		setAuthStatus(
-			"Auth status: 로그인 URL을 열었고 callback 자동완료를 대기 중",
+			"Auth status: 로그인 URL을 열었고 callback 자동완료를 최대 5분 대기 중",
 		);
 		setResult(response);
 		startAutoCompleteLoop();
@@ -294,6 +518,56 @@ const readSyncInputs = () => ({
 			: 7,
 });
 
+const listMessages = async () => {
+	const limit = Number(listLimitInput?.value ?? "50");
+	const resolvedLimit = Number.isInteger(limit) && limit > 0 ? limit : 50;
+	try {
+		const response = await sendNativeMessage("mail_store.list_messages", {
+			limit: resolvedLimit,
+		});
+		const data = handleMcpResponse(response);
+		latestMessages = Array.isArray(data.items) ? data.items : [];
+		setSelectOptions(
+			messageSelect,
+			latestMessages.map((row) => ({
+				value: row.message_pk,
+				label: `${row.received_at || ""} | ${row.subject || "(no subject)"}`,
+			})),
+		);
+		fillMessageInputsFromSelection();
+		setAuthStatus(`Query: list_messages 완료 (${latestMessages.length})`);
+		setResult(response);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		setAuthStatus(`Query error: ${message}`);
+	}
+};
+
+const listThreads = async () => {
+	const limit = Number(listLimitInput?.value ?? "50");
+	const resolvedLimit = Number.isInteger(limit) && limit > 0 ? limit : 50;
+	try {
+		const response = await sendNativeMessage("mail_store.list_threads", {
+			limit: resolvedLimit,
+		});
+		const data = handleMcpResponse(response);
+		latestThreads = Array.isArray(data.items) ? data.items : [];
+		setSelectOptions(
+			threadSelect,
+			latestThreads.map((row) => ({
+				value: row.thread_pk,
+				label: `${row.message_count} msgs | ${row.thread_pk}`,
+			})),
+		);
+		fillThreadInputFromSelection();
+		setAuthStatus(`Query: list_threads 완료 (${latestThreads.length})`);
+		setResult(response);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		setAuthStatus(`Query error: ${message}`);
+	}
+};
+
 const initialSync = async () => {
 	const base = readSyncInputs();
 	try {
@@ -317,6 +591,8 @@ const initialSync = async () => {
 		setResult(response);
 		handleMcpResponse(response);
 		setAuthStatus("Sync: initial_sync 완료");
+		await listMessages();
+		await listThreads();
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		setAuthStatus(`Sync error: ${message}`);
@@ -332,6 +608,8 @@ const deltaSync = async () => {
 		setResult(response);
 		handleMcpResponse(response);
 		setAuthStatus("Sync: delta_sync 완료");
+		await listMessages();
+		await listThreads();
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		setAuthStatus(`Sync error: ${message}`);
@@ -354,6 +632,9 @@ const getMessage = async () => {
 		setResult(response);
 		handleMcpResponse(response);
 		setAuthStatus("Query: get_message 완료");
+		if (evidenceMessagePkInput) {
+			evidenceMessagePkInput.value = messageId;
+		}
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		setAuthStatus(`Query error: ${message}`);
@@ -383,6 +664,41 @@ const getThread = async () => {
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		setAuthStatus(`Query error: ${message}`);
+	}
+};
+
+const listAttachments = async () => {
+	const messagePk =
+		typeof attachmentMessagePkInput?.value === "string"
+			? attachmentMessagePkInput.value.trim()
+			: "";
+	if (!messagePk) {
+		setAuthStatus("Attachment error: message_pk 입력 필요");
+		return;
+	}
+	try {
+		const response = await sendNativeMessage("mail_store.list_attachments", {
+			message_pk: messagePk,
+		});
+		const data = handleMcpResponse(response);
+		latestAttachments = Array.isArray(data.items)
+			? data.items.map((item) => ({ ...item, message_pk: messagePk }))
+			: [];
+		setSelectOptions(
+			attachmentSelect,
+			latestAttachments.map((item) => ({
+				value: item.attachment_pk,
+				label: `${item.attachment_pk} (${item.size_bytes || 0} bytes)`,
+			})),
+		);
+		fillAttachmentInputsFromSelection();
+		setResult(response);
+		setAuthStatus(
+			`Attachment: list_attachments 완료 (${latestAttachments.length})`,
+		);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		setAuthStatus(`Attachment error: ${message}`);
 	}
 };
 
@@ -417,9 +733,141 @@ const downloadAttachment = async () => {
 		setResult(response);
 		handleMcpResponse(response);
 		setAuthStatus("Attachment: download_attachment 완료");
+		await listAttachments();
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		setAuthStatus(`Attachment error: ${message}`);
+	}
+};
+
+const runDeltaSyncOnce = async () => {
+	await deltaSync();
+};
+
+const startAutoSyncLoop = () => {
+	stopAutoSyncLoop();
+	const minutesRaw = Number(autosyncMinutesInput?.value ?? "10");
+	const minutes =
+		Number.isInteger(minutesRaw) && minutesRaw > 0 ? minutesRaw : 10;
+	const ms = minutes * 60 * 1000;
+	setAutoSyncStatus(`Auto sync: running every ${minutes} minute(s)`);
+	autoSyncTimer = setInterval(() => {
+		runDeltaSyncOnce().catch((error) => {
+			const message = error instanceof Error ? error.message : String(error);
+			setAuthStatus(`Auto sync error: ${message}`);
+		});
+	}, ms);
+};
+
+const getSystemHealth = async () => {
+	try {
+		const response = await sendNativeMessage("system.health", {});
+		handleMcpResponse(response);
+		setResult(response);
+		setAuthStatus("System: health 조회 완료");
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		setAuthStatus(`System error: ${message}`);
+	}
+};
+
+const resetSession = async (clearMailbox) => {
+	try {
+		const response = await sendNativeMessage("system.reset_session", {
+			clear_mailbox: clearMailbox,
+		});
+		handleMcpResponse(response);
+		setResult(response);
+		setAuthStatus("System: reset_session 완료");
+		stopAutoCompleteLoop();
+		if (clearMailbox) {
+			latestMessages = [];
+			latestThreads = [];
+			latestAttachments = [];
+			setSelectOptions(messageSelect, []);
+			setSelectOptions(threadSelect, []);
+			setSelectOptions(attachmentSelect, []);
+		}
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		setAuthStatus(`System error: ${message}`);
+	}
+};
+
+const createEvidence = async () => {
+	const messagePk =
+		typeof evidenceMessagePkInput?.value === "string"
+			? evidenceMessagePkInput.value.trim()
+			: "";
+	const snippet =
+		typeof evidenceSnippetInput?.value === "string"
+			? evidenceSnippetInput.value.trim()
+			: "";
+	const confidence = Number(evidenceConfidenceInput?.value ?? "0.7");
+	if (!messagePk || !snippet) {
+		setAuthStatus("Workflow error: message_pk/snippet 입력 필요");
+		return;
+	}
+	try {
+		const response = await sendNativeMessage("workflow.create_evidence", {
+			message_pk: messagePk,
+			snippet,
+			confidence,
+		});
+		const data = handleMcpResponse(response);
+		if (todoEvidenceIdInput && data?.evidence?.evidence_id) {
+			todoEvidenceIdInput.value = data.evidence.evidence_id;
+		}
+		setResult(response);
+		setAuthStatus("Workflow: create_evidence 완료");
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		setAuthStatus(`Workflow error: ${message}`);
+	}
+};
+
+const upsertTodo = async () => {
+	const todoId =
+		typeof todoIdInput?.value === "string" ? todoIdInput.value.trim() : "";
+	const title =
+		typeof todoTitleInput?.value === "string"
+			? todoTitleInput.value.trim()
+			: "";
+	const status =
+		typeof todoStatusInput?.value === "string" ? todoStatusInput.value : "open";
+	const evidenceId =
+		typeof todoEvidenceIdInput?.value === "string"
+			? todoEvidenceIdInput.value.trim()
+			: "";
+	if (!title) {
+		setAuthStatus("Workflow error: todo title 입력 필요");
+		return;
+	}
+	try {
+		const response = await sendNativeMessage("workflow.upsert_todo", {
+			todo_id: todoId,
+			title,
+			status,
+			evidence_id: evidenceId,
+		});
+		handleMcpResponse(response);
+		setResult(response);
+		setAuthStatus("Workflow: upsert_todo 완료");
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		setAuthStatus(`Workflow error: ${message}`);
+	}
+};
+
+const listWorkflow = async () => {
+	try {
+		const response = await sendNativeMessage("workflow.list", {});
+		handleMcpResponse(response);
+		setResult(response);
+		setAuthStatus("Workflow: list 완료");
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		setAuthStatus(`Workflow error: ${message}`);
 	}
 };
 
@@ -427,8 +875,34 @@ startLoginButton?.addEventListener("click", startLogin);
 completeLoginButton?.addEventListener("click", completeLoginManual);
 checkAuthStatusButton?.addEventListener("click", requestAuthStatus);
 logoutButton?.addEventListener("click", logout);
+
 initialSyncButton?.addEventListener("click", initialSync);
 deltaSyncButton?.addEventListener("click", deltaSync);
+
+listMessagesButton?.addEventListener("click", listMessages);
+listThreadsButton?.addEventListener("click", listThreads);
+messageSelect?.addEventListener("change", fillMessageInputsFromSelection);
+threadSelect?.addEventListener("change", fillThreadInputFromSelection);
+
 getMessageButton?.addEventListener("click", getMessage);
 getThreadButton?.addEventListener("click", getThread);
+
+listAttachmentsButton?.addEventListener("click", listAttachments);
+attachmentSelect?.addEventListener("change", fillAttachmentInputsFromSelection);
 downloadAttachmentButton?.addEventListener("click", downloadAttachment);
+
+autosyncStartButton?.addEventListener("click", startAutoSyncLoop);
+autosyncStopButton?.addEventListener("click", stopAutoSyncLoop);
+
+systemHealthButton?.addEventListener("click", getSystemHealth);
+resetSessionButton?.addEventListener("click", () => resetSession(false));
+resetSessionFullButton?.addEventListener("click", () => resetSession(true));
+
+createEvidenceButton?.addEventListener("click", createEvidence);
+upsertTodoButton?.addEventListener("click", upsertTodo);
+workflowListButton?.addEventListener("click", listWorkflow);
+
+requestAuthStatus().catch((error) => {
+	const message = error instanceof Error ? error.message : String(error);
+	setAuthStatus(`Auth status error: ${message}`);
+});

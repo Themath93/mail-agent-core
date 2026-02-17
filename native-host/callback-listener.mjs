@@ -1,6 +1,12 @@
 #!/usr/bin/env node
 
-import { readFileSync, writeFileSync } from "node:fs";
+import {
+	closeSync,
+	fsyncSync,
+	openSync,
+	readFileSync,
+	writeFileSync,
+} from "node:fs";
 import { createServer } from "node:http";
 
 const [, , stateFilePath, redirectUriRaw, expectedState] = process.argv;
@@ -40,11 +46,35 @@ const readState = () => {
 };
 
 const writeState = (state) => {
-	writeFileSync(stateFilePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+	const nextState = `${JSON.stringify(state, null, 2)}\n`;
+	const fd = openSync(stateFilePath, "w");
+	try {
+		writeFileSync(fd, nextState, "utf8");
+		fsyncSync(fd);
+	} finally {
+		closeSync(fd);
+	}
 };
 
 const responseHtml = (title, message) =>
 	`<!doctype html><html><head><meta charset="utf-8" /><title>${title}</title></head><body><h1>${title}</h1><p>${message}</p><p>자동으로 닫히지 않으면 이 창을 직접 닫아 주세요.</p><button type="button" onclick="window.close()">Close</button></body></html>`;
+
+let serverClosed = false;
+
+const closeServerAndExit = (exitCode, delayMs = 20) => {
+	if (serverClosed) {
+		return;
+	}
+	serverClosed = true;
+	const shutdown = () => {
+		server.close(() => process.exit(exitCode));
+	};
+	if (delayMs <= 0) {
+		shutdown();
+		return;
+	}
+	setTimeout(shutdown, delayMs);
+};
 
 const server = createServer((req, res) => {
 	try {
@@ -62,7 +92,7 @@ const server = createServer((req, res) => {
 			res.statusCode = 400;
 			res.setHeader("Content-Type", "text/html; charset=utf-8");
 			res.end(responseHtml("Login Failed", "code/state 가 누락되었습니다."));
-			setTimeout(() => server.close(() => process.exit(0)), 10);
+			closeServerAndExit(0);
 			return;
 		}
 
@@ -70,7 +100,7 @@ const server = createServer((req, res) => {
 			res.statusCode = 400;
 			res.setHeader("Content-Type", "text/html; charset=utf-8");
 			res.end(responseHtml("Login Failed", "state 값이 일치하지 않습니다."));
-			setTimeout(() => server.close(() => process.exit(0)), 10);
+			closeServerAndExit(0);
 			return;
 		}
 
@@ -90,11 +120,11 @@ const server = createServer((req, res) => {
 				"브라우저 창을 닫고 확장 프로그램으로 돌아가세요.",
 			),
 		);
-		setTimeout(() => server.close(() => process.exit(0)), 10);
+		closeServerAndExit(0);
 	} catch {
 		res.statusCode = 500;
 		res.end("error");
-		setTimeout(() => server.close(() => process.exit(1)), 10);
+		closeServerAndExit(1);
 	}
 });
 
@@ -102,7 +132,7 @@ server.listen(listenPort, listenHost);
 
 setTimeout(
 	() => {
-		server.close(() => process.exit(0));
+		closeServerAndExit(0, 0);
 	},
 	5 * 60 * 1000,
 );
