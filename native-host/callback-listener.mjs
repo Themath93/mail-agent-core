@@ -44,7 +44,7 @@ const writeState = (state) => {
 };
 
 const responseHtml = (title, message) =>
-	`<!doctype html><html><head><meta charset="utf-8" /><title>${title}</title></head><body><h1>${title}</h1><p>${message}</p><script>window.close && window.close();</script></body></html>`;
+	`<!doctype html><html><head><meta charset="utf-8" /><title>${title}</title></head><body><h1>${title}</h1><p>${message}</p><p>자동으로 닫히지 않으면 이 창을 직접 닫아 주세요.</p><button type="button" onclick="window.close()">Close</button></body></html>`;
 
 const server = createServer((req, res) => {
 	try {

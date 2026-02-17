@@ -64,6 +64,7 @@ const normalizeState = (value) => {
 	const logs = Array.isArray(source.logs) ? source.logs.slice(-500) : [];
 
 	return {
+		...base,
 		signed_in: Boolean(source.signed_in),
 		account:
 			source.account && typeof source.account.email === "string"
@@ -102,7 +103,6 @@ const normalizeState = (value) => {
 			attachments: normalizeObject(mailbox.attachments),
 		},
 		logs: logs,
-		...base,
 	};
 };
 
