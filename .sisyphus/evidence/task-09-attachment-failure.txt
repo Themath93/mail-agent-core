@@ -1,0 +1,4 @@
+bun run test tests/mcp.test.ts -t "메시지에 없는 첨부" && bun run test tests/mcp.test.ts -t "sha256 불일치"
+- PASS
+- attachment missing: E_NOT_FOUND
+- sha mismatch: E_PARSE_FAILED

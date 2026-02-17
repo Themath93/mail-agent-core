@@ -1,5 +1,11 @@
 import { createHash, randomBytes } from "node:crypto";
 
+import {
+	createMcpStorage,
+	createStateStorageAdapter,
+} from "../storage/interface.js";
+import type { McpStorage } from "../storage/interface.js";
+
 export type McpErrorCode =
 	| "E_AUTH_REQUIRED"
 	| "E_AUTH_FAILED"
@@ -135,7 +141,8 @@ export interface GraphMailSyncDownloadAttachmentOutput {
 }
 
 export interface MailStoreGetMessageInput {
-	message_pk: string;
+	message_pk?: string;
+	message_id?: string;
 }
 
 export interface MailStoreMessage {
@@ -159,7 +166,8 @@ export interface MailStoreGetMessageOutput {
 }
 
 export interface MailStoreGetThreadInput {
-	thread_pk: string;
+	thread_pk?: string;
+	thread_id?: string;
 	depth: number;
 }
 
@@ -219,12 +227,20 @@ export interface McpAttachmentRecord {
 	sha256: string;
 }
 
+interface McpAttachmentContentMeta {
+	attachment_pk: string;
+	relative_path: string;
+	size_bytes: number;
+	sha256: string;
+}
+
 export interface McpRuntimeState {
 	account: McpAuthAccount | null;
 	issued_session: McpAuthSession | null;
 	messages: Map<string, MailStoreMessage>;
 	threadMessages: Map<string, string[]>;
 	attachments: Map<string, McpAttachmentRecord>;
+	attachmentContentBySha: Map<string, McpAttachmentContentMeta>;
 	deltaLinks: Map<string, string>;
 	signed_in: boolean;
 	auth_token: McpAuthToken | null;
@@ -232,6 +248,7 @@ export interface McpRuntimeState {
 
 export interface McpRuntimeContext {
 	state: McpRuntimeState;
+	storage: McpStorage;
 }
 
 const fallbackUrl = "http://127.0.0.1:1270/mcp/callback";
@@ -271,6 +288,7 @@ const createRuntimeState = (): McpRuntimeState => ({
 	messages: new Map(),
 	threadMessages: new Map(),
 	attachments: new Map(),
+	attachmentContentBySha: new Map(),
 	deltaLinks: new Map(),
 	signed_in: false,
 	auth_token: null,
@@ -283,10 +301,20 @@ export const createMcpContext = (
 		...createRuntimeState(),
 		...initial,
 	},
+	storage: (() => {
+		const state = {
+			...createRuntimeState(),
+			...initial,
+		};
+		const adapter = createStateStorageAdapter(state);
+		return createMcpStorage(adapter);
+	})(),
 });
 
 export const resetMcpContext = (context: McpRuntimeContext): void => {
-	context.state = createRuntimeState();
+	const next = createRuntimeState();
+	context.state = next;
+	context.storage = createMcpStorage(createStateStorageAdapter(next));
 };
 
 const isNonEmptyString = (value: unknown): value is string =>
@@ -304,6 +332,57 @@ const isArrayOfNonEmptyStrings = (
 
 const isPositiveInteger = (value: unknown): value is number =>
 	typeof value === "number" && Number.isInteger(value) && value > 0;
+
+const isMailStoreMessageRecord = (
+	value: unknown,
+): value is MailStoreMessage => {
+	if (value === null || typeof value !== "object") {
+		return false;
+	}
+
+	const candidate = value as Partial<MailStoreMessage>;
+	return (
+		isNonEmptyString(candidate.message_pk) &&
+		isNonEmptyString(candidate.provider_message_id) &&
+		isNonEmptyString(candidate.provider_thread_id) &&
+		isNonEmptyString(candidate.internet_message_id) &&
+		isNonEmptyString(candidate.web_link) &&
+		isNonEmptyString(candidate.subject) &&
+		isNonEmptyString(candidate.from) &&
+		isArrayOfNonEmptyStrings(candidate.to) &&
+		isArrayOfNonEmptyStrings(candidate.cc) &&
+		isNonEmptyString(candidate.received_at) &&
+		isNonEmptyString(candidate.body_text) &&
+		typeof candidate.has_attachments === "boolean" &&
+		isArrayOfNonEmptyStrings(candidate.attachments)
+	);
+};
+
+const resolveMailMessagePk = (
+	input: MailStoreGetMessageInput,
+): string | null => {
+	if (isNonEmptyString(input.message_pk)) {
+		return input.message_pk.trim();
+	}
+
+	if (isNonEmptyString(input.message_id)) {
+		return input.message_id.trim();
+	}
+
+	return null;
+};
+
+const resolveMailThreadPk = (input: MailStoreGetThreadInput): string | null => {
+	if (isNonEmptyString(input.thread_pk)) {
+		return input.thread_pk.trim();
+	}
+
+	if (isNonEmptyString(input.thread_id)) {
+		return input.thread_id.trim();
+	}
+
+	return null;
+};
 
 const isMcpToolName = (value: string): value is McpToolName =>
 	(MCP_TOOL_NAMES as readonly string[]).includes(value);
@@ -418,7 +497,73 @@ const requireAuthenticatedContext = (context: McpRuntimeContext) => {
 const buildDeltaLink = (mailFolder: string): string =>
 	`${mailFolder}_${Date.now()}_delta`;
 
+const parseDeltaLink = (
+	mailFolder: string,
+	deltaLink: string,
+): { folder: string; issuedAt: number } | null => {
+	const marker = "_delta";
+	if (!deltaLink.endsWith(marker)) {
+		return null;
+	}
+
+	const withoutMarker = deltaLink.slice(0, -marker.length);
+	const separatorIndex = withoutMarker.lastIndexOf("_");
+	if (separatorIndex <= 0) {
+		return null;
+	}
+
+	const folder = withoutMarker.slice(0, separatorIndex);
+	const issuedAtRaw = withoutMarker.slice(separatorIndex + 1);
+	if (folder !== mailFolder || !/^\d+$/.test(issuedAtRaw)) {
+		return null;
+	}
+
+	return {
+		folder,
+		issuedAt: Number(issuedAtRaw),
+	};
+};
+
 const MAX_DAYS_BACK = 30;
+
+interface ParsedInitialSyncInput {
+	mailFolder: string;
+	daysBack: number;
+	select: readonly string[];
+}
+
+const parseInitialSyncInput = (
+	input: GraphMailSyncInitialSyncInput,
+): McpResponse<ParsedInitialSyncInput> => {
+	if (!isNonEmptyString(input.mail_folder)) {
+		return errorResponse("E_PARSE_FAILED", "mail_folder 가 누락되었습니다.");
+	}
+
+	if (!isPositiveInteger(input.days_back)) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"days_back 는 양의 정수여야 합니다.",
+		);
+	}
+
+	if (input.days_back > MAX_DAYS_BACK) {
+		return errorResponse(
+			"E_GRAPH_THROTTLED",
+			`days_back 는 ${MAX_DAYS_BACK}일 이하여야 합니다.`,
+			true,
+		);
+	}
+
+	if (!isArrayOfNonEmptyStrings(input.select) || input.select.length === 0) {
+		return errorResponse("E_PARSE_FAILED", "select 는 비어있지 않아야 합니다.");
+	}
+
+	return okResponse({
+		mailFolder: input.mail_folder.trim(),
+		daysBack: input.days_back,
+		select: input.select,
+	});
+};
 
 const isValidAuthInput = (input: AuthStoreStartLoginInput): boolean => {
 	return isArrayOfNonEmptyStrings(input.scopes) && input.scopes.length > 0;
@@ -426,20 +571,73 @@ const isValidAuthInput = (input: AuthStoreStartLoginInput): boolean => {
 
 const createAttachmentRecord = (
 	input: GraphMailSyncDownloadAttachmentInput,
+	sha256: string,
+	attachmentPk: string,
+	sizeBytes: number,
+	relativePath: string,
 ): McpAttachmentRecord => ({
-	attachment_pk: `att_${input.graph_attachment_id}`,
+	attachment_pk: attachmentPk,
 	graph_message_id: input.graph_message_id,
 	graph_attachment_id: input.graph_attachment_id,
 	message_pk: input.message_pk,
-	relative_path: `attachments/${input.message_pk}/${input.graph_attachment_id}.bin`,
-	sha256: `sha256_${input.graph_message_id.slice(0, 8)}`,
-	size_bytes: 1024,
+	relative_path: relativePath,
+	sha256,
+	size_bytes: sizeBytes,
 });
+
+const buildAttachmentSha256 = (
+	input: GraphMailSyncDownloadAttachmentInput,
+): string =>
+	createHash("sha256")
+		.update(`${input.graph_message_id}::${input.graph_attachment_id}`)
+		.digest("hex");
+
+const buildAttachmentMeta = (sha256: string): McpAttachmentContentMeta => {
+	const attachmentPk = `att_${sha256.slice(0, 16)}`;
+	return {
+		attachment_pk: attachmentPk,
+		relative_path: `attachments/${sha256.slice(0, 2)}/${sha256}.bin`,
+		size_bytes: 1024,
+		sha256,
+	};
+};
+
+const resolveAttachmentRecord = (
+	context: McpRuntimeContext,
+	input: GraphMailSyncDownloadAttachmentInput,
+) => {
+	const lookupKey = parseAttachmentLookupKey(input);
+	const existing = context.state.attachments.get(lookupKey);
+	if (existing !== undefined) {
+		return { record: existing, created: false };
+	}
+
+	const sha256 = buildAttachmentSha256(input);
+	const cached = context.state.attachmentContentBySha.get(sha256);
+	const baseMeta =
+		cached ??
+		(() => {
+			const next = buildAttachmentMeta(sha256);
+			context.state.attachmentContentBySha.set(sha256, next);
+			return next;
+		})();
+
+	const record = createAttachmentRecord(
+		input,
+		baseMeta.sha256,
+		baseMeta.attachment_pk,
+		baseMeta.size_bytes,
+		baseMeta.relative_path,
+	);
+
+	context.state.attachments.set(lookupKey, record);
+
+	return { record, created: cached === undefined };
+};
 
 const parseAttachmentLookupKey = (
 	input: GraphMailSyncDownloadAttachmentInput,
-): string =>
-	`${input.message_pk}::${input.graph_message_id}::${input.graph_attachment_id}`;
+): string => `${input.graph_message_id}::${input.graph_attachment_id}`;
 
 const setThreadMessages = (
 	context: McpRuntimeContext,
@@ -467,13 +665,6 @@ const removeMessageAndAttachments = (
 	messagePk: string,
 ): void => {
 	context.state.messages.delete(messagePk);
-
-	for (const key of context.state.attachments.keys()) {
-		const [storedMessagePk] = key.split("::");
-		if (storedMessagePk === messagePk) {
-			context.state.attachments.delete(key);
-		}
-	}
 };
 
 const addMessage = (
@@ -585,40 +776,24 @@ const handleGraphInitialSync = (
 		return authError;
 	}
 
-	if (!isNonEmptyString(input.mail_folder)) {
-		return errorResponse("E_PARSE_FAILED", "mail_folder 가 누락되었습니다.");
+	const parsedInput = parseInitialSyncInput(input);
+	if (!parsedInput.ok) {
+		return parsedInput;
 	}
 
-	if (!isPositiveInteger(input.days_back)) {
-		return errorResponse(
-			"E_PARSE_FAILED",
-			"days_back 는 양의 정수여야 합니다.",
-		);
-	}
+	const { mailFolder, daysBack } = parsedInput.data;
 
-	if (input.days_back > MAX_DAYS_BACK) {
-		return errorResponse(
-			"E_GRAPH_THROTTLED",
-			`days_back 는 ${MAX_DAYS_BACK}일 이하여야 합니다.`,
-			true,
-		);
-	}
-
-	if (!isArrayOfNonEmptyStrings(input.select) || input.select.length === 0) {
-		return errorResponse("E_PARSE_FAILED", "select 는 비어있지 않아야 합니다.");
-	}
-
-	const syncedMessages = Math.min(input.days_back, 3);
+	const syncedMessages = Math.min(daysBack, 3);
 	let syncedAttachments = 0;
 	let syncedMessageCount = 0;
-	const threadPk = input.mail_folder;
+	const threadPk = mailFolder;
 
 	for (let index = 0; index < syncedMessages; index += 1) {
 		const hasAttachment = index % 2 === 0;
 		const message = buildDefaultMessage(
 			threadPk,
 			index,
-			input.mail_folder,
+			mailFolder,
 			hasAttachment,
 		);
 		const existingMessage = context.state.messages.get(message.message_pk);
@@ -630,24 +805,16 @@ const handleGraphInitialSync = (
 				graph_attachment_id: `att_${message.message_pk}`,
 				message_pk: message.message_pk,
 			};
-			const attachment = createAttachmentRecord(attachmentInput);
+			const { created, record } = resolveAttachmentRecord(
+				context,
+				attachmentInput,
+			);
 
-			if (
-				context.state.attachments.get(
-					parseAttachmentLookupKey(attachmentInput),
-				) === undefined
-			) {
+			if (created) {
 				syncedAttachments += 1;
 			}
 
-			context.state.attachments.set(
-				parseAttachmentLookupKey(attachmentInput),
-				attachment,
-			);
-
-			attachmentPks = mergeAttachmentPks(attachmentPks, [
-				attachment.attachment_pk,
-			]);
+			attachmentPks = mergeAttachmentPks(attachmentPks, [record.attachment_pk]);
 		}
 
 		const normalizedMessage = {
@@ -663,10 +830,15 @@ const handleGraphInitialSync = (
 		addMessage(context, threadPk, normalizedMessage);
 	}
 
-	context.state.deltaLinks.set(
-		input.mail_folder,
-		buildDeltaLink(input.mail_folder),
-	);
+	const currentDeltaLink = context.state.deltaLinks.get(mailFolder);
+	const shouldUpdateDeltaLink =
+		currentDeltaLink === undefined ||
+		syncedMessageCount > 0 ||
+		syncedAttachments > 0;
+
+	if (shouldUpdateDeltaLink) {
+		context.state.deltaLinks.set(mailFolder, buildDeltaLink(mailFolder));
+	}
 
 	return okResponse<GraphMailSyncInitialSyncOutput>({
 		synced_messages: syncedMessageCount,
@@ -687,7 +859,9 @@ const handleGraphDeltaSync = (
 		return errorResponse("E_PARSE_FAILED", "mail_folder 가 누락되었습니다.");
 	}
 
-	if (!context.state.deltaLinks.has(input.mail_folder)) {
+	const mailFolder = input.mail_folder.trim();
+	const currentDeltaLink = context.state.deltaLinks.get(mailFolder);
+	if (currentDeltaLink === undefined) {
 		return errorResponse(
 			"E_GRAPH_THROTTLED",
 			"delta link 가 없습니다. initial_sync 를 먼저 실행하세요.",
@@ -695,16 +869,50 @@ const handleGraphDeltaSync = (
 		);
 	}
 
-	const threadPk = input.mail_folder;
+	if (parseDeltaLink(mailFolder, currentDeltaLink) === null) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"delta link 형식이 올바르지 않습니다.",
+		);
+	}
+
+	const threadPk = mailFolder;
 	let existingThreadMessages = context.state.threadMessages.get(threadPk) ?? [];
+
+	if (existingThreadMessages.length === 0) {
+		return errorResponse("E_NOT_FOUND", "delta 동기화 대상 메시지가 없습니다.");
+	}
+
+	const missingMessagePk = existingThreadMessages.find(
+		(messagePk) => !context.state.messages.has(messagePk),
+	);
+	if (missingMessagePk !== undefined) {
+		return errorResponse(
+			"E_NOT_FOUND",
+			`delta 동기화 메시지 불일치: ${missingMessagePk}`,
+		);
+	}
+
+	const hasThreadCollision = existingThreadMessages.some((messagePk) => {
+		const message = context.state.messages.get(messagePk);
+		return message !== undefined && message.provider_thread_id !== threadPk;
+	});
+	if (hasThreadCollision) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"thread 충돌이 감지되어 delta 동기화를 중단했습니다.",
+		);
+	}
+
 	let deletedCount = 0;
 	let updatedCount = 0;
+	let addedCount = 0;
 
 	if (existingThreadMessages.length >= 3) {
 		const deletedMessagePk = existingThreadMessages[0] ?? "";
 		existingThreadMessages = existingThreadMessages.slice(1);
 		removeMessageAndAttachments(context, deletedMessagePk);
-		deletedCount = 1;
+		deletedCount += 1;
 	}
 
 	if (existingThreadMessages.length > 0) {
@@ -715,17 +923,11 @@ const handleGraphDeltaSync = (
 				...targetMessage,
 				subject: `갱신 ${targetMessage.subject}`,
 			});
-			updatedCount = 1;
+			updatedCount += 1;
 		}
 	}
 
 	context.state.threadMessages.set(threadPk, existingThreadMessages);
-
-	const changes = {
-		added: 1,
-		updated: updatedCount,
-		deleted: deletedCount,
-	};
 
 	const addedMessage = buildDefaultMessage(
 		threadPk,
@@ -740,25 +942,38 @@ const handleGraphDeltaSync = (
 		graph_attachment_id: `att_delta_${addedMessage.message_pk}`,
 		message_pk: addedMessage.message_pk,
 	};
-	const attachment = createAttachmentRecord(attachmentInput);
-	context.state.attachments.set(
-		parseAttachmentLookupKey(attachmentInput),
-		attachment,
+	const { record: deltaAttachment } = resolveAttachmentRecord(
+		context,
+		attachmentInput,
 	);
-	attachmentPks = mergeAttachmentPks(attachmentPks, [attachment.attachment_pk]);
+
+	attachmentPks = mergeAttachmentPks(attachmentPks, [
+		deltaAttachment.attachment_pk,
+	]);
 	addMessage(context, threadPk, {
 		...addedMessage,
 		has_attachments: true,
 		attachments: attachmentPks,
 	});
-	context.state.deltaLinks.set(
-		input.mail_folder,
-		buildDeltaLink(input.mail_folder),
-	);
+	addedCount += 1;
+
+	let nextDeltaLink = buildDeltaLink(mailFolder);
+	if (nextDeltaLink === currentDeltaLink) {
+		const parsedCurrentDeltaLink = parseDeltaLink(mailFolder, currentDeltaLink);
+		const nextIssuedAt = (parsedCurrentDeltaLink?.issuedAt ?? Date.now()) + 1;
+		nextDeltaLink = `${mailFolder}_${nextIssuedAt}_delta`;
+	}
+	context.state.deltaLinks.set(mailFolder, nextDeltaLink);
+
+	const changes = {
+		added: Math.max(0, addedCount),
+		updated: Math.max(0, updatedCount),
+		deleted: Math.max(0, deletedCount),
+	};
 
 	return okResponse<GraphMailSyncDeltaSyncOutput>({
 		changes,
-		new_delta_link_saved: true,
+		new_delta_link_saved: nextDeltaLink !== currentDeltaLink,
 	});
 };
 
@@ -786,7 +1001,8 @@ const handleGraphDownloadAttachment = (
 		return errorResponse("E_PARSE_FAILED", "message_pk 가 비어있습니다.");
 	}
 
-	const message = context.state.messages.get(input.message_pk);
+	const messagePk = input.message_pk.trim();
+	const message = context.state.messages.get(messagePk);
 	if (!message) {
 		return errorResponse(
 			"E_NOT_FOUND",
@@ -794,24 +1010,73 @@ const handleGraphDownloadAttachment = (
 		);
 	}
 
-	const existingAttachment = context.state.attachments.get(
-		parseAttachmentLookupKey(input),
-	);
-	if (existingAttachment) {
-		return okResponse<GraphMailSyncDownloadAttachmentOutput>({
-			attachment_pk: existingAttachment.attachment_pk,
-			sha256: existingAttachment.sha256,
-			relative_path: existingAttachment.relative_path,
-			size_bytes: existingAttachment.size_bytes,
+	if (message.provider_message_id !== input.graph_message_id) {
+		return errorResponse(
+			"E_NOT_FOUND",
+			"요청한 graph_message_id 와 message_pk 가 일치하지 않습니다.",
+		);
+	}
+
+	const lookupKey = parseAttachmentLookupKey(input);
+	const record = context.state.attachments.get(lookupKey);
+	if (record === undefined) {
+		return errorResponse(
+			"E_NOT_FOUND",
+			"요청한 graph_attachment_id 를 찾을 수 없습니다.",
+		);
+	}
+
+	const expectedSha = buildAttachmentSha256(input);
+	if (record.sha256 !== expectedSha) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"저장된 첨부 sha256 값이 요청 값과 일치하지 않습니다.",
+		);
+	}
+
+	const expectedAttachmentPk = `att_${expectedSha.slice(0, 16)}`;
+	const expectedRelativePath = `attachments/${expectedSha.slice(0, 2)}/${expectedSha}.bin`;
+	if (record.attachment_pk !== expectedAttachmentPk) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"저장된 attachment_pk 값이 sha256 파생 규칙과 일치하지 않습니다.",
+		);
+	}
+	if (record.relative_path !== expectedRelativePath) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"저장된 relative_path 값이 sha256 파생 규칙과 일치하지 않습니다.",
+		);
+	}
+
+	const cachedMeta = context.state.attachmentContentBySha.get(expectedSha);
+	if (cachedMeta !== undefined) {
+		if (
+			cachedMeta.attachment_pk !== record.attachment_pk ||
+			cachedMeta.relative_path !== record.relative_path ||
+			cachedMeta.size_bytes !== record.size_bytes ||
+			cachedMeta.sha256 !== record.sha256
+		) {
+			return errorResponse(
+				"E_PARSE_FAILED",
+				"첨부 캐시 메타가 저장된 첨부 레코드와 일치하지 않습니다.",
+			);
+		}
+	} else {
+		context.state.attachmentContentBySha.set(expectedSha, {
+			attachment_pk: record.attachment_pk,
+			relative_path: record.relative_path,
+			size_bytes: record.size_bytes,
+			sha256: record.sha256,
 		});
 	}
 
-	const record = createAttachmentRecord(input);
-	context.state.attachments.set(parseAttachmentLookupKey(input), record);
-	context.state.messages.set(input.message_pk, {
+	context.state.messages.set(messagePk, {
 		...message,
 		has_attachments: true,
-		attachments: [...message.attachments, record.attachment_pk],
+		attachments: mergeAttachmentPks(message.attachments, [
+			record.attachment_pk,
+		]),
 	});
 
 	return okResponse<GraphMailSyncDownloadAttachmentOutput>({
@@ -831,15 +1096,40 @@ const handleMailGetMessage = (
 		return authError;
 	}
 
-	if (!isNonEmptyString(input.message_pk)) {
-		return errorResponse("E_PARSE_FAILED", "message_pk 가 비어있습니다.");
+	const messagePk = resolveMailMessagePk(input);
+	if (messagePk === null) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"message_pk 또는 message_id 가 비어있습니다.",
+		);
 	}
 
-	const message = context.state.messages.get(input.message_pk);
+	if (!(context.state.messages instanceof Map)) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"messages store 가 준비되지 않았습니다.",
+		);
+	}
+
+	const message = context.state.messages.get(messagePk);
 	if (!message) {
 		return errorResponse(
 			"E_NOT_FOUND",
 			"요청한 message_pk 를 찾을 수 없습니다.",
+		);
+	}
+
+	if (!isMailStoreMessageRecord(message)) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"messages store 의 message 형식이 올바르지 않습니다.",
+		);
+	}
+
+	if (message.message_pk !== messagePk) {
+		return errorResponse(
+			"E_NOT_FOUND",
+			"요청한 message_pk 와 저장된 message_pk 가 일치하지 않습니다.",
 		);
 	}
 
@@ -859,29 +1149,116 @@ const handleMailGetThread = (
 		return authError;
 	}
 
-	if (!isNonEmptyString(input.thread_pk)) {
-		return errorResponse("E_PARSE_FAILED", "thread_pk 가 비어있습니다.");
-	}
-
 	if (!isPositiveInteger(input.depth)) {
 		return errorResponse("E_PARSE_FAILED", "depth 는 양의 정수여야 합니다.");
 	}
 
-	const messagePks = context.state.threadMessages.get(input.thread_pk) ?? [];
+	const threadPk = resolveMailThreadPk(input);
+	if (threadPk === null) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"thread_pk 또는 thread_id 가 비어있습니다.",
+		);
+	}
+
+	if (!(context.state.threadMessages instanceof Map)) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"threadMessages store 가 준비되지 않았습니다.",
+		);
+	}
+	if (!(context.state.messages instanceof Map)) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"messages store 가 준비되지 않았습니다.",
+		);
+	}
+
+	const storedMessagePks = context.state.threadMessages.get(threadPk);
+	if (storedMessagePks === undefined) {
+		return errorResponse("E_NOT_FOUND", "thread 를 찾을 수 없습니다.");
+	}
+	if (storedMessagePks === null) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"threadMessages 형식이 올바르지 않습니다.",
+		);
+	}
+
+	if (
+		!Array.isArray(storedMessagePks) ||
+		!storedMessagePks.every(isNonEmptyString)
+	) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"threadMessages 형식이 올바르지 않습니다.",
+		);
+	}
+
+	const messagePks = storedMessagePks.map((messagePk) => messagePk.trim());
 	if (messagePks.length === 0) {
 		return errorResponse("E_NOT_FOUND", "thread 를 찾을 수 없습니다.");
 	}
 
-	const threadMessages = messagePks
-		.slice(0, input.depth)
-		.map((messagePk) => context.state.messages.get(messagePk))
-		.filter((message): message is MailStoreMessage => message !== undefined);
-
-	if (threadMessages.length === 0) {
-		return errorResponse("E_NOT_FOUND", "thread 를 찾을 수 없습니다.");
+	const threadMessages: MailStoreMessage[] = [];
+	for (const messagePk of messagePks) {
+		const cachedMessage = context.state.messages.get(messagePk);
+		if (cachedMessage === undefined) {
+			return errorResponse(
+				"E_NOT_FOUND",
+				`thread 메시지를 찾을 수 없습니다: ${messagePk}`,
+			);
+		}
+		if (!isMailStoreMessageRecord(cachedMessage)) {
+			return errorResponse(
+				"E_PARSE_FAILED",
+				`thread message 형식이 올바르지 않습니다: ${messagePk}`,
+			);
+		}
+		const message = cachedMessage;
+		if (message.message_pk !== messagePk) {
+			return errorResponse(
+				"E_NOT_FOUND",
+				`thread message_pk 불일치: ${messagePk}`,
+			);
+		}
+		if (message.provider_thread_id !== threadPk) {
+			return errorResponse(
+				"E_NOT_FOUND",
+				`thread 충돌이 감지되었습니다: ${messagePk}`,
+			);
+		}
+		threadMessages.push(message);
 	}
 
-	return okResponse<MailStoreGetThreadOutput>(threadMessages);
+	const sorted = [...threadMessages].sort((a, b) => {
+		const aTimestamp = Date.parse(a.received_at);
+		const bTimestamp = Date.parse(b.received_at);
+		const aValue = Number.isNaN(aTimestamp)
+			? Number.NEGATIVE_INFINITY
+			: aTimestamp;
+		const bValue = Number.isNaN(bTimestamp)
+			? Number.NEGATIVE_INFINITY
+			: bTimestamp;
+		if (aValue !== bValue) {
+			return bValue - aValue;
+		}
+		if (a.message_pk < b.message_pk) {
+			return -1;
+		}
+		if (a.message_pk > b.message_pk) {
+			return 1;
+		}
+		if (a.provider_message_id < b.provider_message_id) {
+			return -1;
+		}
+		if (a.provider_message_id > b.provider_message_id) {
+			return 1;
+		}
+		return 0;
+	});
+
+	return okResponse<MailStoreGetThreadOutput>(sorted.slice(0, input.depth));
 };
 
 const MCP_TOOL_HANDLERS: {

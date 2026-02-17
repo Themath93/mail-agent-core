@@ -1,0 +1,10 @@
+bun run lint && bun run typecheck && bun run test && bun run coverage && bun run build
+- lint: PASS (biome check, no fixes)
+- typecheck: PASS (tsc --noEmit)
+- test: PASS (5 files, 121 passed)
+- coverage: PASS (All files lines 92.15%, threshold 85%+ 충족)
+- build: PASS
+
+coverage 핵심
+- src/domain/mcp.ts lines: 87.54%
+- total lines: 92.15%

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, test } from "vitest";
 import {
 	MCP_TOOL_NAMES,
@@ -372,7 +373,33 @@ describe("MCP tools", () => {
 		if (response.ok) {
 			expect(response.data.synced_messages).toBe(3);
 			expect(response.data.synced_attachments).toBe(2);
+			expect(context.state.deltaLinks.get("inbox")).toBeDefined();
 		}
+	});
+
+	test("graph_mail_sync.initial_sync는 days_back 30 경계값을 허용한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		const response = invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 30,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+
+		expect(response.ok).toBe(true);
+		if (!response.ok) {
+			throw new Error("경계값 동기화 실패");
+		}
+
+		expect(response.data.synced_messages).toBe(3);
+		expect(response.data.synced_attachments).toBe(2);
+		expect(context.state.deltaLinks.get("inbox")).toBeDefined();
 	});
 
 	test("initial_sync는 기존 메시지를 중복 계산하지 않는다", () => {
@@ -392,6 +419,11 @@ describe("MCP tools", () => {
 
 		if (!first.ok) {
 			throw new Error("초기 동기화 실패");
+		}
+
+		const firstDeltaLink = context.state.deltaLinks.get("inbox");
+		if (!firstDeltaLink) {
+			throw new Error("첫 delta link 저장 실패");
 		}
 
 		const beforeMessages = context.state.threadMessages.get("inbox")?.length;
@@ -419,6 +451,25 @@ describe("MCP tools", () => {
 		expect(context.state.threadMessages.get("inbox")?.length).toBe(
 			beforeMessages,
 		);
+		expect(context.state.deltaLinks.get("inbox")).toBe(firstDeltaLink);
+	});
+
+	test("graph_mail_sync.initial_sync는 mail_folder 유효성 실패 시 E_PARSE_FAILED", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		const response = invokeMcpToolByName(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "   ",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+
+		expectParseFailure(response);
 	});
 
 	test("graph_mail_sync.initial_sync는 잘못된 days_back를 거부한다", () => {
@@ -460,6 +511,24 @@ describe("MCP tools", () => {
 		}
 	});
 
+	test("graph_mail_sync.initial_sync는 select 유효성 실패 시 E_PARSE_FAILED", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		const response = invokeMcpToolByName(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", ""],
+			},
+			context,
+		);
+
+		expectParseFailure(response);
+	});
+
 	test("graph_mail_sync.delta_sync는 변경 내역을 반환한다", () => {
 		const context = createToolContext();
 		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
@@ -484,11 +553,51 @@ describe("MCP tools", () => {
 
 		expect(response.ok).toBe(true);
 		if (response.ok) {
-			expect(response.data.changes.added).toBeGreaterThanOrEqual(1);
+			expect(Number.isInteger(response.data.changes.added)).toBe(true);
+			expect(Number.isInteger(response.data.changes.updated)).toBe(true);
+			expect(Number.isInteger(response.data.changes.deleted)).toBe(true);
+			expect(response.data.changes.added).toBeGreaterThanOrEqual(0);
 			expect(response.data.changes.updated).toBeGreaterThanOrEqual(0);
 			expect(response.data.changes.deleted).toBeGreaterThanOrEqual(0);
 			expect(response.data.new_delta_link_saved).toBe(true);
+			expect(context.state.deltaLinks.get("inbox")).toBeDefined();
 		}
+	});
+
+	test("graph_mail_sync.delta_sync는 완료 후 새 delta link를 저장하고 조회 가능하다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+
+		const beforeLink = context.state.deltaLinks.get("inbox");
+		expect(beforeLink).toBeDefined();
+
+		const response = invokeMcpTool(
+			"graph_mail_sync.delta_sync",
+			{
+				mail_folder: "inbox",
+			},
+			context,
+		);
+
+		expect(response.ok).toBe(true);
+		if (!response.ok) {
+			throw new Error("delta 동기화 실패");
+		}
+
+		const afterLink = context.state.deltaLinks.get("inbox");
+		expect(afterLink).toBeDefined();
+		expect(afterLink).not.toBe(beforeLink);
+		expect(response.data.new_delta_link_saved).toBe(true);
 	});
 
 	test("graph_mail_sync.delta_sync는 initial_sync가 없으면 E_GRAPH_THROTTLED", () => {
@@ -507,6 +616,112 @@ describe("MCP tools", () => {
 		expect(response.ok).toBe(false);
 		if (!response.ok) {
 			expect(response.error_code).toBe("E_GRAPH_THROTTLED");
+		}
+	});
+
+	test("delta_sync는 delta link 형식이 손상되면 E_PARSE_FAILED", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+
+		context.state.deltaLinks.set("inbox", "broken_delta_link");
+
+		const response = invokeMcpTool(
+			"graph_mail_sync.delta_sync",
+			{ mail_folder: "inbox" },
+			context,
+		);
+
+		expect(response.ok).toBe(false);
+		if (!response.ok) {
+			expect(response.error_code).toBe("E_PARSE_FAILED");
+		}
+	});
+
+	test("delta_sync는 빈 delta 대상이면 E_NOT_FOUND", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		context.state.deltaLinks.set("inbox", `inbox_${Date.now()}_delta`);
+
+		const response = invokeMcpTool(
+			"graph_mail_sync.delta_sync",
+			{ mail_folder: "inbox" },
+			context,
+		);
+
+		expect(response.ok).toBe(false);
+		if (!response.ok) {
+			expect(response.error_code).toBe("E_NOT_FOUND");
+		}
+	});
+
+	test("delta_sync는 thread 메시지-스토어 불일치 시 E_NOT_FOUND", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		context.state.deltaLinks.set("inbox", `inbox_${Date.now()}_delta`);
+		context.state.threadMessages.set("inbox", ["missing_message_pk"]);
+
+		const response = invokeMcpTool(
+			"graph_mail_sync.delta_sync",
+			{ mail_folder: "inbox" },
+			context,
+		);
+
+		expect(response.ok).toBe(false);
+		if (!response.ok) {
+			expect(response.error_code).toBe("E_NOT_FOUND");
+		}
+	});
+
+	test("delta_sync는 thread collision 감지 시 E_PARSE_FAILED", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 2,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+
+		const messagePk = context.state.threadMessages.get("inbox")?.[0];
+		if (!messagePk) {
+			throw new Error("테스트 메시지 준비 실패");
+		}
+		const message = context.state.messages.get(messagePk);
+		if (!message) {
+			throw new Error("테스트 메시지 조회 실패");
+		}
+		context.state.messages.set(messagePk, {
+			...message,
+			provider_thread_id: "other-thread",
+		});
+
+		const response = invokeMcpTool(
+			"graph_mail_sync.delta_sync",
+			{ mail_folder: "inbox" },
+			context,
+		);
+
+		expect(response.ok).toBe(false);
+		if (!response.ok) {
+			expect(response.error_code).toBe("E_PARSE_FAILED");
 		}
 	});
 
@@ -606,9 +821,12 @@ describe("MCP tools", () => {
 
 		expect(first.ok).toBe(true);
 		if (first.ok) {
-			expect(first.data.attachment_pk).toBe("att_att_inbox_msg_inbox_1");
+			const sha256 = createHash("sha256")
+				.update("graph_inbox_msg_inbox_1::att_inbox_msg_inbox_1")
+				.digest("hex");
+			expect(first.data.attachment_pk).toBe(`att_${sha256.slice(0, 16)}`);
 			expect(first.data.relative_path).toBe(
-				"attachments/inbox_msg_inbox_1/att_inbox_msg_inbox_1.bin",
+				`attachments/${sha256.slice(0, 2)}/${sha256}.bin`,
 			);
 		}
 
@@ -622,6 +840,177 @@ describe("MCP tools", () => {
 			context,
 		);
 		expect(same.ok).toBe(true);
+		if (same.ok && first.ok) {
+			expect(same.data.attachment_pk).toBe(first.data.attachment_pk);
+			expect(same.data.sha256).toBe(first.data.sha256);
+			expect(same.data.relative_path).toBe(first.data.relative_path);
+			expect(same.data.size_bytes).toBe(first.data.size_bytes);
+		}
+	});
+
+	test("download_attachment는 동일한 sha256 기준으로 첨부를 dedupe 한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+
+		const baseline = invokeMcpTool(
+			"graph_mail_sync.download_attachment",
+			{
+				graph_message_id: "graph_inbox_msg_inbox_1",
+				graph_attachment_id: "att_inbox_msg_inbox_1",
+				message_pk: "inbox_msg_inbox_1",
+			},
+			context,
+		);
+		expect(baseline.ok).toBe(true);
+		if (!baseline.ok) {
+			throw new Error("기준 첨부 다운로드 실패");
+		}
+		const attachmentsBefore = context.state.attachments.size;
+
+		const sharedMessage = {
+			message_pk: "inbox_msg_inbox_dup",
+			provider_message_id: "graph_inbox_msg_inbox_1",
+			provider_thread_id: "inbox",
+			internet_message_id: "<dup@outlook.example.com>",
+			web_link: "https://outlook.office.com/mail/inbox_msg_inbox_dup",
+			subject: "중복 대상 메시지",
+			from: "sender@local.test",
+			to: [],
+			cc: [],
+			received_at: new Date().toISOString(),
+			body_text: "샘플 본문 duplicate",
+			has_attachments: false,
+			attachments: [],
+		};
+		context.state.messages.set(sharedMessage.message_pk, sharedMessage);
+		context.state.threadMessages.set("inbox", [
+			...(context.state.threadMessages.get("inbox") ?? []),
+			sharedMessage.message_pk,
+		]);
+
+		const deduped = invokeMcpTool(
+			"graph_mail_sync.download_attachment",
+			{
+				graph_message_id: "graph_inbox_msg_inbox_1",
+				graph_attachment_id: "att_inbox_msg_inbox_1",
+				message_pk: "inbox_msg_inbox_dup",
+			},
+			context,
+		);
+
+		expect(deduped.ok).toBe(true);
+		if (deduped.ok) {
+			expect(deduped.data.attachment_pk).toBe(baseline.data.attachment_pk);
+			expect(deduped.data.sha256).toBe(baseline.data.sha256);
+			expect(deduped.data.relative_path).toBe(baseline.data.relative_path);
+		}
+		expect(context.state.attachments.size).toBe(attachmentsBefore);
+	});
+
+	test("download_attachment는 메시지에 없는 첨부 요청 시 E_NOT_FOUND", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{ mail_folder: "inbox", days_back: 1, select: ["id", "subject"] },
+			context,
+		);
+
+		const missing = invokeMcpTool(
+			"graph_mail_sync.download_attachment",
+			{
+				graph_message_id: "graph_inbox_msg_inbox_1",
+				graph_attachment_id: "att_missing",
+				message_pk: "inbox_msg_inbox_1",
+			},
+			context,
+		);
+
+		expect(missing.ok).toBe(false);
+		if (!missing.ok) {
+			expect(missing.error_code).toBe("E_NOT_FOUND");
+		}
+	});
+
+	test("download_attachment는 저장된 sha256 불일치 시 E_PARSE_FAILED", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{ mail_folder: "inbox", days_back: 1, select: ["id", "subject"] },
+			context,
+		);
+
+		const lookupKey = "graph_inbox_msg_inbox_1::att_inbox_msg_inbox_1";
+		const stored = context.state.attachments.get(lookupKey);
+		if (!stored) {
+			throw new Error("테스트 첨부 레코드 준비 실패");
+		}
+		context.state.attachments.set(lookupKey, {
+			...stored,
+			sha256: "sha_mismatch",
+		});
+
+		const response = invokeMcpTool(
+			"graph_mail_sync.download_attachment",
+			{
+				graph_message_id: "graph_inbox_msg_inbox_1",
+				graph_attachment_id: "att_inbox_msg_inbox_1",
+				message_pk: "inbox_msg_inbox_1",
+			},
+			context,
+		);
+
+		expect(response.ok).toBe(false);
+		if (!response.ok) {
+			expect(response.error_code).toBe("E_PARSE_FAILED");
+		}
+	});
+
+	test("download_attachment는 message_pk와 graph_message_id 불일치 시 E_NOT_FOUND", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+
+		const mismatch = invokeMcpTool(
+			"graph_mail_sync.download_attachment",
+			{
+				graph_message_id: "graph_mismatch",
+				graph_attachment_id: "att_inbox_msg_inbox_1",
+				message_pk: "inbox_msg_inbox_1",
+			},
+			context,
+		);
+
+		expect(mismatch.ok).toBe(false);
+		if (!mismatch.ok) {
+			expect(mismatch.error_code).toBe("E_NOT_FOUND");
+		}
 	});
 
 	test("mail_store.get_message는 존재 확인과 조회를 수행한다", () => {
@@ -664,6 +1053,87 @@ describe("MCP tools", () => {
 		}
 	});
 
+	test("mail_store.get_message supports message_id alias", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+
+		const response = invokeMcpToolByName(
+			"mail_store.get_message",
+			{ message_id: "inbox_msg_inbox_1" },
+			context,
+		);
+
+		expect(response.ok).toBe(true);
+	});
+
+	test("mail_store.get_message not found returns E_NOT_FOUND", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		const response = invokeMcpToolByName(
+			"mail_store.get_message",
+			{ message_id: "missing" },
+			context,
+		);
+
+		expect(response.ok).toBe(false);
+		if (!response.ok) {
+			expect(response.error_code).toBe("E_NOT_FOUND");
+		}
+	});
+
+	test("mail_store.get_message는 message_pk 누락 시 E_PARSE_FAILED", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		const response = invokeMcpTool(
+			"mail_store.get_message",
+			{ message_pk: "   " },
+			context,
+		);
+
+		expectParseFailure(response);
+	});
+
+	test("mail_store.get_message는 message_pk/message_id가 모두 없으면 E_PARSE_FAILED", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		const response = invokeMcpToolByName("mail_store.get_message", {}, context);
+
+		expectParseFailure(response);
+	});
+
+	test("mail_store.get_message는 messages store가 없으면 E_PARSE_FAILED", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		context.state.messages =
+			undefined as unknown as McpRuntimeContext["state"]["messages"];
+
+		const response = invokeMcpTool(
+			"mail_store.get_message",
+			{ message_pk: "inbox_msg_inbox_1" },
+			context,
+		);
+
+		expectParseFailure(response);
+	});
+
 	test("mail_store.get_thread는 thread_pk 기준으로 메시지 목록을 반환한다", () => {
 		const context = createToolContext();
 		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
@@ -688,6 +1158,204 @@ describe("MCP tools", () => {
 		if (response.ok) {
 			expect(response.data.length).toBeGreaterThan(0);
 			expect(response.data[0].provider_thread_id).toBe("inbox");
+		}
+
+		const aliasResponse = invokeMcpToolByName(
+			"mail_store.get_thread",
+			{ thread_id: "inbox", depth: 20 },
+			context,
+		);
+		expect(aliasResponse.ok).toBe(true);
+	});
+
+	test("mail_store.get_thread invalid thread depth returns E_PARSE_FAILED", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		const zero = invokeMcpTool(
+			"mail_store.get_thread",
+			{ thread_pk: "inbox", depth: 0 },
+			context,
+		);
+		expectParseFailure(zero);
+
+		const negative = invokeMcpTool(
+			"mail_store.get_thread",
+			{ thread_pk: "inbox", depth: -1 },
+			context,
+		);
+		expectParseFailure(negative);
+	});
+
+	test("mail_store.get_thread는 thread_pk/thread_id가 모두 없으면 E_PARSE_FAILED", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		const response = invokeMcpToolByName(
+			"mail_store.get_thread",
+			{ depth: 20 },
+			context,
+		);
+
+		expectParseFailure(response);
+	});
+
+	test("mail_store.get_thread not found returns E_NOT_FOUND", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		const response = invokeMcpTool(
+			"mail_store.get_thread",
+			{ thread_pk: "missing-thread", depth: 20 },
+			context,
+		);
+
+		expect(response.ok).toBe(false);
+		if (!response.ok) {
+			expect(response.error_code).toBe("E_NOT_FOUND");
+		}
+	});
+
+	test("mail_store.get_thread는 threadMessages가 비어있으면 E_NOT_FOUND", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		context.state.threadMessages.set("empty", []);
+		const response = invokeMcpTool(
+			"mail_store.get_thread",
+			{ thread_pk: "empty", depth: 20 },
+			context,
+		);
+
+		expect(response.ok).toBe(false);
+		if (!response.ok) {
+			expect(response.error_code).toBe("E_NOT_FOUND");
+		}
+	});
+
+	test("mail_store.get_thread는 threadMessages/messages store 의존성이 깨지면 명시적으로 실패한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		context.state.threadMessages.set("inbox", ["missing_message_pk"]);
+		context.state.messages.clear();
+		const missingMessage = invokeMcpTool(
+			"mail_store.get_thread",
+			{ thread_pk: "inbox", depth: 20 },
+			context,
+		);
+		expect(missingMessage.ok).toBe(false);
+		if (!missingMessage.ok) {
+			expect(missingMessage.error_code).toBe("E_NOT_FOUND");
+		}
+
+		context.state.threadMessages =
+			undefined as unknown as McpRuntimeContext["state"]["threadMessages"];
+		const corrupted = invokeMcpTool(
+			"mail_store.get_thread",
+			{ thread_pk: "inbox", depth: 20 },
+			context,
+		);
+		expectParseFailure(corrupted);
+
+		context.state.threadMessages = new Map([
+			["inbox", null as unknown as string[]],
+		]);
+		const nullCache = invokeMcpTool(
+			"mail_store.get_thread",
+			{ thread_pk: "inbox", depth: 20 },
+			context,
+		);
+		expectParseFailure(nullCache);
+	});
+
+	test("mail_store.get_thread는 received_at 기준 내림차순으로 정렬한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{ mail_folder: "inbox", days_back: 2, select: ["id", "subject"] },
+			context,
+		);
+
+		const before = context.state.threadMessages.get("inbox");
+		if (!before || before.length < 2) {
+			throw new Error("정렬 테스트 준비 실패");
+		}
+
+		context.state.threadMessages.set("inbox", [
+			before[1] ?? "",
+			before[0] ?? "",
+		]);
+		const response = invokeMcpTool(
+			"mail_store.get_thread",
+			{ thread_pk: "inbox", depth: 20 },
+			context,
+		);
+
+		expect(response.ok).toBe(true);
+		if (response.ok) {
+			expect(response.data[0].message_pk).toBe(before[0]);
+		}
+	});
+
+	test("mail_store.get_thread는 동일 timestamp면 message_pk로 결정적 정렬", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		const receivedAt = new Date(0).toISOString();
+		const threadPk = "custom";
+		const messageA = {
+			message_pk: "custom_a",
+			provider_message_id: "graph_custom_a",
+			provider_thread_id: threadPk,
+			internet_message_id: "<custom_a@outlook.example.com>",
+			web_link: "https://outlook.office.com/mail/custom_a",
+			subject: "A",
+			from: "sender@local.test",
+			to: [],
+			cc: [],
+			received_at: receivedAt,
+			body_text: "A",
+			has_attachments: false,
+			attachments: [],
+		};
+		const messageB = {
+			...messageA,
+			message_pk: "custom_b",
+			provider_message_id: "graph_custom_b",
+			internet_message_id: "<custom_b@outlook.example.com>",
+			web_link: "https://outlook.office.com/mail/custom_b",
+			subject: "B",
+			body_text: "B",
+		};
+
+		context.state.messages.set(messageB.message_pk, messageB);
+		context.state.messages.set(messageA.message_pk, messageA);
+		context.state.threadMessages.set(threadPk, [
+			messageB.message_pk,
+			messageA.message_pk,
+		]);
+
+		const response = invokeMcpTool(
+			"mail_store.get_thread",
+			{ thread_pk: threadPk, depth: 20 },
+			context,
+		);
+
+		expect(response.ok).toBe(true);
+		if (response.ok) {
+			expect(response.data.map((m) => m.message_pk)).toEqual([
+				"custom_a",
+				"custom_b",
+			]);
 		}
 	});
 

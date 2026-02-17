@@ -1,0 +1,4 @@
+bun run test tests/mcp.test.ts -t "download_attachment"
+- PASS
+- 동일 첨부 2회 요청 시 attachment_pk/sha256/relative_path/size_bytes 동일
+- 서로 다른 message_pk라도 동일 graph_message_id::graph_attachment_id면 첨부 레코드 재사용(attachments Map size 증가 없음)
