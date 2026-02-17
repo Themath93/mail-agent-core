@@ -5,10 +5,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Outlook Local Work Agent</title>
     <style>
-      :root {
-        color-scheme: light;
-      }
-
       body {
         margin: 0;
         padding: 16px;
@@ -22,41 +18,103 @@
         font-size: 18px;
       }
 
+      h2 {
+        margin: 0 0 8px;
+        font-size: 14px;
+      }
+
       .card {
         background: #ffffff;
         border: 1px solid #e5e7eb;
         border-radius: 10px;
         padding: 12px;
+        margin-bottom: 10px;
       }
 
-      p {
-        margin: 8px 0;
-        line-height: 1.4;
-        font-size: 14px;
+      .row {
+        display: flex;
+        gap: 6px;
+        margin: 6px 0;
       }
 
-      code {
-        background: #eef2ff;
-        padding: 1px 5px;
-        border-radius: 5px;
+      input {
+        flex: 1;
+        min-width: 0;
+      }
+
+      button {
+        white-space: nowrap;
+      }
+
+      pre {
+        margin: 8px 0 0;
+        padding: 8px;
+        border-radius: 6px;
+        background: #f3f4f6;
+        font-size: 12px;
+        overflow: auto;
       }
     </style>
   </head>
   <body>
     <h1>Outlook Local Work Agent</h1>
+
     <div class="card">
-      <p>확장 프로그램 로드는 정상 완료되었습니다.</p>
-      <p>Native Host 연결 후 로그인 시작/완료를 순서대로 실행하세요.</p>
-      <p><button id="start-login" type="button">로그인 시작</button></p>
-      <p>
-        <input id="auth-code" type="text" placeholder="인가 코드(code) 입력" />
+      <h2>인증</h2>
+      <div class="row">
+        <button id="start-login" type="button">로그인 시작</button>
+        <button id="check-auth-status" type="button">로그인 상태 확인</button>
+        <button id="logout" type="button">로그아웃</button>
+      </div>
+      <div class="row">
+        <input id="auth-code" type="text" placeholder="인가 코드 또는 callback URL" />
         <button id="complete-login" type="button">로그인 완료</button>
-      </p>
-      <p><button id="check-auth-status" type="button">로그인 상태 확인</button></p>
-      <p id="login-url"></p>
+      </div>
       <p id="auth-status">Auth status: unknown</p>
+      <p id="login-url"></p>
       <p id="loaded-at"></p>
     </div>
+
+    <div class="card">
+      <h2>메일 동기화</h2>
+      <div class="row">
+        <input id="sync-folder" type="text" value="inbox" placeholder="mail_folder" />
+        <input id="sync-days" type="number" value="7" min="1" max="30" />
+        <button id="initial-sync" type="button">initial_sync</button>
+        <button id="delta-sync" type="button">delta_sync</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>메일 조회</h2>
+      <div class="row">
+        <input id="message-id" type="text" placeholder="message_pk 또는 message_id" />
+        <button id="get-message" type="button">get_message</button>
+      </div>
+      <div class="row">
+        <input id="thread-id" type="text" placeholder="thread_pk 또는 thread_id" />
+        <input id="thread-depth" type="number" value="10" min="1" />
+        <button id="get-thread" type="button">get_thread</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>첨부 다운로드</h2>
+      <div class="row">
+        <input id="attachment-message-id" type="text" placeholder="graph_message_id" />
+        <input id="attachment-id" type="text" placeholder="graph_attachment_id" />
+      </div>
+      <div class="row">
+        <input id="attachment-message-pk" type="text" placeholder="message_pk" />
+        <button id="download-attachment" type="button">download_attachment</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>결과</h2>
+      <pre id="result">{}</pre>
+    </div>
+
     <script src="sidepanel.js"></script>
   </body>
 </html>
