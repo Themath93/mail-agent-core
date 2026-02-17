@@ -38,6 +38,14 @@ Microsoft Graph API 기반으로 Outlook 메일과 첨부 파일을 로컬에서
 - 코드 작성/테스트/리뷰 규칙은 `pm_notes/코드_규칙.md`를 참고합니다.
 - 기능 개발 단계, PR 절차, 커밋 규칙은 위 규칙 문서에 통합 관리합니다.
 - 기여 규칙은 `CONTRIBUTING.md`에서 `main` 대상 브랜치·PR·커밋 템플릿을 함께 확인하세요.
+- 에이전트/자동화 작업 공통 규칙은 `Agents.md`를 기준으로 따릅니다.
+
+## 에이전트 작업 공통 규칙
+
+- 작업 시작 전 `Agents.md` 확인 (브랜치/PR/검증/롤백 공통 규칙)
+- PR 생성 시 제목 형식 `v<major>.<minor>.<patch> | <요약>` 준수
+- PR 본문은 `.github/PULL_REQUEST_TEMPLATE.md`의 필수 섹션(`개요/검증/핵심 체크/위험/롤백`)을 모두 작성
+- 머지 전 `bun run ci` 통과와 커버리지 임계치(85% 이상) 충족
 
 ## CI/CD 요건
 
