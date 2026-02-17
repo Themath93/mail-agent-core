@@ -135,7 +135,8 @@ export interface GraphMailSyncDownloadAttachmentOutput {
 }
 
 export interface MailStoreGetMessageInput {
-	message_pk: string;
+	message_pk?: string;
+	message_id?: string;
 }
 
 export interface MailStoreMessage {
@@ -159,7 +160,8 @@ export interface MailStoreGetMessageOutput {
 }
 
 export interface MailStoreGetThreadInput {
-	thread_pk: string;
+	thread_pk?: string;
+	thread_id?: string;
 	depth: number;
 }
 
@@ -313,6 +315,57 @@ const isArrayOfNonEmptyStrings = (
 
 const isPositiveInteger = (value: unknown): value is number =>
 	typeof value === "number" && Number.isInteger(value) && value > 0;
+
+const isMailStoreMessageRecord = (
+	value: unknown,
+): value is MailStoreMessage => {
+	if (value === null || typeof value !== "object") {
+		return false;
+	}
+
+	const candidate = value as Partial<MailStoreMessage>;
+	return (
+		isNonEmptyString(candidate.message_pk) &&
+		isNonEmptyString(candidate.provider_message_id) &&
+		isNonEmptyString(candidate.provider_thread_id) &&
+		isNonEmptyString(candidate.internet_message_id) &&
+		isNonEmptyString(candidate.web_link) &&
+		isNonEmptyString(candidate.subject) &&
+		isNonEmptyString(candidate.from) &&
+		isArrayOfNonEmptyStrings(candidate.to) &&
+		isArrayOfNonEmptyStrings(candidate.cc) &&
+		isNonEmptyString(candidate.received_at) &&
+		isNonEmptyString(candidate.body_text) &&
+		typeof candidate.has_attachments === "boolean" &&
+		isArrayOfNonEmptyStrings(candidate.attachments)
+	);
+};
+
+const resolveMailMessagePk = (
+	input: MailStoreGetMessageInput,
+): string | null => {
+	if (isNonEmptyString(input.message_pk)) {
+		return input.message_pk.trim();
+	}
+
+	if (isNonEmptyString(input.message_id)) {
+		return input.message_id.trim();
+	}
+
+	return null;
+};
+
+const resolveMailThreadPk = (input: MailStoreGetThreadInput): string | null => {
+	if (isNonEmptyString(input.thread_pk)) {
+		return input.thread_pk.trim();
+	}
+
+	if (isNonEmptyString(input.thread_id)) {
+		return input.thread_id.trim();
+	}
+
+	return null;
+};
 
 const isMcpToolName = (value: string): value is McpToolName =>
 	(MCP_TOOL_NAMES as readonly string[]).includes(value);
@@ -939,7 +992,8 @@ const handleGraphDownloadAttachment = (
 		return errorResponse("E_PARSE_FAILED", "message_pk 가 비어있습니다.");
 	}
 
-	const message = context.state.messages.get(input.message_pk);
+	const messagePk = input.message_pk.trim();
+	const message = context.state.messages.get(messagePk);
 	if (!message) {
 		return errorResponse(
 			"E_NOT_FOUND",
@@ -967,7 +1021,7 @@ const handleGraphDownloadAttachment = (
 	}
 
 	const { record } = resolveAttachmentRecord(context, input);
-	context.state.messages.set(input.message_pk, {
+	context.state.messages.set(messagePk, {
 		...message,
 		has_attachments: true,
 		attachments: mergeAttachmentPks(message.attachments, [
@@ -992,15 +1046,40 @@ const handleMailGetMessage = (
 		return authError;
 	}
 
-	if (!isNonEmptyString(input.message_pk)) {
-		return errorResponse("E_PARSE_FAILED", "message_pk 가 비어있습니다.");
+	const messagePk = resolveMailMessagePk(input);
+	if (messagePk === null) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"message_pk 또는 message_id 가 비어있습니다.",
+		);
 	}
 
-	const message = context.state.messages.get(input.message_pk);
+	if (!(context.state.messages instanceof Map)) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"messages store 가 준비되지 않았습니다.",
+		);
+	}
+
+	const message = context.state.messages.get(messagePk);
 	if (!message) {
 		return errorResponse(
 			"E_NOT_FOUND",
 			"요청한 message_pk 를 찾을 수 없습니다.",
+		);
+	}
+
+	if (!isMailStoreMessageRecord(message)) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"messages store 의 message 형식이 올바르지 않습니다.",
+		);
+	}
+
+	if (message.message_pk !== messagePk) {
+		return errorResponse(
+			"E_NOT_FOUND",
+			"요청한 message_pk 와 저장된 message_pk 가 일치하지 않습니다.",
 		);
 	}
 
@@ -1020,29 +1099,116 @@ const handleMailGetThread = (
 		return authError;
 	}
 
-	if (!isNonEmptyString(input.thread_pk)) {
-		return errorResponse("E_PARSE_FAILED", "thread_pk 가 비어있습니다.");
-	}
-
 	if (!isPositiveInteger(input.depth)) {
 		return errorResponse("E_PARSE_FAILED", "depth 는 양의 정수여야 합니다.");
 	}
 
-	const messagePks = context.state.threadMessages.get(input.thread_pk) ?? [];
+	const threadPk = resolveMailThreadPk(input);
+	if (threadPk === null) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"thread_pk 또는 thread_id 가 비어있습니다.",
+		);
+	}
+
+	if (!(context.state.threadMessages instanceof Map)) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"threadMessages store 가 준비되지 않았습니다.",
+		);
+	}
+	if (!(context.state.messages instanceof Map)) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"messages store 가 준비되지 않았습니다.",
+		);
+	}
+
+	const storedMessagePks = context.state.threadMessages.get(threadPk);
+	if (storedMessagePks === undefined) {
+		return errorResponse("E_NOT_FOUND", "thread 를 찾을 수 없습니다.");
+	}
+	if (storedMessagePks === null) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"threadMessages 형식이 올바르지 않습니다.",
+		);
+	}
+
+	if (
+		!Array.isArray(storedMessagePks) ||
+		!storedMessagePks.every(isNonEmptyString)
+	) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"threadMessages 형식이 올바르지 않습니다.",
+		);
+	}
+
+	const messagePks = storedMessagePks.map((messagePk) => messagePk.trim());
 	if (messagePks.length === 0) {
 		return errorResponse("E_NOT_FOUND", "thread 를 찾을 수 없습니다.");
 	}
 
-	const threadMessages = messagePks
-		.slice(0, input.depth)
-		.map((messagePk) => context.state.messages.get(messagePk))
-		.filter((message): message is MailStoreMessage => message !== undefined);
-
-	if (threadMessages.length === 0) {
-		return errorResponse("E_NOT_FOUND", "thread 를 찾을 수 없습니다.");
+	const threadMessages: MailStoreMessage[] = [];
+	for (const messagePk of messagePks) {
+		const cachedMessage = context.state.messages.get(messagePk);
+		if (cachedMessage === undefined) {
+			return errorResponse(
+				"E_NOT_FOUND",
+				`thread 메시지를 찾을 수 없습니다: ${messagePk}`,
+			);
+		}
+		if (!isMailStoreMessageRecord(cachedMessage)) {
+			return errorResponse(
+				"E_PARSE_FAILED",
+				`thread message 형식이 올바르지 않습니다: ${messagePk}`,
+			);
+		}
+		const message = cachedMessage;
+		if (message.message_pk !== messagePk) {
+			return errorResponse(
+				"E_NOT_FOUND",
+				`thread message_pk 불일치: ${messagePk}`,
+			);
+		}
+		if (message.provider_thread_id !== threadPk) {
+			return errorResponse(
+				"E_NOT_FOUND",
+				`thread 충돌이 감지되었습니다: ${messagePk}`,
+			);
+		}
+		threadMessages.push(message);
 	}
 
-	return okResponse<MailStoreGetThreadOutput>(threadMessages);
+	const sorted = [...threadMessages].sort((a, b) => {
+		const aTimestamp = Date.parse(a.received_at);
+		const bTimestamp = Date.parse(b.received_at);
+		const aValue = Number.isNaN(aTimestamp)
+			? Number.NEGATIVE_INFINITY
+			: aTimestamp;
+		const bValue = Number.isNaN(bTimestamp)
+			? Number.NEGATIVE_INFINITY
+			: bTimestamp;
+		if (aValue !== bValue) {
+			return bValue - aValue;
+		}
+		if (a.message_pk < b.message_pk) {
+			return -1;
+		}
+		if (a.message_pk > b.message_pk) {
+			return 1;
+		}
+		if (a.provider_message_id < b.provider_message_id) {
+			return -1;
+		}
+		if (a.provider_message_id > b.provider_message_id) {
+			return 1;
+		}
+		return 0;
+	});
+
+	return okResponse<MailStoreGetThreadOutput>(sorted.slice(0, input.depth));
 };
 
 const MCP_TOOL_HANDLERS: {

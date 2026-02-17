@@ -981,6 +981,87 @@ describe("MCP tools", () => {
 		}
 	});
 
+	test("mail_store.get_message supports message_id alias", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+
+		const response = invokeMcpToolByName(
+			"mail_store.get_message",
+			{ message_id: "inbox_msg_inbox_1" },
+			context,
+		);
+
+		expect(response.ok).toBe(true);
+	});
+
+	test("mail_store.get_message not found returns E_NOT_FOUND", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		const response = invokeMcpToolByName(
+			"mail_store.get_message",
+			{ message_id: "missing" },
+			context,
+		);
+
+		expect(response.ok).toBe(false);
+		if (!response.ok) {
+			expect(response.error_code).toBe("E_NOT_FOUND");
+		}
+	});
+
+	test("mail_store.get_message는 message_pk 누락 시 E_PARSE_FAILED", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		const response = invokeMcpTool(
+			"mail_store.get_message",
+			{ message_pk: "   " },
+			context,
+		);
+
+		expectParseFailure(response);
+	});
+
+	test("mail_store.get_message는 message_pk/message_id가 모두 없으면 E_PARSE_FAILED", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		const response = invokeMcpToolByName("mail_store.get_message", {}, context);
+
+		expectParseFailure(response);
+	});
+
+	test("mail_store.get_message는 messages store가 없으면 E_PARSE_FAILED", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		context.state.messages =
+			undefined as unknown as McpRuntimeContext["state"]["messages"];
+
+		const response = invokeMcpTool(
+			"mail_store.get_message",
+			{ message_pk: "inbox_msg_inbox_1" },
+			context,
+		);
+
+		expectParseFailure(response);
+	});
+
 	test("mail_store.get_thread는 thread_pk 기준으로 메시지 목록을 반환한다", () => {
 		const context = createToolContext();
 		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
@@ -1005,6 +1086,204 @@ describe("MCP tools", () => {
 		if (response.ok) {
 			expect(response.data.length).toBeGreaterThan(0);
 			expect(response.data[0].provider_thread_id).toBe("inbox");
+		}
+
+		const aliasResponse = invokeMcpToolByName(
+			"mail_store.get_thread",
+			{ thread_id: "inbox", depth: 20 },
+			context,
+		);
+		expect(aliasResponse.ok).toBe(true);
+	});
+
+	test("mail_store.get_thread invalid thread depth returns E_PARSE_FAILED", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		const zero = invokeMcpTool(
+			"mail_store.get_thread",
+			{ thread_pk: "inbox", depth: 0 },
+			context,
+		);
+		expectParseFailure(zero);
+
+		const negative = invokeMcpTool(
+			"mail_store.get_thread",
+			{ thread_pk: "inbox", depth: -1 },
+			context,
+		);
+		expectParseFailure(negative);
+	});
+
+	test("mail_store.get_thread는 thread_pk/thread_id가 모두 없으면 E_PARSE_FAILED", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		const response = invokeMcpToolByName(
+			"mail_store.get_thread",
+			{ depth: 20 },
+			context,
+		);
+
+		expectParseFailure(response);
+	});
+
+	test("mail_store.get_thread not found returns E_NOT_FOUND", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		const response = invokeMcpTool(
+			"mail_store.get_thread",
+			{ thread_pk: "missing-thread", depth: 20 },
+			context,
+		);
+
+		expect(response.ok).toBe(false);
+		if (!response.ok) {
+			expect(response.error_code).toBe("E_NOT_FOUND");
+		}
+	});
+
+	test("mail_store.get_thread는 threadMessages가 비어있으면 E_NOT_FOUND", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		context.state.threadMessages.set("empty", []);
+		const response = invokeMcpTool(
+			"mail_store.get_thread",
+			{ thread_pk: "empty", depth: 20 },
+			context,
+		);
+
+		expect(response.ok).toBe(false);
+		if (!response.ok) {
+			expect(response.error_code).toBe("E_NOT_FOUND");
+		}
+	});
+
+	test("mail_store.get_thread는 threadMessages/messages store 의존성이 깨지면 명시적으로 실패한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		context.state.threadMessages.set("inbox", ["missing_message_pk"]);
+		context.state.messages.clear();
+		const missingMessage = invokeMcpTool(
+			"mail_store.get_thread",
+			{ thread_pk: "inbox", depth: 20 },
+			context,
+		);
+		expect(missingMessage.ok).toBe(false);
+		if (!missingMessage.ok) {
+			expect(missingMessage.error_code).toBe("E_NOT_FOUND");
+		}
+
+		context.state.threadMessages =
+			undefined as unknown as McpRuntimeContext["state"]["threadMessages"];
+		const corrupted = invokeMcpTool(
+			"mail_store.get_thread",
+			{ thread_pk: "inbox", depth: 20 },
+			context,
+		);
+		expectParseFailure(corrupted);
+
+		context.state.threadMessages = new Map([
+			["inbox", null as unknown as string[]],
+		]);
+		const nullCache = invokeMcpTool(
+			"mail_store.get_thread",
+			{ thread_pk: "inbox", depth: 20 },
+			context,
+		);
+		expectParseFailure(nullCache);
+	});
+
+	test("mail_store.get_thread는 received_at 기준 내림차순으로 정렬한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{ mail_folder: "inbox", days_back: 2, select: ["id", "subject"] },
+			context,
+		);
+
+		const before = context.state.threadMessages.get("inbox");
+		if (!before || before.length < 2) {
+			throw new Error("정렬 테스트 준비 실패");
+		}
+
+		context.state.threadMessages.set("inbox", [
+			before[1] ?? "",
+			before[0] ?? "",
+		]);
+		const response = invokeMcpTool(
+			"mail_store.get_thread",
+			{ thread_pk: "inbox", depth: 20 },
+			context,
+		);
+
+		expect(response.ok).toBe(true);
+		if (response.ok) {
+			expect(response.data[0].message_pk).toBe(before[0]);
+		}
+	});
+
+	test("mail_store.get_thread는 동일 timestamp면 message_pk로 결정적 정렬", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		const receivedAt = new Date(0).toISOString();
+		const threadPk = "custom";
+		const messageA = {
+			message_pk: "custom_a",
+			provider_message_id: "graph_custom_a",
+			provider_thread_id: threadPk,
+			internet_message_id: "<custom_a@outlook.example.com>",
+			web_link: "https://outlook.office.com/mail/custom_a",
+			subject: "A",
+			from: "sender@local.test",
+			to: [],
+			cc: [],
+			received_at: receivedAt,
+			body_text: "A",
+			has_attachments: false,
+			attachments: [],
+		};
+		const messageB = {
+			...messageA,
+			message_pk: "custom_b",
+			provider_message_id: "graph_custom_b",
+			internet_message_id: "<custom_b@outlook.example.com>",
+			web_link: "https://outlook.office.com/mail/custom_b",
+			subject: "B",
+			body_text: "B",
+		};
+
+		context.state.messages.set(messageB.message_pk, messageB);
+		context.state.messages.set(messageA.message_pk, messageA);
+		context.state.threadMessages.set(threadPk, [
+			messageB.message_pk,
+			messageA.message_pk,
+		]);
+
+		const response = invokeMcpTool(
+			"mail_store.get_thread",
+			{ thread_pk: threadPk, depth: 20 },
+			context,
+		);
+
+		expect(response.ok).toBe(true);
+		if (response.ok) {
+			expect(response.data.map((m) => m.message_pk)).toEqual([
+				"custom_a",
+				"custom_b",
+			]);
 		}
 	});
 
