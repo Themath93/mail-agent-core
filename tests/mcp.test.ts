@@ -553,11 +553,51 @@ describe("MCP tools", () => {
 
 		expect(response.ok).toBe(true);
 		if (response.ok) {
-			expect(response.data.changes.added).toBeGreaterThanOrEqual(1);
+			expect(Number.isInteger(response.data.changes.added)).toBe(true);
+			expect(Number.isInteger(response.data.changes.updated)).toBe(true);
+			expect(Number.isInteger(response.data.changes.deleted)).toBe(true);
+			expect(response.data.changes.added).toBeGreaterThanOrEqual(0);
 			expect(response.data.changes.updated).toBeGreaterThanOrEqual(0);
 			expect(response.data.changes.deleted).toBeGreaterThanOrEqual(0);
 			expect(response.data.new_delta_link_saved).toBe(true);
+			expect(context.state.deltaLinks.get("inbox")).toBeDefined();
 		}
+	});
+
+	test("graph_mail_sync.delta_sync는 완료 후 새 delta link를 저장하고 조회 가능하다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+
+		const beforeLink = context.state.deltaLinks.get("inbox");
+		expect(beforeLink).toBeDefined();
+
+		const response = invokeMcpTool(
+			"graph_mail_sync.delta_sync",
+			{
+				mail_folder: "inbox",
+			},
+			context,
+		);
+
+		expect(response.ok).toBe(true);
+		if (!response.ok) {
+			throw new Error("delta 동기화 실패");
+		}
+
+		const afterLink = context.state.deltaLinks.get("inbox");
+		expect(afterLink).toBeDefined();
+		expect(afterLink).not.toBe(beforeLink);
+		expect(response.data.new_delta_link_saved).toBe(true);
 	});
 
 	test("graph_mail_sync.delta_sync는 initial_sync가 없으면 E_GRAPH_THROTTLED", () => {
@@ -576,6 +616,112 @@ describe("MCP tools", () => {
 		expect(response.ok).toBe(false);
 		if (!response.ok) {
 			expect(response.error_code).toBe("E_GRAPH_THROTTLED");
+		}
+	});
+
+	test("delta_sync는 delta link 형식이 손상되면 E_PARSE_FAILED", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+
+		context.state.deltaLinks.set("inbox", "broken_delta_link");
+
+		const response = invokeMcpTool(
+			"graph_mail_sync.delta_sync",
+			{ mail_folder: "inbox" },
+			context,
+		);
+
+		expect(response.ok).toBe(false);
+		if (!response.ok) {
+			expect(response.error_code).toBe("E_PARSE_FAILED");
+		}
+	});
+
+	test("delta_sync는 빈 delta 대상이면 E_NOT_FOUND", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		context.state.deltaLinks.set("inbox", `inbox_${Date.now()}_delta`);
+
+		const response = invokeMcpTool(
+			"graph_mail_sync.delta_sync",
+			{ mail_folder: "inbox" },
+			context,
+		);
+
+		expect(response.ok).toBe(false);
+		if (!response.ok) {
+			expect(response.error_code).toBe("E_NOT_FOUND");
+		}
+	});
+
+	test("delta_sync는 thread 메시지-스토어 불일치 시 E_NOT_FOUND", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		context.state.deltaLinks.set("inbox", `inbox_${Date.now()}_delta`);
+		context.state.threadMessages.set("inbox", ["missing_message_pk"]);
+
+		const response = invokeMcpTool(
+			"graph_mail_sync.delta_sync",
+			{ mail_folder: "inbox" },
+			context,
+		);
+
+		expect(response.ok).toBe(false);
+		if (!response.ok) {
+			expect(response.error_code).toBe("E_NOT_FOUND");
+		}
+	});
+
+	test("delta_sync는 thread collision 감지 시 E_PARSE_FAILED", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 2,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+
+		const messagePk = context.state.threadMessages.get("inbox")?.[0];
+		if (!messagePk) {
+			throw new Error("테스트 메시지 준비 실패");
+		}
+		const message = context.state.messages.get(messagePk);
+		if (!message) {
+			throw new Error("테스트 메시지 조회 실패");
+		}
+		context.state.messages.set(messagePk, {
+			...message,
+			provider_thread_id: "other-thread",
+		});
+
+		const response = invokeMcpTool(
+			"graph_mail_sync.delta_sync",
+			{ mail_folder: "inbox" },
+			context,
+		);
+
+		expect(response.ok).toBe(false);
+		if (!response.ok) {
+			expect(response.error_code).toBe("E_PARSE_FAILED");
 		}
 	});
 

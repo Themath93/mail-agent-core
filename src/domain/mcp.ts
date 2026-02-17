@@ -427,6 +427,33 @@ const requireAuthenticatedContext = (context: McpRuntimeContext) => {
 const buildDeltaLink = (mailFolder: string): string =>
 	`${mailFolder}_${Date.now()}_delta`;
 
+const parseDeltaLink = (
+	mailFolder: string,
+	deltaLink: string,
+): { folder: string; issuedAt: number } | null => {
+	const marker = "_delta";
+	if (!deltaLink.endsWith(marker)) {
+		return null;
+	}
+
+	const withoutMarker = deltaLink.slice(0, -marker.length);
+	const separatorIndex = withoutMarker.lastIndexOf("_");
+	if (separatorIndex <= 0) {
+		return null;
+	}
+
+	const folder = withoutMarker.slice(0, separatorIndex);
+	const issuedAtRaw = withoutMarker.slice(separatorIndex + 1);
+	if (folder !== mailFolder || !/^\d+$/.test(issuedAtRaw)) {
+		return null;
+	}
+
+	return {
+		folder,
+		issuedAt: Number(issuedAtRaw),
+	};
+};
+
 const MAX_DAYS_BACK = 30;
 
 interface ParsedInitialSyncInput {
@@ -770,7 +797,9 @@ const handleGraphDeltaSync = (
 		return errorResponse("E_PARSE_FAILED", "mail_folder 가 누락되었습니다.");
 	}
 
-	if (!context.state.deltaLinks.has(input.mail_folder)) {
+	const mailFolder = input.mail_folder.trim();
+	const currentDeltaLink = context.state.deltaLinks.get(mailFolder);
+	if (currentDeltaLink === undefined) {
 		return errorResponse(
 			"E_GRAPH_THROTTLED",
 			"delta link 가 없습니다. initial_sync 를 먼저 실행하세요.",
@@ -778,16 +807,50 @@ const handleGraphDeltaSync = (
 		);
 	}
 
-	const threadPk = input.mail_folder;
+	if (parseDeltaLink(mailFolder, currentDeltaLink) === null) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"delta link 형식이 올바르지 않습니다.",
+		);
+	}
+
+	const threadPk = mailFolder;
 	let existingThreadMessages = context.state.threadMessages.get(threadPk) ?? [];
+
+	if (existingThreadMessages.length === 0) {
+		return errorResponse("E_NOT_FOUND", "delta 동기화 대상 메시지가 없습니다.");
+	}
+
+	const missingMessagePk = existingThreadMessages.find(
+		(messagePk) => !context.state.messages.has(messagePk),
+	);
+	if (missingMessagePk !== undefined) {
+		return errorResponse(
+			"E_NOT_FOUND",
+			`delta 동기화 메시지 불일치: ${missingMessagePk}`,
+		);
+	}
+
+	const hasThreadCollision = existingThreadMessages.some((messagePk) => {
+		const message = context.state.messages.get(messagePk);
+		return message !== undefined && message.provider_thread_id !== threadPk;
+	});
+	if (hasThreadCollision) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"thread 충돌이 감지되어 delta 동기화를 중단했습니다.",
+		);
+	}
+
 	let deletedCount = 0;
 	let updatedCount = 0;
+	let addedCount = 0;
 
 	if (existingThreadMessages.length >= 3) {
 		const deletedMessagePk = existingThreadMessages[0] ?? "";
 		existingThreadMessages = existingThreadMessages.slice(1);
 		removeMessageAndAttachments(context, deletedMessagePk);
-		deletedCount = 1;
+		deletedCount += 1;
 	}
 
 	if (existingThreadMessages.length > 0) {
@@ -798,17 +861,11 @@ const handleGraphDeltaSync = (
 				...targetMessage,
 				subject: `갱신 ${targetMessage.subject}`,
 			});
-			updatedCount = 1;
+			updatedCount += 1;
 		}
 	}
 
 	context.state.threadMessages.set(threadPk, existingThreadMessages);
-
-	const changes = {
-		added: 1,
-		updated: updatedCount,
-		deleted: deletedCount,
-	};
 
 	const addedMessage = buildDefaultMessage(
 		threadPk,
@@ -836,14 +893,25 @@ const handleGraphDeltaSync = (
 		has_attachments: true,
 		attachments: attachmentPks,
 	});
-	context.state.deltaLinks.set(
-		input.mail_folder,
-		buildDeltaLink(input.mail_folder),
-	);
+	addedCount += 1;
+
+	let nextDeltaLink = buildDeltaLink(mailFolder);
+	if (nextDeltaLink === currentDeltaLink) {
+		const parsedCurrentDeltaLink = parseDeltaLink(mailFolder, currentDeltaLink);
+		const nextIssuedAt = (parsedCurrentDeltaLink?.issuedAt ?? Date.now()) + 1;
+		nextDeltaLink = `${mailFolder}_${nextIssuedAt}_delta`;
+	}
+	context.state.deltaLinks.set(mailFolder, nextDeltaLink);
+
+	const changes = {
+		added: Math.max(0, addedCount),
+		updated: Math.max(0, updatedCount),
+		deleted: Math.max(0, deletedCount),
+	};
 
 	return okResponse<GraphMailSyncDeltaSyncOutput>({
 		changes,
-		new_delta_link_saved: true,
+		new_delta_link_saved: nextDeltaLink !== currentDeltaLink,
 	});
 };
 
