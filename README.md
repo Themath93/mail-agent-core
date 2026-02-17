@@ -11,6 +11,9 @@ Microsoft Graph API 기반으로 Outlook 메일과 첨부 파일을 로컬에서
 
 ## 사용 가이드(초안)
 
+- 사용자 사용 설명서: `docs/chrome-extension-user-guide.md`
+- 설치 가이드: `docs/install-guide.md`
+
 ### 실행 흐름
 
 1. Chrome Extension은 인증/동기화 UI와 사이드 패널을 제공
