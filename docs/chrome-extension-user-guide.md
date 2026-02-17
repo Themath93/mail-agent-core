@@ -27,9 +27,8 @@
 
 ## 4.1 로그인 및 상태 확인
 
-- 로그인 시작: `auth_store.start_login`
-- 로그인 완료: `auth_store.complete_login`
-- 상태 확인: `auth_store.auth_status`
+- 사이드패널의 "로그인 상태 확인" 버튼으로 Native Host의 auth status를 확인합니다.
+- 최소 연결 단계에서는 상태 응답(`signed_in`, `account`) 확인까지만 지원합니다.
 
 로그인 실패 또는 세션 만료 시 재로그인을 수행하세요.
 
