@@ -46,8 +46,14 @@
     <h1>Outlook Local Work Agent</h1>
     <div class="card">
       <p>확장 프로그램 로드는 정상 완료되었습니다.</p>
-      <p>다음 단계는 <code>docs/install-guide.md</code>를 따라 Native Host를 연결하는 것입니다.</p>
+      <p>Native Host 연결 후 로그인 시작/완료를 순서대로 실행하세요.</p>
+      <p><button id="start-login" type="button">로그인 시작</button></p>
+      <p>
+        <input id="auth-code" type="text" placeholder="인가 코드(code) 입력" />
+        <button id="complete-login" type="button">로그인 완료</button>
+      </p>
       <p><button id="check-auth-status" type="button">로그인 상태 확인</button></p>
+      <p id="login-url"></p>
       <p id="auth-status">Auth status: unknown</p>
       <p id="loaded-at"></p>
     </div>
