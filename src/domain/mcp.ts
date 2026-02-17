@@ -429,6 +429,45 @@ const buildDeltaLink = (mailFolder: string): string =>
 
 const MAX_DAYS_BACK = 30;
 
+interface ParsedInitialSyncInput {
+	mailFolder: string;
+	daysBack: number;
+	select: readonly string[];
+}
+
+const parseInitialSyncInput = (
+	input: GraphMailSyncInitialSyncInput,
+): McpResponse<ParsedInitialSyncInput> => {
+	if (!isNonEmptyString(input.mail_folder)) {
+		return errorResponse("E_PARSE_FAILED", "mail_folder 가 누락되었습니다.");
+	}
+
+	if (!isPositiveInteger(input.days_back)) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"days_back 는 양의 정수여야 합니다.",
+		);
+	}
+
+	if (input.days_back > MAX_DAYS_BACK) {
+		return errorResponse(
+			"E_GRAPH_THROTTLED",
+			`days_back 는 ${MAX_DAYS_BACK}일 이하여야 합니다.`,
+			true,
+		);
+	}
+
+	if (!isArrayOfNonEmptyStrings(input.select) || input.select.length === 0) {
+		return errorResponse("E_PARSE_FAILED", "select 는 비어있지 않아야 합니다.");
+	}
+
+	return okResponse({
+		mailFolder: input.mail_folder.trim(),
+		daysBack: input.days_back,
+		select: input.select,
+	});
+};
+
 const isValidAuthInput = (input: AuthStoreStartLoginInput): boolean => {
 	return isArrayOfNonEmptyStrings(input.scopes) && input.scopes.length > 0;
 };
@@ -648,40 +687,24 @@ const handleGraphInitialSync = (
 		return authError;
 	}
 
-	if (!isNonEmptyString(input.mail_folder)) {
-		return errorResponse("E_PARSE_FAILED", "mail_folder 가 누락되었습니다.");
+	const parsedInput = parseInitialSyncInput(input);
+	if (!parsedInput.ok) {
+		return parsedInput;
 	}
 
-	if (!isPositiveInteger(input.days_back)) {
-		return errorResponse(
-			"E_PARSE_FAILED",
-			"days_back 는 양의 정수여야 합니다.",
-		);
-	}
+	const { mailFolder, daysBack } = parsedInput.data;
 
-	if (input.days_back > MAX_DAYS_BACK) {
-		return errorResponse(
-			"E_GRAPH_THROTTLED",
-			`days_back 는 ${MAX_DAYS_BACK}일 이하여야 합니다.`,
-			true,
-		);
-	}
-
-	if (!isArrayOfNonEmptyStrings(input.select) || input.select.length === 0) {
-		return errorResponse("E_PARSE_FAILED", "select 는 비어있지 않아야 합니다.");
-	}
-
-	const syncedMessages = Math.min(input.days_back, 3);
+	const syncedMessages = Math.min(daysBack, 3);
 	let syncedAttachments = 0;
 	let syncedMessageCount = 0;
-	const threadPk = input.mail_folder;
+	const threadPk = mailFolder;
 
 	for (let index = 0; index < syncedMessages; index += 1) {
 		const hasAttachment = index % 2 === 0;
 		const message = buildDefaultMessage(
 			threadPk,
 			index,
-			input.mail_folder,
+			mailFolder,
 			hasAttachment,
 		);
 		const existingMessage = context.state.messages.get(message.message_pk);
@@ -718,10 +741,15 @@ const handleGraphInitialSync = (
 		addMessage(context, threadPk, normalizedMessage);
 	}
 
-	context.state.deltaLinks.set(
-		input.mail_folder,
-		buildDeltaLink(input.mail_folder),
-	);
+	const currentDeltaLink = context.state.deltaLinks.get(mailFolder);
+	const shouldUpdateDeltaLink =
+		currentDeltaLink === undefined ||
+		syncedMessageCount > 0 ||
+		syncedAttachments > 0;
+
+	if (shouldUpdateDeltaLink) {
+		context.state.deltaLinks.set(mailFolder, buildDeltaLink(mailFolder));
+	}
 
 	return okResponse<GraphMailSyncInitialSyncOutput>({
 		synced_messages: syncedMessageCount,

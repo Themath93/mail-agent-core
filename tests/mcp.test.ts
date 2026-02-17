@@ -373,7 +373,33 @@ describe("MCP tools", () => {
 		if (response.ok) {
 			expect(response.data.synced_messages).toBe(3);
 			expect(response.data.synced_attachments).toBe(2);
+			expect(context.state.deltaLinks.get("inbox")).toBeDefined();
 		}
+	});
+
+	test("graph_mail_sync.initial_sync는 days_back 30 경계값을 허용한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		const response = invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 30,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+
+		expect(response.ok).toBe(true);
+		if (!response.ok) {
+			throw new Error("경계값 동기화 실패");
+		}
+
+		expect(response.data.synced_messages).toBe(3);
+		expect(response.data.synced_attachments).toBe(2);
+		expect(context.state.deltaLinks.get("inbox")).toBeDefined();
 	});
 
 	test("initial_sync는 기존 메시지를 중복 계산하지 않는다", () => {
@@ -393,6 +419,11 @@ describe("MCP tools", () => {
 
 		if (!first.ok) {
 			throw new Error("초기 동기화 실패");
+		}
+
+		const firstDeltaLink = context.state.deltaLinks.get("inbox");
+		if (!firstDeltaLink) {
+			throw new Error("첫 delta link 저장 실패");
 		}
 
 		const beforeMessages = context.state.threadMessages.get("inbox")?.length;
@@ -420,6 +451,25 @@ describe("MCP tools", () => {
 		expect(context.state.threadMessages.get("inbox")?.length).toBe(
 			beforeMessages,
 		);
+		expect(context.state.deltaLinks.get("inbox")).toBe(firstDeltaLink);
+	});
+
+	test("graph_mail_sync.initial_sync는 mail_folder 유효성 실패 시 E_PARSE_FAILED", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		const response = invokeMcpToolByName(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "   ",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+
+		expectParseFailure(response);
 	});
 
 	test("graph_mail_sync.initial_sync는 잘못된 days_back를 거부한다", () => {
@@ -459,6 +509,24 @@ describe("MCP tools", () => {
 		if (!response.ok) {
 			expect(response.error_code).toBe("E_GRAPH_THROTTLED");
 		}
+	});
+
+	test("graph_mail_sync.initial_sync는 select 유효성 실패 시 E_PARSE_FAILED", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		const response = invokeMcpToolByName(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", ""],
+			},
+			context,
+		);
+
+		expectParseFailure(response);
 	});
 
 	test("graph_mail_sync.delta_sync는 변경 내역을 반환한다", () => {
