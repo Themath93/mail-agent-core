@@ -64,7 +64,7 @@ describe("MCP 응답 타입", () => {
 
 	test("지원 도구 전체를 기준 검증한다", () => {
 		expect(Array.isArray(MCP_TOOL_NAMES)).toBe(true);
-		expect(MCP_TOOL_NAMES.length).toBe(8);
+		expect(MCP_TOOL_NAMES.length).toBe(9);
 	});
 });
 
@@ -217,6 +217,89 @@ describe("MCP tools", () => {
 		}
 	});
 
+	test("complete_login_auto는 pending callback이 없으면 E_NOT_FOUND(retryable)", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+
+		const response = invokeMcpTool(
+			"auth_store.complete_login_auto",
+			{},
+			context,
+		);
+
+		expect(response.ok).toBe(false);
+		if (!response.ok) {
+			expect(response.error_code).toBe("E_NOT_FOUND");
+			expect(response.retryable).toBe(true);
+		}
+	});
+
+	test("complete_login_auto는 pending callback이 있으면 로그인 완료된다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		const issuedSession = context.state.issued_session;
+		if (!issuedSession) {
+			throw new Error("issued_session 준비 실패");
+		}
+
+		context.state.pending_callback = {
+			code: "auto-code",
+			state: issuedSession.state,
+			received_at: new Date().toISOString(),
+		};
+
+		const response = invokeMcpTool(
+			"auth_store.complete_login_auto",
+			{},
+			context,
+		);
+
+		expect(response.ok).toBe(true);
+		expect(context.state.signed_in).toBe(true);
+		expect(context.state.pending_callback).toBeNull();
+	});
+
+	test("complete_login_auto는 state 불일치 시 E_AUTH_FAILED", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		context.state.pending_callback = {
+			code: "auto-code",
+			state: "invalid-state",
+			received_at: new Date().toISOString(),
+		};
+
+		const response = invokeMcpTool(
+			"auth_store.complete_login_auto",
+			{},
+			context,
+		);
+
+		expect(response.ok).toBe(false);
+		if (!response.ok) {
+			expect(response.error_code).toBe("E_AUTH_FAILED");
+		}
+	});
+
+	test("complete_login_auto는 issued_session이 없으면 E_AUTH_REQUIRED", () => {
+		const context = createToolContext();
+		context.state.pending_callback = {
+			code: "auto-code",
+			state: "any-state",
+			received_at: new Date().toISOString(),
+		};
+
+		const response = invokeMcpTool(
+			"auth_store.complete_login_auto",
+			{},
+			context,
+		);
+
+		expect(response.ok).toBe(false);
+		if (!response.ok) {
+			expect(response.error_code).toBe("E_AUTH_REQUIRED");
+		}
+	});
+
 	test("auth_status는 로그인 상태를 정확히 노출한다", () => {
 		const context = createToolContext();
 		const before = invokeMcpTool("auth_store.auth_status", {}, context);
@@ -224,6 +307,7 @@ describe("MCP tools", () => {
 		if (before.ok) {
 			expect(before.data.signed_in).toBe(false);
 			expect(before.data.account).toBeNull();
+			expect(before.data.pending_callback_received).toBe(false);
 		}
 
 		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
@@ -235,6 +319,33 @@ describe("MCP tools", () => {
 			expect(after.data.signed_in).toBe(true);
 			expect(after.data.account?.tenant).toBe("default");
 			expect(after.data.access_token_expires_at).toBeDefined();
+			expect(after.data.pending_callback_received).toBe(false);
+		}
+	});
+
+	test("auth_status는 pending_callback_received 플래그를 노출한다", () => {
+		const context = createToolContext();
+		const issued = invokeMcpTool(
+			"auth_store.start_login",
+			{ scopes: ["Mail.Read"] },
+			context,
+		);
+		expect(issued.ok).toBe(true);
+		if (!issued.ok) {
+			throw new Error("start_login 실패");
+		}
+
+		context.state.pending_callback = {
+			code: "auto-code",
+			state: context.state.issued_session?.state ?? "",
+			received_at: new Date().toISOString(),
+		};
+
+		const status = invokeMcpTool("auth_store.auth_status", {}, context);
+		expect(status.ok).toBe(true);
+		if (status.ok) {
+			expect(status.data.pending_callback_received).toBe(true);
+			expect(status.data.pending_callback_received_at).toBeDefined();
 		}
 	});
 
@@ -1371,6 +1482,23 @@ describe("MCP tools", () => {
 						context,
 					);
 					break;
+				case "auth_store.complete_login_auto": {
+					invokeMcpTool(
+						"auth_store.start_login",
+						{ scopes: ["Mail.Read"] },
+						context,
+					);
+					const issuedSession = context.state.issued_session;
+					if (!issuedSession) {
+						throw new Error("auto complete 테스트 준비 실패");
+					}
+					context.state.pending_callback = {
+						code: "abc",
+						state: issuedSession.state,
+						received_at: new Date().toISOString(),
+					};
+					break;
+				}
 				case "graph_mail_sync.initial_sync":
 				case "graph_mail_sync.delta_sync":
 				case "graph_mail_sync.download_attachment":
@@ -1407,6 +1535,7 @@ describe("MCP tools", () => {
 					state: context.state.issued_session?.state ?? "state",
 					code_verifier: "challenge",
 				},
+				"auth_store.complete_login_auto": {},
 				"auth_store.auth_status": {},
 				"graph_mail_sync.initial_sync": {
 					mail_folder: "inbox",
@@ -1431,6 +1560,17 @@ describe("MCP tools", () => {
 			}[toolName as McpToolName] as never;
 
 			const byName = invokeMcpToolByName(toolName, input, context);
+			if (toolName === "auth_store.complete_login_auto" && byName.ok) {
+				const issuedSession = context.state.issued_session;
+				if (!issuedSession) {
+					throw new Error("auto complete 재호출 테스트 준비 실패");
+				}
+				context.state.pending_callback = {
+					code: "abc",
+					state: issuedSession.state,
+					received_at: new Date().toISOString(),
+				};
+			}
 			const direct = invokeMcpTool(toolName, input as never, context);
 
 			expect(byName.ok).toBe(direct.ok);
