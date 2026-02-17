@@ -4,7 +4,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 
 const statePath = new URL("./state.json", import.meta.url);
-const fallbackUrl = "http://127.0.0.1:1270/mcp/callback";
+const configPath = new URL("./config.json", import.meta.url);
 
 const nowIso = () => new Date().toISOString();
 
@@ -31,6 +31,12 @@ const defaultState = () => ({
 	account: null,
 	issued_session: null,
 	auth_token: null,
+});
+
+const defaultConfig = () => ({
+	tenant: "common",
+	client_id: "",
+	redirect_uri: "http://127.0.0.1:1270/mcp/callback",
 });
 
 const normalizeState = (value) => {
@@ -62,6 +68,23 @@ const normalizeState = (value) => {
 	};
 };
 
+const normalizeConfig = (value) => {
+	if (value === null || typeof value !== "object") {
+		return defaultConfig();
+	}
+
+	const config = value;
+	return {
+		tenant: isNonEmptyString(config.tenant) ? config.tenant.trim() : "common",
+		client_id: isNonEmptyString(config.client_id)
+			? config.client_id.trim()
+			: "",
+		redirect_uri: isNonEmptyString(config.redirect_uri)
+			? config.redirect_uri.trim()
+			: "http://127.0.0.1:1270/mcp/callback",
+	};
+};
+
 const readState = () => {
 	try {
 		const raw = readFileSync(statePath, "utf8");
@@ -75,21 +98,13 @@ const writeState = (state) => {
 	writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
 };
 
-const buildAuthToken = (issuedSession) => {
-	const issuedAt = nowIso();
-	const accessExpiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
-	const refreshExpiresAt = new Date(
-		Date.now() + 30 * 24 * 60 * 60 * 1000,
-	).toISOString();
-
-	return {
-		access_token: `access_${issuedSession.state}`,
-		refresh_token: `refresh_${issuedSession.state}`,
-		token_type: "Bearer",
-		expires_at: accessExpiresAt,
-		refresh_token_expires_at: refreshExpiresAt,
-		issued_at: issuedAt,
-	};
+const readConfig = () => {
+	try {
+		const raw = readFileSync(configPath, "utf8");
+		return normalizeConfig(JSON.parse(raw));
+	} catch {
+		return defaultConfig();
+	}
 };
 
 const errorResponse = (errorCode, errorMessage, retryable = false) => ({
@@ -98,6 +113,186 @@ const errorResponse = (errorCode, errorMessage, retryable = false) => ({
 	error_message: errorMessage,
 	retryable: retryable,
 });
+
+const validateAuthConfig = (config) => {
+	if (!isNonEmptyString(config.client_id)) {
+		return errorResponse(
+			"E_AUTH_FAILED",
+			"native-host/config.json 의 client_id를 설정하세요.",
+		);
+	}
+
+	if (!isNonEmptyString(config.redirect_uri)) {
+		return errorResponse(
+			"E_AUTH_FAILED",
+			"native-host/config.json 의 redirect_uri를 설정하세요.",
+		);
+	}
+
+	try {
+		new URL(config.redirect_uri);
+	} catch {
+		return errorResponse(
+			"E_AUTH_FAILED",
+			"native-host/config.json 의 redirect_uri 형식이 잘못되었습니다.",
+		);
+	}
+
+	return null;
+};
+
+const buildAuthTokenFromResponse = (tokenResponse) => {
+	const issuedAt = nowIso();
+	const expiresIn =
+		typeof tokenResponse.expires_in === "number" && tokenResponse.expires_in > 0
+			? tokenResponse.expires_in
+			: 3600;
+	const refreshExpiresIn =
+		typeof tokenResponse.refresh_token_expires_in === "number" &&
+		tokenResponse.refresh_token_expires_in > 0
+			? tokenResponse.refresh_token_expires_in
+			: 30 * 24 * 60 * 60;
+
+	return {
+		access_token: tokenResponse.access_token,
+		refresh_token:
+			typeof tokenResponse.refresh_token === "string"
+				? tokenResponse.refresh_token
+				: "",
+		token_type:
+			typeof tokenResponse.token_type === "string"
+				? tokenResponse.token_type
+				: "Bearer",
+		expires_at: new Date(Date.now() + expiresIn * 1000).toISOString(),
+		refresh_token_expires_at: new Date(
+			Date.now() + refreshExpiresIn * 1000,
+		).toISOString(),
+		issued_at: issuedAt,
+	};
+};
+
+const parseJwtClaims = (idToken) => {
+	if (!isNonEmptyString(idToken)) {
+		return null;
+	}
+
+	const chunks = idToken.split(".");
+	if (chunks.length < 2) {
+		return null;
+	}
+
+	try {
+		const payload = Buffer.from(chunks[1], "base64url").toString("utf8");
+		const parsed = JSON.parse(payload);
+		return parsed && typeof parsed === "object" ? parsed : null;
+	} catch {
+		return null;
+	}
+};
+
+const extractAccount = (tokenResponse, config) => {
+	const claims = parseJwtClaims(tokenResponse.id_token);
+	if (claims) {
+		const emailCandidates = [
+			claims.preferred_username,
+			claims.email,
+			claims.upn,
+		];
+		for (const candidate of emailCandidates) {
+			if (isNonEmptyString(candidate)) {
+				return {
+					email: candidate,
+					tenant:
+						typeof claims.tid === "string" && claims.tid.length > 0
+							? claims.tid
+							: config.tenant,
+				};
+			}
+		}
+	}
+
+	return {
+		email: "user@localhost",
+		tenant: config.tenant,
+	};
+};
+
+const exchangeAuthorizationCode = async (
+	config,
+	code,
+	codeVerifier,
+	scopes,
+) => {
+	const endpoint = `https://login.microsoftonline.com/${encodeURIComponent(config.tenant)}/oauth2/v2.0/token`;
+	const params = new URLSearchParams();
+	params.set("grant_type", "authorization_code");
+	params.set("client_id", config.client_id);
+	params.set("code", code);
+	params.set("redirect_uri", config.redirect_uri);
+	params.set("code_verifier", codeVerifier);
+	if (isArrayOfNonEmptyStrings(scopes) && scopes.length > 0) {
+		params.set("scope", scopes.join(" "));
+	}
+
+	let response;
+	try {
+		response = await fetch(endpoint, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/x-www-form-urlencoded",
+			},
+			body: params.toString(),
+		});
+	} catch {
+		return {
+			ok: false,
+			error: errorResponse(
+				"E_AUTH_FAILED",
+				"토큰 엔드포인트에 연결하지 못했습니다.",
+				true,
+			),
+		};
+	}
+
+	let payload = null;
+	try {
+		payload = await response.json();
+	} catch {
+		payload = null;
+	}
+
+	if (!response.ok) {
+		const description =
+			payload && typeof payload.error_description === "string"
+				? payload.error_description
+				: payload && typeof payload.error === "string"
+					? payload.error
+					: `HTTP ${response.status}`;
+		return {
+			ok: false,
+			error: errorResponse("E_AUTH_FAILED", `토큰 교환 실패: ${description}`),
+		};
+	}
+
+	if (
+		payload === null ||
+		typeof payload !== "object" ||
+		!isNonEmptyString(payload.access_token)
+	) {
+		return {
+			ok: false,
+			error: errorResponse(
+				"E_AUTH_FAILED",
+				"토큰 응답 형식이 올바르지 않습니다.",
+			),
+		};
+	}
+
+	return {
+		ok: true,
+		tokenResponse: payload,
+	};
+};
 
 const handleStartLogin = (message, state) => {
 	if (
@@ -108,6 +303,12 @@ const handleStartLogin = (message, state) => {
 			"E_PARSE_FAILED",
 			"scopes 는 비어있지 않은 문자열 목록이어야 합니다.",
 		);
+	}
+
+	const config = readConfig();
+	const configError = validateAuthConfig(config);
+	if (configError !== null) {
+		return configError;
 	}
 
 	const loginState = generateLoginState();
@@ -124,25 +325,28 @@ const handleStartLogin = (message, state) => {
 		code_verifier: codeVerifier,
 		code_challenge: codeChallenge,
 		issued_at: nowIso(),
+		redirect_uri: config.redirect_uri,
+		client_id: config.client_id,
+		tenant: config.tenant,
 	};
 	writeState(state);
 
 	return {
 		ok: true,
 		data: {
-			login_url: `https://login.microsoftonline.com/common/oauth2/v2.0/authorize?response_type=code&scope=${encodeURIComponent(
-				message.scopes.join(" "),
-			)}&state=${encodeURIComponent(loginState)}&redirect_uri=${encodeURIComponent(
-				fallbackUrl,
+			login_url: `https://login.microsoftonline.com/${encodeURIComponent(config.tenant)}/oauth2/v2.0/authorize?response_type=code&client_id=${encodeURIComponent(
+				config.client_id,
+			)}&scope=${encodeURIComponent(message.scopes.join(" "))}&state=${encodeURIComponent(loginState)}&redirect_uri=${encodeURIComponent(
+				config.redirect_uri,
 			)}&code_challenge=${encodeURIComponent(codeChallenge)}&code_challenge_method=S256`,
-			callback_url: fallbackUrl,
+			callback_url: config.redirect_uri,
 			state: loginState,
 			code_verifier: codeVerifier,
 		},
 	};
 };
 
-const handleCompleteLogin = (message, state) => {
+const handleCompleteLogin = async (message, state) => {
 	if (!isNonEmptyString(message.code) || !isNonEmptyString(message.state)) {
 		return errorResponse("E_PARSE_FAILED", "code/state 가 누락되었습니다.");
 	}
@@ -166,14 +370,26 @@ const handleCompleteLogin = (message, state) => {
 		return errorResponse("E_AUTH_FAILED", "state 값이 일치하지 않습니다.");
 	}
 
-	const account = {
-		email: "user@localhost",
-		tenant: "default",
-	};
+	const config = readConfig();
+	const configError = validateAuthConfig(config);
+	if (configError !== null) {
+		return configError;
+	}
 
+	const tokenResult = await exchangeAuthorizationCode(
+		config,
+		message.code,
+		message.code_verifier,
+		state.issued_session.scopes,
+	);
+	if (!tokenResult.ok) {
+		return tokenResult.error;
+	}
+
+	const account = extractAccount(tokenResult.tokenResponse, config);
 	state.account = account;
 	state.signed_in = true;
-	state.auth_token = buildAuthToken(state.issued_session);
+	state.auth_token = buildAuthTokenFromResponse(tokenResult.tokenResponse);
 	writeState(state);
 
 	return {
@@ -195,23 +411,30 @@ const handleAuthStatus = (state) => ({
 	},
 });
 
-const readMessage = () => {
-	const header = process.stdin.read(4);
-	if (!header) {
-		return null;
+const handleMessage = async (message) => {
+	if (
+		message === null ||
+		typeof message !== "object" ||
+		Array.isArray(message)
+	) {
+		return errorResponse("E_PARSE_FAILED", "요청 본문은 객체여야 합니다.");
 	}
 
-	const length = header.readUInt32LE(0);
-	const body = process.stdin.read(length);
-	if (!body) {
-		return null;
+	const state = readState();
+
+	if (message.action === "auth_store.start_login") {
+		return handleStartLogin(message, state);
 	}
 
-	try {
-		return JSON.parse(body.toString("utf8"));
-	} catch {
-		return null;
+	if (message.action === "auth_store.complete_login") {
+		return handleCompleteLogin(message, state);
 	}
+
+	if (message.action === "auth_store.auth_status") {
+		return handleAuthStatus(state);
+	}
+
+	return errorResponse("E_UNKNOWN", "unsupported action");
 };
 
 const sendMessage = (message) => {
@@ -221,30 +444,46 @@ const sendMessage = (message) => {
 	process.stdout.write(Buffer.concat([header, payload]));
 };
 
-process.stdin.on("readable", () => {
-	while (true) {
-		const message = readMessage();
-		if (!message) {
-			break;
+let inputBuffer = Buffer.alloc(0);
+let messageQueue = Promise.resolve();
+
+const consumeMessages = async () => {
+	while (inputBuffer.length >= 4) {
+		const messageLength = inputBuffer.readUInt32LE(0);
+		if (inputBuffer.length < 4 + messageLength) {
+			return;
 		}
 
-		const state = readState();
+		const body = inputBuffer.subarray(4, 4 + messageLength);
+		inputBuffer = inputBuffer.subarray(4 + messageLength);
 
-		if (message.action === "auth_store.start_login") {
-			sendMessage(handleStartLogin(message, state));
+		let message;
+		try {
+			message = JSON.parse(body.toString("utf8"));
+		} catch {
+			sendMessage(
+				errorResponse(
+					"E_PARSE_FAILED",
+					"요청 본문은 유효한 JSON이어야 합니다.",
+				),
+			);
 			continue;
 		}
 
-		if (message.action === "auth_store.complete_login") {
-			sendMessage(handleCompleteLogin(message, state));
-			continue;
+		try {
+			const response = await handleMessage(message);
+			sendMessage(response);
+		} catch {
+			sendMessage(
+				errorResponse("E_UNKNOWN", "native host internal error", true),
+			);
 		}
-
-		if (message.action === "auth_store.auth_status") {
-			sendMessage(handleAuthStatus(state));
-			continue;
-		}
-
-		sendMessage(errorResponse("E_UNKNOWN", "unsupported action"));
 	}
+};
+
+process.stdin.on("data", (chunk) => {
+	inputBuffer = Buffer.concat([inputBuffer, chunk]);
+	messageQueue = messageQueue.then(consumeMessages).catch(() => {
+		sendMessage(errorResponse("E_UNKNOWN", "native host queue error", true));
+	});
 });
