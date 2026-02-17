@@ -29,9 +29,10 @@
 
 - 로그인 시작 전에 `scripts/setup-macos.sh` 실행으로 `native-host/config.json`을 설정합니다.
 - "로그인 시작" 버튼을 눌러 로그인 URL을 발급받고 브라우저에서 엽니다.
-- 로그인 후 콜백 URL 수신 시 확장이 자동으로 "로그인 완료"를 수행합니다.
-- 자동 완료가 지연되면 callback URL 전체 또는 code만 입력 후 "로그인 완료"를 수동 실행할 수 있습니다.
-- "로그인 상태 확인" 버튼으로 `signed_in`/`account` 상태를 확인합니다.
+- 로그인 후 콜백 URL 수신 시 확장이 자동으로 "로그인 완료"를 수행합니다(최대 5분 대기).
+- 자동 완료가 지연되면 `로그인 상태 확인`에서 `pending_callback_received` 힌트를 먼저 확인합니다.
+- `pending_callback_received=true`면 callback URL 전체 또는 code만 입력 후 "로그인 완료"를 수동 실행할 수 있습니다.
+- "로그인 상태 확인" 버튼으로 `signed_in`/`account`/`pending_callback_received` 상태를 확인합니다.
 
 로그인 실패 또는 세션 만료 시 "로그인 시작"부터 다시 수행하세요.
 
@@ -44,18 +45,41 @@
 
 일반적으로 첫 실행 시 초기 동기화를 1회 수행한 뒤, 이후에는 delta sync를 주기적으로 실행합니다.
 
-## 4.3 첨부 다운로드
+- 사이드패널의 `자동 동기화 시작`으로 주기 실행(분 단위)을 켜고, 필요 시 `자동 동기화 중지`로 중단합니다.
+
+## 4.3 목록 기반 조회
+
+- 메시지 목록: `mail_store.list_messages`로 최근 메일 목록을 가져오고 선택합니다.
+- 스레드 목록: `mail_store.list_threads`로 최근 스레드 목록을 가져오고 선택합니다.
+- 목록에서 선택하면 `get_message`/`get_thread` 입력값이 자동 채워집니다.
+
+## 4.4 첨부 다운로드
 
 - 첨부 다운로드: `graph_mail_sync.download_attachment` (graph_message_id/graph_attachment_id/message_pk 필요)
+- 첨부 목록 조회: `mail_store.list_attachments` (message_pk 기준)
+
+권장 순서: 메시지 선택 -> `list_attachments` -> 첨부 선택 -> `download_attachment`.
 
 첨부 파일은 로컬 경로에 저장되며, 동일 파일은 sha256 기준으로 중복 저장을 줄입니다.
 
-## 4.4 메일 조회
+## 4.5 메일 조회
 
 - 단건 조회: `mail_store.get_message`
 - 스레드 조회: `mail_store.get_thread`
 
 업무 확인 시 스레드 조회를 우선 사용하면 문맥 파악이 빠릅니다.
+
+## 4.6 운영/복구
+
+- 상태/로그 확인: `system.health`
+- 세션 초기화(인증만): `system.reset_session` (`clear_mailbox=false`)
+- 세션 초기화(인증+메일 캐시): `system.reset_session` (`clear_mailbox=true`)
+
+## 4.7 Evidence/Todo 최소 연계
+
+- Evidence 생성: `workflow.create_evidence` (message_pk/snippet/confidence)
+- Todo 생성/갱신: `workflow.upsert_todo` (title/status/evidence_id)
+- 워크플로 목록 확인: `workflow.list`
 
 ## 5. 자주 발생하는 문제와 대응
 
@@ -64,13 +88,15 @@
   - 조치: 로그인 재시도 후 상태 확인
 - `E_AUTH_FAILED`
   - 원인: 인증 교환 실패
-  - 조치: 브라우저 인증 과정을 다시 진행
+  - 조치: `state 값이 일치하지 않습니다`가 보이면 기존 세션을 버리고 "로그인 시작"부터 다시 진행
 - `E_GRAPH_THROTTLED`
   - 원인: Graph API 호출 제한
   - 조치: 잠시 대기 후 재시도(짧은 간격 반복 호출 지양)
 - `E_NOT_FOUND`
-  - 원인: 요청한 메시지/스레드/첨부 없음
-  - 조치: 먼저 동기화를 다시 실행하고 식별자를 확인
+  - 원인(로그인): 자동완료 대기 중 callback 미수신
+  - 조치(로그인): 2~3초 후 `로그인 상태 확인`으로 `pending_callback_received` 확인, 5분 초과 시 수동 완료로 전환
+  - 원인(메일/첨부): 요청한 메시지/스레드/첨부 없음
+  - 조치(메일/첨부): 먼저 동기화를 다시 실행하고 식별자를 확인
 - `E_PARSE_FAILED`
   - 원인: 입력 형식 또는 데이터 파싱 실패
   - 조치: 입력값 형식 확인 후 재시도

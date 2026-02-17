@@ -52,6 +52,9 @@ bun run ci
 - Native Host 등록 파일 확인: `~/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.themath93.mail_agent_core.host.json`
 - 설정 파일 확인: `native-host/config.json`의 `client_id`가 비어있지 않은지 확인
 - 메일 기능 점검: `initial_sync` → `delta_sync` → `get_message/get_thread` 동작 확인
+- 목록 기능 점검: `list_messages`/`list_threads`/`list_attachments` 동작 확인
+- 운영 기능 점검: `system.health`, `reset_session` 동작 확인
+- 워크플로 기능 점검: `create_evidence` → `upsert_todo` → `workflow.list` 확인
 
 ## 6. 로그인 상태 시뮬레이션
 
@@ -71,12 +74,22 @@ bun run ci
 
 ## 7. 로그인 완료가 실패할 때
 
+- 자동완료 대기 기본값
+  - 로그인 시작 후 자동완료는 최대 5분(최대 300회)까지 재시도됩니다.
+  - 대기 시간이 지나면 사이드패널 안내에 따라 수동 로그인 완료를 실행하세요.
 - `Auth status error: 자동 완료 대기 중인 callback code가 없습니다.`
-  - 로그인 창에서 인증을 완료했는지 확인하고 2~3초 기다린 뒤 상태를 다시 확인하세요.
+  - callback이 아직 host에 기록되지 않은 상태입니다. 2~3초 뒤 "로그인 상태 확인"을 눌러 `pending_callback_received` 여부를 확인하세요.
+  - `pending_callback_received=true`면 callback URL 전체 또는 code를 붙여넣고 "로그인 완료"를 수동 실행하세요.
 - `Auth status error: state 값이 일치하지 않습니다.`
   - 기존 로그인 흐름을 중단하고 "로그인 시작"을 새로 실행하세요.
 - `Auth status error: 토큰 교환 실패: ...`
   - Entra App의 Redirect URI와 `native-host/config.json`의 `redirect_uri`가 완전히 같은지 확인하세요.
+
+사전 점검(권장):
+
+1. `lsof -iTCP:1270 -sTCP:LISTEN`으로 callback 포트 충돌 여부 확인
+2. 포트 점유 프로세스가 있으면 종료 후 "로그인 시작" 재실행
+3. 그래도 실패하면 `scripts/setup-macos.sh`를 다시 실행해 Native Host 등록 정보 재적용
 
 ## 8. 자주 발생하는 설치 이슈
 
