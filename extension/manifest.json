@@ -1,0 +1,16 @@
+{
+	"manifest_version": 3,
+	"name": "Outlook Local Work Agent",
+	"version": "0.2.2",
+	"description": "Outlook local work automation extension shell.",
+	"permissions": ["storage", "sidePanel"],
+	"action": {
+		"default_title": "Outlook Local Work Agent"
+	},
+	"background": {
+		"service_worker": "background.js"
+	},
+	"side_panel": {
+		"default_path": "sidepanel.html"
+	}
+}
