@@ -29,6 +29,42 @@ const setLoginUrlText = (value) => {
 	loginUrlText.textContent = value;
 };
 
+const parseAuthInput = (rawInput) => {
+	const trimmed = rawInput.trim();
+	if (trimmed.length === 0) {
+		return { code: "", state: null };
+	}
+
+	const parseQuery = (queryString) => {
+		const params = new URLSearchParams(queryString);
+		const code = params.get("code");
+		const state = params.get("state");
+		return {
+			code: typeof code === "string" ? code.trim() : "",
+			state: typeof state === "string" ? state : null,
+		};
+	};
+
+	try {
+		const callbackUrl = new URL(trimmed);
+		return parseQuery(callbackUrl.search);
+	} catch {}
+
+	if (trimmed.startsWith("?")) {
+		return parseQuery(trimmed);
+	}
+
+	if (trimmed.includes("code=")) {
+		const queryStartIndex = trimmed.indexOf("?");
+		if (queryStartIndex >= 0) {
+			return parseQuery(trimmed.slice(queryStartIndex));
+		}
+		return parseQuery(trimmed);
+	}
+
+	return { code: trimmed, state: null };
+};
+
 const sendNativeMessage = (action, payload, onSuccess) => {
 	chrome.runtime.sendNativeMessage(
 		HOST_NAME,
@@ -86,8 +122,10 @@ const startLogin = () => {
 };
 
 const completeLogin = () => {
-	const code =
-		typeof authCodeInput?.value === "string" ? authCodeInput.value.trim() : "";
+	const rawInput =
+		typeof authCodeInput?.value === "string" ? authCodeInput.value : "";
+	const parsedInput = parseAuthInput(rawInput);
+	const code = parsedInput.code;
 	if (code.length === 0) {
 		setAuthStatus("Auth status error: code를 입력하세요.");
 		return;
@@ -101,6 +139,17 @@ const completeLogin = () => {
 
 			if (typeof state !== "string" || typeof codeVerifier !== "string") {
 				setAuthStatus("Auth status error: start_login을 먼저 실행하세요.");
+				return;
+			}
+
+			if (
+				typeof parsedInput.state === "string" &&
+				parsedInput.state.length > 0 &&
+				parsedInput.state !== state
+			) {
+				setAuthStatus(
+					"Auth status error: URL의 state가 현재 로그인 세션과 다릅니다. 로그인 시작을 다시 실행하세요.",
+				);
 				return;
 			}
 
