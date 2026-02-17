@@ -1,5 +1,11 @@
 import { createHash, randomBytes } from "node:crypto";
 
+import {
+	createMcpStorage,
+	createStateStorageAdapter,
+} from "../storage/interface.js";
+import type { McpStorage } from "../storage/interface.js";
+
 export type McpErrorCode =
 	| "E_AUTH_REQUIRED"
 	| "E_AUTH_FAILED"
@@ -242,6 +248,7 @@ export interface McpRuntimeState {
 
 export interface McpRuntimeContext {
 	state: McpRuntimeState;
+	storage: McpStorage;
 }
 
 const fallbackUrl = "http://127.0.0.1:1270/mcp/callback";
@@ -294,10 +301,20 @@ export const createMcpContext = (
 		...createRuntimeState(),
 		...initial,
 	},
+	storage: (() => {
+		const state = {
+			...createRuntimeState(),
+			...initial,
+		};
+		const adapter = createStateStorageAdapter(state);
+		return createMcpStorage(adapter);
+	})(),
 });
 
 export const resetMcpContext = (context: McpRuntimeContext): void => {
-	context.state = createRuntimeState();
+	const next = createRuntimeState();
+	context.state = next;
+	context.storage = createMcpStorage(createStateStorageAdapter(next));
 };
 
 const isNonEmptyString = (value: unknown): value is string =>
