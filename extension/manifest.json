@@ -3,7 +3,7 @@
 	"name": "Outlook Local Work Agent",
 	"version": "0.2.2",
 	"description": "Outlook local work automation extension shell.",
-	"permissions": ["storage", "sidePanel"],
+	"permissions": ["storage", "sidePanel", "nativeMessaging"],
 	"action": {
 		"default_title": "Outlook Local Work Agent"
 	},
