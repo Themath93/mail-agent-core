@@ -3,6 +3,20 @@ const authStatus = document.getElementById("auth-status");
 const loginUrlText = document.getElementById("login-url");
 const resultView = document.getElementById("result");
 const autoSyncStatus = document.getElementById("autosync-status");
+const dashboardRefreshButton = document.getElementById("dashboard-refresh");
+const dashboardKpiMail = document.getElementById("dashboard-kpi-mail");
+const dashboardKpiTodoOpen = document.getElementById("dashboard-kpi-todo-open");
+const dashboardKpiTodoProgress = document.getElementById(
+	"dashboard-kpi-todo-progress",
+);
+const dashboardKpiTodoDone = document.getElementById("dashboard-kpi-todo-done");
+const dashboardSearchInput = document.getElementById("dashboard-search-input");
+const dashboardSearchButton = document.getElementById("dashboard-search");
+const dashboardSearchResults = document.getElementById(
+	"dashboard-search-results",
+);
+const dashboardSummary = document.getElementById("dashboard-summary");
+const dashboardTimeline = document.getElementById("dashboard-timeline");
 
 const startLoginButton = document.getElementById("start-login");
 const completeLoginButton = document.getElementById("complete-login");
@@ -94,6 +108,7 @@ let autoSyncTimer = null;
 let latestMessages = [];
 let latestThreads = [];
 let latestAttachments = [];
+let latestTimelineEvents = [];
 
 if (loadedAt) {
 	loadedAt.textContent = `Loaded at: ${new Date().toLocaleString()}`;
@@ -132,6 +147,150 @@ const setAutopilotStatusText = (value) => {
 const setAutopilotHealthHintText = (value) => {
 	if (autopilotHealthHintText) {
 		autopilotHealthHintText.textContent = value;
+	}
+};
+
+const setDashboardSummary = (value) => {
+	if (dashboardSummary) {
+		dashboardSummary.textContent = value;
+	}
+};
+
+const setDashboardKpiValue = (node, value) => {
+	if (!node) {
+		return;
+	}
+	node.textContent = String(value);
+};
+
+const renderDashboardSearchResults = async () => {
+	if (!dashboardSearchResults) {
+		return;
+	}
+
+	const queryRaw =
+		typeof dashboardSearchInput?.value === "string"
+			? dashboardSearchInput.value.trim()
+			: "";
+	dashboardSearchResults.innerHTML = "";
+	if (queryRaw.length === 0) {
+		const li = document.createElement("li");
+		li.textContent = "검색어를 입력하세요.";
+		dashboardSearchResults.appendChild(li);
+		return;
+	}
+
+	try {
+		const response = await sendNativeMessage("search.query", {
+			query: queryRaw,
+			scope: "all",
+			limit: 8,
+			sort: "relevance",
+			filters: {
+				date_window: "last_7_days",
+			},
+		});
+		const data = handleMcpResponse(response);
+		const items = Array.isArray(data?.items) ? data.items : [];
+		if (items.length === 0) {
+			const li = document.createElement("li");
+			li.textContent = "검색 결과가 없습니다.";
+			dashboardSearchResults.appendChild(li);
+			return;
+		}
+
+		for (const item of items) {
+			const li = document.createElement("li");
+			const title =
+				typeof item?.title === "string" && item.title.trim().length > 0
+					? item.title
+					: "(제목 없음)";
+			const sourceType =
+				typeof item?.source_type === "string" ? item.source_type : "item";
+			li.textContent = `${title} (${sourceType})`;
+			dashboardSearchResults.appendChild(li);
+		}
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		const li = document.createElement("li");
+		li.textContent = `검색 실패: ${message}`;
+		dashboardSearchResults.appendChild(li);
+	}
+};
+
+const renderDashboardTimeline = () => {
+	if (!dashboardTimeline) {
+		return;
+	}
+	const events = Array.isArray(latestTimelineEvents)
+		? latestTimelineEvents
+		: [];
+	const top = events.slice(0, 6);
+	dashboardTimeline.innerHTML = "";
+	if (top.length === 0) {
+		const li = document.createElement("li");
+		li.textContent = "타임라인 데이터가 없습니다.";
+		dashboardTimeline.appendChild(li);
+		return;
+	}
+	for (const row of top) {
+		const event =
+			typeof row?.event_type === "string" ? row.event_type : "event";
+		const source = typeof row?.source_tool === "string" ? row.source_tool : "-";
+		const li = document.createElement("li");
+		li.textContent = `${event}: ${source}`;
+		dashboardTimeline.appendChild(li);
+	}
+};
+
+const refreshDashboard = async () => {
+	try {
+		const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+		const date = new Date().toISOString().slice(0, 10);
+		const [overviewResponse, timelineResponse] = await Promise.all([
+			sendNativeMessage("dashboard.get_overview", {
+				date,
+				timezone,
+				top_counterparties_limit: 5,
+				include_drilldowns: true,
+			}),
+			sendNativeMessage("timeline.list", {
+				limit: 20,
+				include_payload: false,
+			}),
+		]);
+
+		const overviewData = handleMcpResponse(overviewResponse);
+		const timelineData = handleMcpResponse(timelineResponse);
+		const kpis =
+			overviewData?.kpis && typeof overviewData.kpis === "object"
+				? overviewData.kpis
+				: null;
+		setDashboardKpiValue(dashboardKpiMail, Number(kpis?.today_mail_count ?? 0));
+		setDashboardKpiValue(
+			dashboardKpiTodoOpen,
+			Number(kpis?.progress_status?.open_count ?? 0),
+		);
+		setDashboardKpiValue(
+			dashboardKpiTodoProgress,
+			Number(kpis?.progress_status?.in_progress_count ?? 0),
+		);
+		setDashboardKpiValue(
+			dashboardKpiTodoDone,
+			Number(kpis?.progress_status?.done_count ?? 0),
+		);
+
+		latestTimelineEvents = Array.isArray(timelineData?.events)
+			? timelineData.events
+			: [];
+		renderDashboardTimeline();
+
+		setDashboardSummary(
+			`대시보드 상태: 오늘 메일 ${Number(kpis?.today_mail_count ?? 0)}건, 오늘 할 일 ${Number(kpis?.today_todo_count ?? 0)}건`,
+		);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		setDashboardSummary(`대시보드 상태: 갱신 실패 (${message})`);
 	}
 };
 
@@ -705,6 +864,7 @@ const initialSync = async () => {
 		setAuthStatus("Sync: initial_sync 완료");
 		await listMessages();
 		await listThreads();
+		await refreshDashboard();
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		setAuthStatus(`Sync error: ${message}`);
@@ -722,6 +882,7 @@ const deltaSync = async () => {
 		setAuthStatus("Sync: delta_sync 완료");
 		await listMessages();
 		await listThreads();
+		await refreshDashboard();
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		setAuthStatus(`Sync error: ${message}`);
@@ -887,6 +1048,7 @@ const getSystemHealth = async () => {
 			);
 			setAutopilotHealthHintText(buildAutopilotHealthHint(autopilot));
 		}
+		await refreshDashboard();
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		setAuthStatus(`System error: ${message}`);
@@ -910,6 +1072,7 @@ const resetSession = async (clearMailbox) => {
 			setSelectOptions(threadSelect, []);
 			setSelectOptions(attachmentSelect, []);
 		}
+		await refreshDashboard();
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		setAuthStatus(`System error: ${message}`);
@@ -981,6 +1144,7 @@ const runAutopilotTickOnce = async () => {
 	await listMessages();
 	await listThreads();
 	await refreshAutopilotStatus();
+	await refreshDashboard();
 };
 
 const runAutopilotTick = async () => {
@@ -1045,6 +1209,7 @@ const createEvidence = async () => {
 		}
 		setResult(response);
 		setAuthStatus("Workflow: create_evidence 완료");
+		await refreshDashboard();
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		setAuthStatus(`Workflow error: ${message}`);
@@ -1078,6 +1243,7 @@ const upsertTodo = async () => {
 		handleMcpResponse(response);
 		setResult(response);
 		setAuthStatus("Workflow: upsert_todo 완료");
+		await refreshDashboard();
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		setAuthStatus(`Workflow error: ${message}`);
@@ -1090,6 +1256,7 @@ const listWorkflow = async () => {
 		handleMcpResponse(response);
 		setResult(response);
 		setAuthStatus("Workflow: list 완료");
+		await refreshDashboard();
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		setAuthStatus(`Workflow error: ${message}`);
@@ -1115,6 +1282,19 @@ getThreadButton?.addEventListener("click", getThread);
 listAttachmentsButton?.addEventListener("click", listAttachments);
 attachmentSelect?.addEventListener("change", fillAttachmentInputsFromSelection);
 downloadAttachmentButton?.addEventListener("click", downloadAttachment);
+
+dashboardRefreshButton?.addEventListener("click", () => {
+	void refreshDashboard();
+});
+dashboardSearchButton?.addEventListener("click", () => {
+	void renderDashboardSearchResults();
+});
+dashboardSearchInput?.addEventListener("keydown", (event) => {
+	if (event.key === "Enter") {
+		event.preventDefault();
+		void renderDashboardSearchResults();
+	}
+});
 
 autosyncStartButton?.addEventListener("click", startAutoSyncLoop);
 autosyncStopButton?.addEventListener("click", stopAutoSyncLoop);
@@ -1142,4 +1322,9 @@ refreshAutopilotStatus().catch((error) => {
 	const message = error instanceof Error ? error.message : String(error);
 	setAutopilotStatusText(`Autopilot error: ${message}`);
 	setAutopilotHealthHintText("Autopilot hint: unavailable");
+});
+
+refreshDashboard().catch((error) => {
+	const message = error instanceof Error ? error.message : String(error);
+	setDashboardSummary(`대시보드 상태: 초기화 실패 (${message})`);
 });

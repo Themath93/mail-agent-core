@@ -85,6 +85,44 @@
           0 4px 12px rgba(23, 31, 40, 0.04);
       }
 
+      .dashboard-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: var(--nm-space-8);
+      }
+
+      .kpi {
+        border: 1px solid var(--nm-border-subtle);
+        border-radius: 10px;
+        background: var(--nm-surface-elevated);
+        padding: var(--nm-space-8);
+      }
+
+      .kpi-title {
+        display: block;
+        font-size: 11px;
+        color: var(--nm-text-muted);
+        margin-bottom: var(--nm-space-4);
+      }
+
+      .kpi-value {
+        display: block;
+        font-size: 15px;
+        font-weight: 600;
+        color: var(--nm-text-primary);
+      }
+
+      .mini-list {
+        margin: var(--nm-space-8) 0 0;
+        padding-left: 18px;
+        font-size: 12px;
+        color: var(--nm-text-secondary);
+      }
+
+      .mini-list li {
+        margin: 0 0 var(--nm-space-4);
+      }
+
       .row {
         display: flex;
         flex-wrap: wrap;
@@ -212,6 +250,10 @@
           height: 32px;
           font-size: 12px;
         }
+
+        .dashboard-grid {
+          grid-template-columns: minmax(0, 1fr);
+        }
       }
 
       @media (min-width: 360px) and (max-width: 399px) {
@@ -256,6 +298,39 @@
   </head>
   <body>
     <h1>Outlook 로컬 업무 에이전트</h1>
+
+    <div class="card">
+      <h2>대시보드</h2>
+      <div class="row">
+        <button id="dashboard-refresh" type="button">대시보드 새로고침</button>
+      </div>
+      <div class="dashboard-grid">
+        <div class="kpi">
+          <span class="kpi-title">오늘 메일</span>
+          <span id="dashboard-kpi-mail" class="kpi-value">-</span>
+        </div>
+        <div class="kpi">
+          <span class="kpi-title">열린 할 일</span>
+          <span id="dashboard-kpi-todo-open" class="kpi-value">-</span>
+        </div>
+        <div class="kpi">
+          <span class="kpi-title">진행 중 할 일</span>
+          <span id="dashboard-kpi-todo-progress" class="kpi-value">-</span>
+        </div>
+        <div class="kpi">
+          <span class="kpi-title">완료 할 일</span>
+          <span id="dashboard-kpi-todo-done" class="kpi-value">-</span>
+        </div>
+      </div>
+      <div class="row">
+        <input id="dashboard-search-input" type="text" placeholder="메일 빠른 검색 (제목/보낸이)" />
+        <button id="dashboard-search" type="button">검색</button>
+      </div>
+      <p id="dashboard-summary">대시보드 상태: 초기화 전</p>
+      <ul id="dashboard-search-results" class="mini-list"></ul>
+      <p>최근 타임라인</p>
+      <ul id="dashboard-timeline" class="mini-list"></ul>
+    </div>
 
     <div class="card">
       <h2>인증</h2>
