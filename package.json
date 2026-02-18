@@ -1,6 +1,6 @@
 {
 	"name": "mail-agent-core",
-	"version": "0.1.0",
+	"version": "0.2.2",
 	"private": true,
 	"type": "module",
 	"scripts": {
@@ -11,7 +11,9 @@
 		"test:i18n-contract": "bunx vitest run tests/i18n-contract.test.ts",
 		"test:e2e": "bunx playwright test",
 		"coverage": "bunx vitest run --coverage",
-		"ci": "bun run lint && bun run typecheck && bun run test && bun run coverage"
+		"version:check": "node ./scripts/check-version-sync.mjs",
+		"version:sync": "node ./scripts/sync-extension-version.mjs",
+		"ci": "bun run version:check && bun run lint && bun run typecheck && bun run test && bun run coverage"
 	},
 	"devDependencies": {
 		"@playwright/test": "^1.50.0",
