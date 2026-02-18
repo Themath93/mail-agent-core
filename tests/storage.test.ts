@@ -15,6 +15,7 @@ import { createMemoryStorage } from "../src/storage/memory-adapter.js";
 const createState = (): McpRuntimeState => ({
 	account: null,
 	issued_session: null,
+	pending_callback: null,
 	messages: new Map(),
 	threadMessages: new Map(),
 	attachments: new Map(),

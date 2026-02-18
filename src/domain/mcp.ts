@@ -53,6 +53,7 @@ export const isOkResponse = <TData>(
 export type McpToolName =
 	| "auth_store.start_login"
 	| "auth_store.complete_login"
+	| "auth_store.complete_login_auto"
 	| "auth_store.auth_status"
 	| "graph_mail_sync.initial_sync"
 	| "graph_mail_sync.delta_sync"
@@ -63,6 +64,7 @@ export type McpToolName =
 export const MCP_TOOL_NAMES = [
 	"auth_store.start_login",
 	"auth_store.complete_login",
+	"auth_store.complete_login_auto",
 	"auth_store.auth_status",
 	"graph_mail_sync.initial_sync",
 	"graph_mail_sync.delta_sync",
@@ -95,12 +97,20 @@ export interface AuthStoreCompleteLoginOutput {
 	account: McpAuthAccount;
 }
 
+export type AuthStoreCompleteLoginAutoInput = Record<string, never>;
+
+export interface AuthStoreCompleteLoginAutoOutput {
+	account: McpAuthAccount;
+}
+
 export type AuthStoreAuthStatusInput = Record<string, never>;
 
 export interface AuthStoreAuthStatusOutput {
 	signed_in: boolean;
 	account: McpAuthAccount | null;
 	access_token_expires_at?: string;
+	pending_callback_received: boolean;
+	pending_callback_received_at?: string;
 }
 
 export interface GraphMailSyncInitialSyncInput {
@@ -176,6 +186,7 @@ export type MailStoreGetThreadOutput = MailStoreMessage[];
 export type McpToolInput = {
 	"auth_store.start_login": AuthStoreStartLoginInput;
 	"auth_store.complete_login": AuthStoreCompleteLoginInput;
+	"auth_store.complete_login_auto": AuthStoreCompleteLoginAutoInput;
 	"auth_store.auth_status": AuthStoreAuthStatusInput;
 	"graph_mail_sync.initial_sync": GraphMailSyncInitialSyncInput;
 	"graph_mail_sync.delta_sync": GraphMailSyncDeltaSyncInput;
@@ -187,6 +198,7 @@ export type McpToolInput = {
 export type McpToolOutput = {
 	"auth_store.start_login": AuthStoreStartLoginOutput;
 	"auth_store.complete_login": AuthStoreCompleteLoginOutput;
+	"auth_store.complete_login_auto": AuthStoreCompleteLoginAutoOutput;
 	"auth_store.auth_status": AuthStoreAuthStatusOutput;
 	"graph_mail_sync.initial_sync": GraphMailSyncInitialSyncOutput;
 	"graph_mail_sync.delta_sync": GraphMailSyncDeltaSyncOutput;
@@ -217,6 +229,12 @@ export interface McpAuthToken {
 	issued_at: string;
 }
 
+export interface McpPendingCallback {
+	code: string;
+	state: string;
+	received_at: string;
+}
+
 export interface McpAttachmentRecord {
 	attachment_pk: string;
 	graph_message_id: string;
@@ -237,6 +255,7 @@ interface McpAttachmentContentMeta {
 export interface McpRuntimeState {
 	account: McpAuthAccount | null;
 	issued_session: McpAuthSession | null;
+	pending_callback: McpPendingCallback | null;
 	messages: Map<string, MailStoreMessage>;
 	threadMessages: Map<string, string[]>;
 	attachments: Map<string, McpAttachmentRecord>;
@@ -285,6 +304,7 @@ const hasSignedIn = (context: McpRuntimeContext): boolean =>
 const createRuntimeState = (): McpRuntimeState => ({
 	account: null,
 	issued_session: null,
+	pending_callback: null,
 	messages: new Map(),
 	threadMessages: new Map(),
 	attachments: new Map(),
@@ -706,6 +726,7 @@ const handleAuthStoreStartLogin = (
 		code_challenge: codeChallenge,
 		issued_at: nowIso(),
 	};
+	context.state.pending_callback = null;
 
 	return okResponse<AuthStoreStartLoginOutput>({
 		login_url: `https://login.microsoftonline.com/common/oauth2/v2.0/authorize?response_type=code&scope=${encodeURIComponent(
@@ -750,9 +771,33 @@ const handleAuthStoreCompleteLogin = (
 	};
 	context.state.account = account;
 	context.state.signed_in = true;
+	context.state.pending_callback = null;
 	context.state.auth_token = buildAuthToken(context.state.issued_session);
 
 	return okResponse<AuthStoreCompleteLoginOutput>({ account });
+};
+
+const handleAuthStoreCompleteLoginAuto = (
+	context: McpRuntimeContext,
+	_input: AuthStoreCompleteLoginAutoInput,
+) => {
+	if (context.state.pending_callback === null) {
+		return errorResponse(
+			"E_NOT_FOUND",
+			"자동 완료 대기 중인 callback code가 없습니다.",
+			true,
+		);
+	}
+
+	if (context.state.issued_session === null) {
+		return errorResponse("E_AUTH_REQUIRED", "로그인 시작 정보가 없습니다.");
+	}
+
+	return handleAuthStoreCompleteLogin(context, {
+		code: context.state.pending_callback.code,
+		state: context.state.pending_callback.state,
+		code_verifier: context.state.issued_session.code_verifier,
+	});
 };
 
 const handleAuthStoreAuthStatus = (
@@ -765,6 +810,13 @@ const handleAuthStoreAuthStatus = (
 		...(context.state.auth_token
 			? { access_token_expires_at: context.state.auth_token.expires_at }
 			: {}),
+		...(context.state.pending_callback
+			? {
+					pending_callback_received: true,
+					pending_callback_received_at:
+						context.state.pending_callback.received_at,
+				}
+			: { pending_callback_received: false }),
 	});
 
 const handleGraphInitialSync = (
@@ -1271,6 +1323,8 @@ const MCP_TOOL_HANDLERS: {
 		handleAuthStoreStartLogin(context, input),
 	"auth_store.complete_login": (context, input) =>
 		handleAuthStoreCompleteLogin(context, input),
+	"auth_store.complete_login_auto": (context, input) =>
+		handleAuthStoreCompleteLoginAuto(context, input),
 	"auth_store.auth_status": (context, input) =>
 		handleAuthStoreAuthStatus(context, input),
 	"graph_mail_sync.initial_sync": (context, input) =>

@@ -3,6 +3,7 @@
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createServer as createNetServer } from "node:net";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -41,6 +42,10 @@ const defaultState = () => ({
 		delta_links: {},
 		attachments: {},
 	},
+	workflow: {
+		evidences: [],
+		todos: [],
+	},
 	logs: [],
 });
 
@@ -56,12 +61,32 @@ const normalizeObject = (value) =>
 		? value
 		: {};
 
+const normalizeWorkflowState = (value) => {
+	const source = normalizeObject(value);
+	const evidences = Array.isArray(source.evidences)
+		? source.evidences
+				.filter((item) => item && typeof item === "object")
+				.slice(-500)
+		: [];
+	const todos = Array.isArray(source.todos)
+		? source.todos
+				.filter((item) => item && typeof item === "object")
+				.slice(-500)
+		: [];
+
+	return {
+		evidences,
+		todos,
+	};
+};
+
 const normalizeState = (value) => {
 	const base = defaultState();
 	const source = normalizeObject(value);
 	const mailbox = normalizeObject(source.mailbox);
 	const pendingCallback = normalizeObject(source.pending_callback);
 	const logs = Array.isArray(source.logs) ? source.logs.slice(-500) : [];
+	const workflow = normalizeWorkflowState(source.workflow);
 
 	return {
 		...base,
@@ -102,6 +127,7 @@ const normalizeState = (value) => {
 			delta_links: normalizeObject(mailbox.delta_links),
 			attachments: normalizeObject(mailbox.attachments),
 		},
+		workflow,
 		logs: logs,
 	};
 };
@@ -170,6 +196,109 @@ const generateLoginState = () => toBase64Url(randomBytes(16));
 const parseTimestamp = (value) => {
 	const ts = Date.parse(value);
 	return Number.isNaN(ts) ? null : ts;
+};
+
+const parseRedirectAddress = (redirectUriRaw) => {
+	try {
+		const redirectUri = new URL(redirectUriRaw);
+		if (!isNonEmptyString(redirectUri.hostname)) {
+			return {
+				ok: false,
+				errorMessage: "redirect_uri host 값이 올바르지 않습니다.",
+			};
+		}
+		const port = Number(
+			redirectUri.port || (redirectUri.protocol === "https:" ? "443" : "80"),
+		);
+		if (!Number.isInteger(port) || port < 1 || port > 65535) {
+			return {
+				ok: false,
+				errorMessage: "redirect_uri port 값이 올바르지 않습니다.",
+			};
+		}
+		return {
+			ok: true,
+			host: redirectUri.hostname,
+			port,
+		};
+	} catch {
+		return {
+			ok: false,
+			errorMessage: "redirect_uri 형식이 올바르지 않습니다.",
+		};
+	}
+};
+
+const probePortInUse = (host, port) =>
+	new Promise((resolve) => {
+		const tester = createNetServer();
+		let settled = false;
+		const complete = (result) => {
+			if (settled) {
+				return;
+			}
+			settled = true;
+			resolve(result);
+		};
+
+		tester.once("error", (error) => {
+			const code =
+				error && typeof error === "object" && "code" in error ? error.code : "";
+			if (code === "EADDRINUSE") {
+				complete({ ok: true, inUse: true });
+				return;
+			}
+			if (code === "EACCES") {
+				complete({
+					ok: false,
+					inUse: false,
+					reason: `권한 오류(${host}:${port})`,
+				});
+				return;
+			}
+			complete({
+				ok: false,
+				inUse: false,
+				reason: error instanceof Error ? error.message : String(error),
+			});
+		});
+
+		tester.once("listening", () => {
+			tester.close(() => complete({ ok: true, inUse: false }));
+		});
+
+		try {
+			tester.listen(port, host);
+		} catch (error) {
+			complete({
+				ok: false,
+				inUse: false,
+				reason: error instanceof Error ? error.message : String(error),
+			});
+		}
+	});
+
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const waitForPortInUse = async (host, port, timeoutMs) => {
+	const startedAt = Date.now();
+	while (Date.now() - startedAt < timeoutMs) {
+		const probe = await probePortInUse(host, port);
+		if (!probe.ok) {
+			return {
+				ok: false,
+				errorMessage: `callback listener 시작 점검 실패: ${probe.reason}`,
+			};
+		}
+		if (probe.inUse) {
+			return { ok: true };
+		}
+		await wait(50);
+	}
+	return {
+		ok: false,
+		errorMessage: "callback listener 시작 확인이 시간 내 완료되지 않았습니다.",
+	};
 };
 
 const isTokenNearExpiry = (token) => {
@@ -501,7 +630,37 @@ const extractAccount = (tokenResponse, config) => {
 	return { email: "user@localhost", tenant: config.tenant };
 };
 
-const beginCallbackListener = (state, config, loginState) => {
+const beginCallbackListener = async (state, config, loginState) => {
+	const address = parseRedirectAddress(config.redirect_uri);
+	if (!address.ok) {
+		pushLog(
+			state,
+			"warn",
+			"callback_listener",
+			`callback listener failed: ${address.errorMessage}`,
+		);
+		return { ok: false, errorMessage: address.errorMessage };
+	}
+
+	const preflight = await probePortInUse(address.host, address.port);
+	if (!preflight.ok) {
+		pushLog(
+			state,
+			"warn",
+			"callback_listener",
+			`callback listener preflight failed: ${preflight.reason}`,
+		);
+		return {
+			ok: false,
+			errorMessage: `callback listener 사전 점검 실패: ${preflight.reason}`,
+		};
+	}
+	if (preflight.inUse) {
+		const message = `callback listener 포트(${address.host}:${address.port})가 이미 사용 중입니다.`;
+		pushLog(state, "warn", "callback_listener", message);
+		return { ok: false, errorMessage: message };
+	}
+
 	try {
 		const processArgs = [
 			fileURLToPath(callbackListenerPath),
@@ -514,13 +673,34 @@ const beginCallbackListener = (state, config, loginState) => {
 			stdio: "ignore",
 		});
 		child.unref();
-		pushLog(state, "info", "callback_listener", "callback listener started");
-	} catch {
-		pushLog(state, "warn", "callback_listener", "callback listener failed");
+	} catch (error) {
+		const message =
+			error instanceof Error
+				? `callback listener failed: ${error.message}`
+				: "callback listener failed";
+		pushLog(state, "warn", "callback_listener", message);
+		return {
+			ok: false,
+			errorMessage: "callback listener 시작에 실패했습니다.",
+		};
 	}
+
+	const started = await waitForPortInUse(address.host, address.port, 1000);
+	if (!started.ok) {
+		pushLog(
+			state,
+			"warn",
+			"callback_listener",
+			`callback listener startup failed: ${started.errorMessage}`,
+		);
+		return { ok: false, errorMessage: started.errorMessage };
+	}
+
+	pushLog(state, "info", "callback_listener", "callback listener started");
+	return { ok: true };
 };
 
-const handleStartLogin = (message, state, config) => {
+const handleStartLogin = async (message, state, config) => {
 	if (
 		!isArrayOfNonEmptyStrings(message.scopes) ||
 		message.scopes.length === 0
@@ -551,7 +731,21 @@ const handleStartLogin = (message, state, config) => {
 		tenant: config.tenant,
 	};
 	state.pending_callback = null;
-	beginCallbackListener(state, config, loginState);
+	writeState(state);
+
+	const callbackListener = await beginCallbackListener(
+		state,
+		config,
+		loginState,
+	);
+	if (!callbackListener.ok) {
+		state.issued_session = null;
+		state.pending_callback = null;
+		pushLog(state, "warn", "start_login", callbackListener.errorMessage);
+		writeState(state);
+		return errorResponse("E_AUTH_FAILED", callbackListener.errorMessage, true);
+	}
+
 	writeState(state);
 
 	return {
@@ -1147,6 +1341,296 @@ const getThread = async (state, config, input) => {
 	return { ok: true, data: messages };
 };
 
+const listMessages = async (state, config, input) => {
+	const auth = await ensureAuthenticated(state, config);
+	if (!auth.ok) {
+		return auth.error;
+	}
+
+	const limit = Number(input.limit);
+	const resolvedLimit = Number.isInteger(limit) && limit > 0 ? limit : 50;
+	const items = Object.values(state.mailbox.messages)
+		.filter((msg) => msg && typeof msg === "object")
+		.sort((a, b) => {
+			const ta = parseTimestamp(a.received_at) ?? 0;
+			const tb = parseTimestamp(b.received_at) ?? 0;
+			return tb - ta;
+		})
+		.slice(0, resolvedLimit)
+		.map((msg) => ({
+			message_pk: msg.message_pk,
+			subject: msg.subject,
+			from: msg.from,
+			received_at: msg.received_at,
+			thread_pk: msg.provider_thread_id,
+			has_attachments: Boolean(msg.has_attachments),
+			attachment_count: Array.isArray(msg.attachments)
+				? msg.attachments.length
+				: 0,
+		}));
+
+	return {
+		ok: true,
+		data: {
+			items,
+			total: Object.keys(state.mailbox.messages).length,
+		},
+	};
+};
+
+const listThreads = async (state, config, input) => {
+	const auth = await ensureAuthenticated(state, config);
+	if (!auth.ok) {
+		return auth.error;
+	}
+
+	const limit = Number(input.limit);
+	const resolvedLimit = Number.isInteger(limit) && limit > 0 ? limit : 50;
+	const rows = Object.entries(state.mailbox.thread_messages)
+		.map(([thread_pk, messagePks]) => {
+			const ids = Array.isArray(messagePks) ? messagePks : [];
+			let latestReceivedAt = "";
+			for (const id of ids) {
+				const message = state.mailbox.messages[id];
+				if (!message) {
+					continue;
+				}
+				if (
+					latestReceivedAt.length === 0 ||
+					message.received_at > latestReceivedAt
+				) {
+					latestReceivedAt = message.received_at;
+				}
+			}
+			return {
+				thread_pk,
+				message_count: ids.length,
+				latest_received_at: latestReceivedAt,
+			};
+		})
+		.sort((a, b) => {
+			const ta = parseTimestamp(a.latest_received_at) ?? 0;
+			const tb = parseTimestamp(b.latest_received_at) ?? 0;
+			return tb - ta;
+		})
+		.slice(0, resolvedLimit);
+
+	return {
+		ok: true,
+		data: {
+			items: rows,
+			total: Object.keys(state.mailbox.thread_messages).length,
+		},
+	};
+};
+
+const listAttachments = async (state, config, input) => {
+	const auth = await ensureAuthenticated(state, config);
+	if (!auth.ok) {
+		return auth.error;
+	}
+
+	const messagePk = isNonEmptyString(input.message_pk) ? input.message_pk : "";
+	if (!isNonEmptyString(messagePk)) {
+		return errorResponse("E_PARSE_FAILED", "message_pk 가 필요합니다.");
+	}
+
+	const message = state.mailbox.messages[messagePk];
+	if (!message) {
+		return errorResponse("E_NOT_FOUND", "요청한 message 를 찾을 수 없습니다.");
+	}
+
+	const attachmentPks = Array.isArray(message.attachments)
+		? message.attachments
+		: [];
+	const items = Object.values(state.mailbox.attachments)
+		.filter((item) => item && attachmentPks.includes(item.attachment_pk))
+		.map((item) => ({
+			attachment_pk: item.attachment_pk,
+			graph_message_id: item.graph_message_id,
+			graph_attachment_id: item.graph_attachment_id,
+			relative_path: item.relative_path,
+			size_bytes: item.size_bytes,
+			sha256: item.sha256,
+		}));
+
+	return {
+		ok: true,
+		data: {
+			message_pk: messagePk,
+			items,
+		},
+	};
+};
+
+const getSystemHealth = (state) => {
+	const logs = Array.isArray(state.logs) ? state.logs : [];
+	const recent = logs.slice(-20);
+	return {
+		ok: true,
+		data: {
+			signed_in: Boolean(state.signed_in && state.account),
+			account: state.account,
+			message_count: Object.keys(state.mailbox.messages).length,
+			thread_count: Object.keys(state.mailbox.thread_messages).length,
+			attachment_count: Object.keys(state.mailbox.attachments).length,
+			workflow_evidence_count: Array.isArray(state.workflow?.evidences)
+				? state.workflow.evidences.length
+				: 0,
+			workflow_todo_count: Array.isArray(state.workflow?.todos)
+				? state.workflow.todos.length
+				: 0,
+			last_log: recent.length > 0 ? recent[recent.length - 1] : null,
+			recent_logs: recent,
+		},
+	};
+};
+
+const resetSession = (state, input) => {
+	const clearMailbox = Boolean(input.clear_mailbox);
+	state.signed_in = false;
+	state.account = null;
+	state.auth_token = null;
+	state.issued_session = null;
+	state.pending_callback = null;
+	if (clearMailbox) {
+		state.mailbox = {
+			messages: {},
+			thread_messages: {},
+			delta_links: {},
+			attachments: {},
+		};
+	}
+	pushLog(
+		state,
+		"warn",
+		"reset_session",
+		clearMailbox ? "auth+mailbox" : "auth",
+	);
+	writeState(state);
+	return {
+		ok: true,
+		data: {
+			cleared_auth: true,
+			cleared_mailbox: clearMailbox,
+		},
+	};
+};
+
+const createWorkflowEvidence = (state, input) => {
+	if (!isNonEmptyString(input.message_pk)) {
+		return errorResponse("E_PARSE_FAILED", "message_pk 가 필요합니다.");
+	}
+	if (!isNonEmptyString(input.snippet)) {
+		return errorResponse("E_PARSE_FAILED", "snippet 이 필요합니다.");
+	}
+	const confidenceRaw = Number(input.confidence);
+	const confidence =
+		Number.isFinite(confidenceRaw) && confidenceRaw >= 0 && confidenceRaw <= 1
+			? confidenceRaw
+			: 0.7;
+
+	const message = state.mailbox.messages[input.message_pk];
+	if (!message) {
+		return errorResponse("E_NOT_FOUND", "요청한 message 를 찾을 수 없습니다.");
+	}
+
+	if (!state.workflow || typeof state.workflow !== "object") {
+		state.workflow = { evidences: [], todos: [] };
+	}
+	if (!Array.isArray(state.workflow.evidences)) {
+		state.workflow.evidences = [];
+	}
+
+	const evidenceId = `ev_${createHash("sha1")
+		.update(`${input.message_pk}:${input.snippet}:${Date.now()}`)
+		.digest("hex")
+		.slice(0, 12)}`;
+	const evidence = {
+		evidence_id: evidenceId,
+		source: {
+			kind: "email",
+			id: input.message_pk,
+			thread_pk: message.provider_thread_id,
+		},
+		locator: {
+			type: "outlook_quote",
+			text_quote: input.snippet,
+		},
+		snippet: input.snippet,
+		confidence,
+		created_at: nowIso(),
+	};
+	state.workflow.evidences.push(evidence);
+	state.workflow.evidences = state.workflow.evidences.slice(-500);
+	writeState(state);
+	pushLog(state, "info", "workflow_evidence", evidenceId);
+	return { ok: true, data: { evidence } };
+};
+
+const upsertWorkflowTodo = (state, input) => {
+	if (!isNonEmptyString(input.title)) {
+		return errorResponse("E_PARSE_FAILED", "title 이 필요합니다.");
+	}
+	if (!state.workflow || typeof state.workflow !== "object") {
+		state.workflow = { evidences: [], todos: [] };
+	}
+	if (!Array.isArray(state.workflow.todos)) {
+		state.workflow.todos = [];
+	}
+	const allowed = ["open", "in_progress", "done"];
+	const status =
+		isNonEmptyString(input.status) && allowed.includes(input.status)
+			? input.status
+			: "open";
+	const todoId = isNonEmptyString(input.todo_id)
+		? input.todo_id
+		: `todo_${createHash("sha1")
+				.update(`${input.title}:${Date.now()}`)
+				.digest("hex")
+				.slice(0, 12)}`;
+	const evidenceId = isNonEmptyString(input.evidence_id)
+		? input.evidence_id
+		: null;
+	const now = nowIso();
+	const idx = state.workflow.todos.findIndex((item) => item.todo_id === todoId);
+	if (idx >= 0) {
+		const prev = state.workflow.todos[idx];
+		state.workflow.todos[idx] = {
+			...prev,
+			title: input.title,
+			status,
+			evidence_id: evidenceId,
+			updated_at: now,
+		};
+	} else {
+		state.workflow.todos.push({
+			todo_id: todoId,
+			title: input.title,
+			status,
+			evidence_id: evidenceId,
+			created_at: now,
+			updated_at: now,
+		});
+	}
+	state.workflow.todos = state.workflow.todos.slice(-500);
+	writeState(state);
+	pushLog(state, "info", "workflow_todo", todoId);
+	const todo =
+		state.workflow.todos.find((item) => item.todo_id === todoId) ?? null;
+	return { ok: true, data: { todo } };
+};
+
+const listWorkflow = (state) => ({
+	ok: true,
+	data: {
+		evidences: Array.isArray(state.workflow?.evidences)
+			? state.workflow.evidences
+			: [],
+		todos: Array.isArray(state.workflow?.todos) ? state.workflow.todos : [],
+	},
+});
+
 const handleAuthStatus = (state) => ({
 	ok: true,
 	data: {
@@ -1205,6 +1689,30 @@ const handleMessage = async (message) => {
 	}
 	if (message.action === "mail_store.get_thread") {
 		return getThread(state, config, message);
+	}
+	if (message.action === "mail_store.list_messages") {
+		return listMessages(state, config, message);
+	}
+	if (message.action === "mail_store.list_threads") {
+		return listThreads(state, config, message);
+	}
+	if (message.action === "mail_store.list_attachments") {
+		return listAttachments(state, config, message);
+	}
+	if (message.action === "system.health") {
+		return getSystemHealth(state);
+	}
+	if (message.action === "system.reset_session") {
+		return resetSession(state, message);
+	}
+	if (message.action === "workflow.create_evidence") {
+		return createWorkflowEvidence(state, message);
+	}
+	if (message.action === "workflow.upsert_todo") {
+		return upsertWorkflowTodo(state, message);
+	}
+	if (message.action === "workflow.list") {
+		return listWorkflow(state);
 	}
 
 	return errorResponse("E_UNKNOWN", "unsupported action");
