@@ -368,7 +368,7 @@ export const parseEvidence = (
 	if (!isRecord(raw)) {
 		return {
 			ok: false,
-			errors: [{ path: "root", message: "Evidence 값은 객체여야 합니다." }],
+			errors: [{ path: "root", message: "근거 값은 객체여야 합니다." }],
 		};
 	}
 
@@ -452,7 +452,7 @@ export const parseEvidence = (
 	) {
 		errors.push({
 			path: "root",
-			message: "Evidence 에 알 수 없는 키가 존재합니다.",
+			message: "근거 객체에 알 수 없는 키가 존재합니다.",
 		});
 	}
 

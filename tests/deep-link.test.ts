@@ -190,7 +190,7 @@ describe("Deep Link 생성", () => {
 			"refresh_message_link",
 			"retry_navigation",
 		]);
-		expect(plan.guidance).toContain("webLink 가 비어있어");
+		expect(plan.guidance).toContain("메일 링크(webLink)");
 	});
 
 	test("buildEmailDeepLinkNavigationPlan 는 잘못된 webLink 에서 재인덱싱 플로우를 제공한다", () => {
@@ -324,7 +324,7 @@ describe("Deep Link 생성", () => {
 
 	test("빈 webLink 는 예외를 던진다", () => {
 		expect(() => buildEmailDeepLink("", "요청")).toThrow(
-			"webLink 는 빈 값일 수 없습니다.",
+			"메일 링크(webLink)는 빈 값일 수 없습니다.",
 		);
 	});
 
@@ -340,7 +340,7 @@ describe("Deep Link 생성", () => {
 
 	test("잘못된 webLink는 예외를 던진다", () => {
 		expect(() => buildEmailDeepLink("mailbox")).toThrow(
-			"webLink 는 절대 URL 이어야 합니다.",
+			"메일 링크(webLink)는 절대 URL이어야 합니다.",
 		);
 	});
 });

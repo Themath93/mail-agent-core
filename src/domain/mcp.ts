@@ -1075,7 +1075,7 @@ const requireCodexAuthContext = (context: McpRuntimeContext) => {
 	if (context.state.codex_auth.mode !== "env") {
 		return errorResponse(
 			"E_CODEX_AUTH_FAILED",
-			"codex auth mode 설정이 올바르지 않습니다.",
+			"코덱스 인증 모드 설정이 올바르지 않습니다.",
 		);
 	}
 
@@ -1304,7 +1304,7 @@ const handleGraphDeltaSync = (
 	if (currentDeltaLink === undefined) {
 		return errorResponse(
 			"E_GRAPH_THROTTLED",
-			"delta link 가 없습니다. initial_sync 를 먼저 실행하세요.",
+			"델타 링크가 없습니다. initial_sync 를 먼저 실행하세요.",
 			true,
 		);
 	}
@@ -2613,7 +2613,7 @@ const handleAutopilotResume = (
 	if (context.state.autopilot.mode === "manual") {
 		return errorResponse(
 			"E_POLICY_DENIED",
-			"manual 모드에서는 resume 할 수 없습니다.",
+			"manual 모드에서는 재개할 수 없습니다.",
 		);
 	}
 	context.state.autopilot.paused = false;
@@ -2651,17 +2651,20 @@ const handleAutopilotTick = (
 	if (context.state.autopilot.mode === "manual") {
 		return errorResponse(
 			"E_POLICY_DENIED",
-			"manual 모드입니다. autopilot.set_mode 후 실행하세요.",
+			"manual 모드입니다. autopilot.set_mode 도구를 먼저 실행하세요.",
 		);
 	}
 	if (context.state.autopilot.status === "degraded") {
 		return errorResponse(
 			"E_POLICY_DENIED",
-			`autopilot 이 degraded 상태입니다. ${context.state.autopilot.last_error ?? "복구 후 resume 하세요."}`,
+			`autopilot 이 성능 저하(degraded) 상태입니다. ${context.state.autopilot.last_error ?? "복구 후 재개(resume)하세요."}`,
 		);
 	}
 	if (context.state.autopilot.paused) {
-		return errorResponse("E_POLICY_DENIED", "autopilot 이 paused 상태입니다.");
+		return errorResponse(
+			"E_POLICY_DENIED",
+			"autopilot 이 일시정지(paused) 상태입니다.",
+		);
 	}
 	const runId = `run_${Date.now()}_${randomBytes(3).toString("hex")}`;
 	context.state.autopilot.in_flight_run_id = runId;

@@ -42,14 +42,14 @@ const FALLBACK_RECOVERY: Record<
 		shouldReindex: false,
 		recoverySteps: ["refresh_message_link", "retry_navigation"],
 		guidance:
-			"메일 webLink 가 비어있어 기본 메일함으로 이동한 뒤 동기화 메타데이터를 갱신하세요.",
+			"메일 링크(webLink)가 비어 있어 기본 메일함으로 이동한 뒤 동기화 메타데이터를 갱신하세요.",
 	},
 	invalid_email_web_link: {
 		mode: "fallback_invalid_email_web_link",
 		shouldReindex: true,
 		recoverySteps: ["reindex_message", "retry_navigation"],
 		guidance:
-			"메일 링크 형식이 유효하지 않아 재인덱싱 후 링크를 재생성해 재시도하세요.",
+			"메일 링크 형식이 유효하지 않아 재인덱싱 후 링크를 다시 생성해 재시도하세요.",
 	},
 };
 
@@ -59,7 +59,7 @@ const malformedLinkPlan: Omit<EmailDeepLinkNavigationPlan, "deepLinkInfo"> = {
 	shouldReindex: true,
 	recoverySteps: ["reindex_message", "retry_navigation"],
 	guidance:
-		"이메일 deep link 형식이 올바르지 않습니다. 메시지 링크를 재인덱싱한 뒤 재시도하세요.",
+		"이메일 딥링크 형식이 올바르지 않습니다. 메시지 링크를 재인덱싱한 뒤 재시도하세요.",
 };
 
 export const buildEmailDeepLinkNavigationPlan = (
@@ -88,7 +88,7 @@ export const buildEmailDeepLinkNavigationPlan = (
 			shouldRetry: false,
 			shouldReindex: false,
 			recoverySteps: [],
-			guidance: "메일 링크에서 quote 하이라이트를 시도합니다.",
+			guidance: "메일 링크에서 인용문 하이라이트를 시도합니다.",
 		};
 	}
 
