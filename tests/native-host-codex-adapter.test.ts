@@ -48,6 +48,20 @@ type CodexExecRuntimeContract = {
 	};
 };
 
+type CodexOAuthBrokerStateContract = {
+	status: "idle" | "pending" | "authorized" | "error";
+	oauth_session_id: string | null;
+	authorize_url: string | null;
+	last_error: string | null;
+	updated_at: string | null;
+};
+
+type NativeHostStateLike = {
+	codex_auth?: {
+		oauth_broker?: CodexOAuthBrokerStateContract;
+	};
+};
+
 type AnalyzeCandidateResult = {
 	proposal: {
 		message_pk: string;
@@ -103,6 +117,32 @@ const hostModule = (await import(
 				env_fallback_only_ci_headless: boolean;
 			}>;
 		}) => CodexExecRuntimeContract;
+		resolveCodexExecAuth: (
+			config: {
+				codex_exec?: Partial<{
+					opencode_api_key_env: string;
+					env_api_key_env: string;
+				}>;
+			},
+			runtimeContract: CodexExecRuntimeContract,
+			state?: NativeHostStateLike,
+		) =>
+			| {
+					ok: true;
+					enabled: boolean;
+					source?: string;
+					redacted?: string;
+			  }
+			| {
+					ok: false;
+					error: {
+						ok: false;
+						error_code: string;
+						error_message: string;
+						retryable: boolean;
+					};
+					logMessage: string;
+			  };
 		analyzeAutopilotCandidate: (
 			message: AnalyzeCandidateInput,
 			runtimeContract: CodexExecRuntimeContract,
@@ -492,6 +532,204 @@ describe("native host codex exec adapter", () => {
 		expect(terminal.failure_kind).toBe("analysis_fail");
 		expect(terminal.failure_message).toContain("adapter terminal");
 	});
+
+	test("policy mapping: OAuth 세션 누락은 E_CODEX_AUTH_REQUIRED로 결정적으로 매핑된다", () => {
+		const runtimeContract = __hostTestables.buildCodexExecRuntimeContract({
+			codex_exec: {
+				enabled: true,
+				env_fallback_only_ci_headless: true,
+			},
+		});
+		const result = __hostTestables.resolveCodexExecAuth(
+			{},
+			runtimeContract,
+			{},
+		);
+
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.error.error_code).toBe("E_CODEX_AUTH_REQUIRED");
+			expect(result.error.retryable).toBe(false);
+		}
+	});
+
+	test("policy mapping: OAuth broker authorized 세션이면 codex exec auth가 성공한다", () => {
+		const runtimeContract = __hostTestables.buildCodexExecRuntimeContract({
+			codex_exec: {
+				enabled: true,
+			},
+		});
+		const result = __hostTestables.resolveCodexExecAuth({}, runtimeContract, {
+			codex_auth: {
+				oauth_broker: {
+					status: "authorized",
+					oauth_session_id: "sess_runtime_123",
+					authorize_url: null,
+					last_error: null,
+					updated_at: "2026-02-18T00:00:00.000Z",
+				},
+			},
+		});
+
+		expect(result.ok).toBe(true);
+		if (result.ok) {
+			expect(result.source).toBe("oauth_broker_session:authorized");
+			expect(result.redacted).toBe("[REDACTED]");
+		}
+	});
+
+	test("policy mapping: authorized 상태여도 oauth_session_id가 없으면 codex exec auth를 거부한다", () => {
+		const runtimeContract = __hostTestables.buildCodexExecRuntimeContract({
+			codex_exec: {
+				enabled: true,
+			},
+		});
+		const result = __hostTestables.resolveCodexExecAuth({}, runtimeContract, {
+			codex_auth: {
+				oauth_broker: {
+					status: "authorized",
+					oauth_session_id: null,
+					authorize_url: null,
+					last_error: null,
+					updated_at: "2026-02-18T00:00:00.000Z",
+				},
+			},
+		});
+
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.error.error_code).toBe("E_CODEX_AUTH_REQUIRED");
+			expect(result.error.retryable).toBe(false);
+		}
+	});
+
+	test("policy mapping reliability matrix: oauth broker authorized + non-empty session은 happy path를 보장한다", () => {
+		const runtimeContract = buildRuntimeContract(true);
+		const result = __hostTestables.resolveCodexExecAuth({}, runtimeContract, {
+			codex_auth: {
+				oauth_broker: {
+					status: "authorized",
+					oauth_session_id: "sess_matrix_happy",
+					authorize_url: null,
+					last_error: null,
+					updated_at: "2026-02-18T00:00:00.000Z",
+				},
+			},
+		});
+
+		expect(result.ok).toBe(true);
+		if (result.ok) {
+			expect(result.source).toBe("oauth_broker_session:authorized");
+			expect(result.redacted).toBe("[REDACTED]");
+		}
+	});
+
+	test.each([
+		{
+			name: "missing state",
+			state: undefined,
+			expectedCode: "E_CODEX_AUTH_REQUIRED",
+		},
+		{
+			name: "oauth_broker object missing",
+			state: {
+				codex_auth: {},
+			},
+			expectedCode: "E_CODEX_AUTH_REQUIRED",
+		},
+		{
+			name: "idle status even with session",
+			state: {
+				codex_auth: {
+					oauth_broker: {
+						status: "idle",
+						oauth_session_id: "sess_idle",
+						authorize_url: null,
+						last_error: null,
+						updated_at: "2026-02-18T00:00:00.000Z",
+					},
+				},
+			},
+			expectedCode: "E_CODEX_AUTH_REQUIRED",
+		},
+		{
+			name: "pending status",
+			state: {
+				codex_auth: {
+					oauth_broker: {
+						status: "pending",
+						oauth_session_id: "sess_pending",
+						authorize_url: "https://auth.example/codex",
+						last_error: null,
+						updated_at: "2026-02-18T00:00:00.000Z",
+					},
+				},
+			},
+			expectedCode: "E_CODEX_AUTH_REQUIRED",
+		},
+		{
+			name: "error status after consent denied",
+			state: {
+				codex_auth: {
+					oauth_broker: {
+						status: "error",
+						oauth_session_id: "sess_error",
+						authorize_url: null,
+						last_error: "access_denied",
+						updated_at: "2026-02-18T00:00:00.000Z",
+					},
+				},
+			},
+			expectedCode: "E_CODEX_AUTH_REQUIRED",
+		},
+		{
+			name: "authorized status with null session (stale)",
+			state: {
+				codex_auth: {
+					oauth_broker: {
+						status: "authorized",
+						oauth_session_id: null,
+						authorize_url: null,
+						last_error: null,
+						updated_at: "2026-02-18T00:00:00.000Z",
+					},
+				},
+			},
+			expectedCode: "E_CODEX_AUTH_REQUIRED",
+		},
+		{
+			name: "authorized status with blank session",
+			state: {
+				codex_auth: {
+					oauth_broker: {
+						status: "authorized",
+						oauth_session_id: "   ",
+						authorize_url: null,
+						last_error: null,
+						updated_at: "2026-02-18T00:00:00.000Z",
+					},
+				},
+			},
+			expectedCode: "E_CODEX_AUTH_REQUIRED",
+		},
+	])(
+		"policy mapping reliability matrix failure: $name",
+		({ state, expectedCode }) => {
+			const runtimeContract = buildRuntimeContract(true);
+			const result = __hostTestables.resolveCodexExecAuth(
+				{},
+				runtimeContract,
+				state as NativeHostStateLike | undefined,
+			);
+
+			expect(result.ok).toBe(false);
+			if (!result.ok) {
+				expect(result.error.error_code).toBe(expectedCode);
+				expect(result.error.retryable).toBe(false);
+				expect(result.logMessage).toContain("oauth broker session");
+			}
+		},
+	);
 
 	test("codex-stage redaction은 auth/secret 값을 로그 문자열에서 제거한다", () => {
 		process.env.CODEX_API_KEY = "sk-live-secret-value-123456";

@@ -1,0 +1,21 @@
+# Learnings
+
+- 2026-02-18: `resolveCodexExecAuth` 테스트에 `status=authorized`지만 `oauth_session_id`가 없는 케이스를 추가해, OAuth 세션 ID가 인증 성공의 필수 조건임을 계약으로 고정했다.
+- 2026-02-18: `requireCodexAuthContext`를 OAuth broker 세션(`authorized` + non-empty `oauth_session_id`) 기준으로 fail-closed 하도록 단순화하면 env/opencode 플래그 편차 없이 `E_CODEX_AUTH_REQUIRED` 정책을 일관되게 보장할 수 있다.
+- 2026-02-18: `tests/storage.test.ts`의 `McpRuntimeState` fixture에 `codex_auth.oauth_broker` 기본 shape를 추가하면 TS2741(`oauth_broker` 누락) 빌드 실패를 런타임 로직 변경 없이 최소 수정으로 해소할 수 있다.
+- 2026-02-18: 이전에 남긴 "plan 파일이 없다" 단정은 잘못된 보고였고, 이후 체크리스트 북키핑은 실제 파일 존재를 먼저 재검증한 뒤 수행해야 한다.
+- 2026-02-18: `tests/mcp.test.ts`는 `createToolContext` 기본 fixture를 OAuth authorized broker 세션으로 정규화하고, auth 실패를 의도한 케이스만 `setCodexOAuthUnauthorized`를 사용하면 OAuth-only 전환 후 대량 회귀를 helper 레벨에서 최소 수정으로 흡수할 수 있다.
+- 2026-02-18: `createMcpContext(undefined, { domainMirrorAdapter })`를 직접 쓰는 attachment 계열 테스트는 기본 auth fixture를 우회하므로 `setCodexOAuthAuthorized(context)`를 명시해야 `autopilot.tick` 성공 경로가 유지된다.
+- 2026-02-18: sidepanel Codex OAuth UX는 Graph 로그인 유틸(자동완료 루프, callback 파싱, 수동 fallback 문구)을 provider 파라미터(`provider="codex"`) 기반으로 재사용하면 host/domain 런타임 로직 변경 없이 상태 전이(start/auto/manual/status/logout)를 동일 패턴으로 확장할 수 있다.
+- 2026-02-18: e2e에서 sidepanel을 `file://`로 직접 열어도 `chrome.runtime.sendNativeMessage` mock과 `chrome.storage.local` mock을 `page.addInitScript`로 선주입하면 Codex OAuth smoke 시나리오를 브라우저 실환경에 가깝게 검증할 수 있다.
+- 2026-02-18: `autopilot.status`에 `codex_auth_state`(신규)와 `codex_auth`(호환 alias)를 동시에 노출하고 `oauth_session_id_present:boolean`로 세션 존재만 전달하면 기존 키를 유지하면서 OAuth broker 상태를 민감정보 없이 확장할 수 있다.
+- 2026-02-18: `SENSITIVE_TEXT_FIELD_PATTERN` 기반 중앙 redaction 패턴으로 `oauth_session_id`, `oauth_access_token`, `oauth_session_secret`를 공통 처리하면 `system.health`/`autopilot.status`/로그 sanitize 경로를 개별 수정하지 않고 OAuth artifact 누출을 동시에 차단할 수 있다.
+- 2026-02-18: Task 5 재검증 시 sidepanel(`extension/sidepanel.js`, `extension/sidepanel.html`)과 e2e smoke(`tests/e2e/smoke.e2e.ts`)가 Codex start/auto/manual/status/logout 흐름을 이미 커버하고 있어 기능 추가 없이 체크리스트만 닫는 것이 최적이다.
+- 2026-02-18: Task 6 재검증에서 `native-host/host.mjs`의 `resolveCodexExecAuth`와 `src/domain/mcp.ts`의 `requireCodexAuthContext`가 동일하게 OAuth broker `authorized + oauth_session_id`를 필수 조건으로 강제함을 확인했다.
+- 2026-02-18: Task 12 최종 게이트에서 `bun run test:i18n-contract` -> `bun run build` -> `bun test` -> `bun run ci` -> `bun run test:e2e` 순서를 그대로 검증하면 커버리지(85.79%) 포함 릴리즈 기준을 한 번에 판정할 수 있다.
+- 2026-02-18: 최종 증적은 `.sisyphus/evidence/task-12-oauth-release-gate.txt` 단일 파일로 남기고, 계획서의 DoD/Final Checklist를 동시에 완료 처리해야 운영 상태와 문서 상태가 일치한다.
+- 2026-02-18: Task 10 문서화에서 운영자가 바로 실행할 수 있도록 Codex 인증 Runbook을 `start_login -> complete_login_auto -> complete_login(수동) -> auth_status -> logout` 고정 순서로 명시하면 callback 지연/누락 상황에서도 복구 절차가 분기 없이 일관되게 유지된다.
+- 2026-02-18: OAuth-only 전환 이후 혼선을 줄이려면 `fallback_used` 같은 상태 호환 메타데이터는 "관측값"으로만 설명하고, 실행 인증 판정 소스는 OAuth 세션만 유효하다는 문장을 Runbook/설치 가이드/README에 동시에 배치해야 한다.
+- 2026-02-18: Task 11에서 `tests/mcp.test.ts` auth_store reliability matrix를 추가해 happy path 1건과 실패 경로 6건(timeout equivalent, invalid state, consent denied equivalent, stale session, logout race equivalent, callback replay)을 모두 결정적 에러 코드로 고정했다.
+- 2026-02-18: `tests/native-host-codex-adapter.test.ts`의 resolve auth matrix는 oauth_broker가 missing/idle/pending/error/authorized+null/authorized+blank여도 동일하게 `E_CODEX_AUTH_REQUIRED`를 반환함을 증명해 OAuth-only fail-closed 정책을 강화했다.
+- 2026-02-18: `tests/e2e/smoke.e2e.ts`에서 sidepanel callback 실패 매트릭스(invalid state, code 누락, access_denied, logout 이후 stale completion)를 UI 문구 기준으로 검증하면 host 응답 분기와 사용자 복구 안내가 함께 회귀 방지된다.

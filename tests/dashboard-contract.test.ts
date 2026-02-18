@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, test } from "vitest";
 
 import {
@@ -380,5 +381,19 @@ describe("Dashboard/Search/Timeline 계약 고정", () => {
 		if (!searchInvalidTotalEstimate.ok) {
 			expect(searchInvalidTotalEstimate.errors[0]?.path).toBe("total_estimate");
 		}
+	});
+
+	test("autopilot.status 계약은 기존 키를 유지하면서 codex auth 상태 필드를 노출한다", () => {
+		const hostSource = readFileSync("native-host/host.mjs", "utf8");
+
+		expect(hostSource).toContain(
+			"codex_exec_contract: sanitizeCodexExecContractForStatus(runtimeContract)",
+		);
+		expect(hostSource).toContain(
+			"persistence_authority: PHASE_1_PERSISTENCE_AUTHORITY",
+		);
+		expect(hostSource).toContain("codex_auth_state:");
+		expect(hostSource).toContain("codex_auth:");
+		expect(hostSource).toContain("oauth_session_id_present");
 	});
 });

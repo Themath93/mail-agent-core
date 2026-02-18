@@ -5,7 +5,7 @@
 ## 1. 이 문서의 범위
 
 - 대상: Outlook 메일을 동기화하고 근거(Evidence) 기반으로 업무를 관리하려는 사용자
-- 범위: 로그인 자동완료, 동기화, 메일/첨부 조회, 기본 문제 해결
+- 범위: 로그인 자동완료, 동기화, 메일/첨부 조회, 기본 문제 해결, Codex OAuth 운영 Runbook
 - 참고: 본 저장소는 `mail-agent-core` 중심이며, 실제 확장 UI/배포는 연동 환경에 따라 다를 수 있습니다.
 
 ## 2. 시작 전 준비
@@ -35,6 +35,19 @@
 - "로그인 상태 확인" 버튼으로 `signed_in`/`account`/`pending_callback_received` 상태를 확인합니다.
 
 로그인 실패 또는 세션 만료 시 "로그인 시작"부터 다시 수행하세요.
+
+### 4.1.1 Codex OAuth 로그인 Runbook (start/auto/manual/status/logout)
+
+- Codex 실행 인증은 OAuth 세션 기준으로만 활성화됩니다.
+- 실행 순서:
+  1. `codex_auth.start_login` 실행 후 반환된 `login_url`을 브라우저에서 완료합니다.
+  2. `codex_auth.complete_login_auto`를 최대 5분(300회 재시도) 대기합니다.
+  3. 자동 완료가 실패하면 callback URL 전체 또는 `code`를 사용해 `codex_auth.complete_login`을 수동 실행합니다.
+  4. `codex_auth.auth_status`에서 `signed_in=true`, `pending_callback_received=false`를 확인합니다.
+  5. 세션 폐기/재시작이 필요하면 `codex_auth.logout` 후 1단계부터 다시 수행합니다.
+- 정책 주의사항:
+  - env 기반 Codex 인증(`CODEX_API_KEY`, env fallback)은 더 이상 활성 경로가 아닙니다.
+  - `autopilot.status`의 호환 메타데이터에 env 관련 필드가 남아 있어도 실행 인증 판정에는 사용되지 않습니다.
 
 ## 4.2 메일 동기화
 
@@ -74,6 +87,17 @@
 - 상태/로그 확인: `system.health`
 - 세션 초기화(인증만): `system.reset_session` (`clear_mailbox=false`)
 - 세션 초기화(인증+메일 캐시): `system.reset_session` (`clear_mailbox=true`)
+
+### Codex OAuth 2분 복구 절차 (인증/콜백 장애)
+
+아래 순서를 그대로 실행하면 2분 내 Codex 인증 장애를 복구하거나 안전하게 격리할 수 있습니다.
+
+1. 0~30초: `codex_auth.auth_status`로 현재 상태 확인 (`signed_in`, `pending_callback_received`, `last_error`)
+2. 30~60초: `signed_in=false`면 `codex_auth.start_login` 재실행
+3. 60~90초: `pending_callback_received=true`면 `codex_auth.complete_login`(수동 callback/code) 즉시 실행
+4. 90~120초: 실패 지속 시 `codex_auth.logout` -> `codex_auth.start_login` 순으로 세션 재수립
+
+2분 내 복구되지 않으면 자동 write를 차단하기 위해 `autopilot.pause` -> `autopilot.set_mode` (`mode=manual`)를 실행합니다.
 
 ## 4.7 Evidence/Todo 최소 연계
 
@@ -154,6 +178,18 @@
 
 ## 5. 자주 발생하는 문제와 대응
 
+### Codex OAuth 장애 대응 매트릭스 (결정형)
+
+| 상황(결정 신호) | 원인 | 즉시 조치 (순서 고정) | 완료 판정 |
+| --- | --- | --- | --- |
+| `codex_auth.complete_login_auto` 타임아웃 + `pending_callback_received=false` | 브라우저 인증 미완료/콜백 미도달 | `codex_auth.start_login` 재실행 -> 브라우저 인증 완료 -> `codex_auth.complete_login_auto` 재시도 | `codex_auth.auth_status.signed_in=true` |
+| `pending_callback_received=true`인데 자동 완료 반복 실패 | 자동 감지 루프 초과 또는 callback 파싱 실패 | callback URL 전체 또는 `code` 복사 -> `codex_auth.complete_login` 수동 실행 | `pending_callback_received=false` |
+| `state 값이 일치하지 않습니다` 또는 `E_AUTH_FAILED` | 이전 세션의 stale state 사용 | `codex_auth.logout` -> `codex_auth.start_login` 새 세션 발급 -> 새 callback으로 완료 | `last_error`가 동일 state 오류로 재발하지 않음 |
+| `E_CODEX_AUTH_REQUIRED`가 `autopilot.tick`에서 반복 | Codex OAuth 미인증 상태에서 실행 시도 | `codex_auth.auth_status` 확인 -> 미인증이면 start/complete 수행 -> `autopilot.tick` 재시도 | `autopilot.tick` auth 오류 해소 |
+| 콜백 처리 후에도 signed-out 유지 | 잘못된 callback/code 입력 또는 세션 만료 | `codex_auth.logout` -> 재로그인(자동) -> 필요 시 수동 완료 | `signed_in=true`로 고정 |
+
+운영 원칙: 동일 장애 2회 연속 발생 시 즉시 `autopilot.pause`를 유지하고 장애 원인 제거 전 `full_auto` 재승격을 금지합니다.
+
 ### 오류 코드 해석 매트릭스 (운영자용)
 
 | 오류 코드 | 증상 | 가능 원인 | 운영자 조치 |
@@ -167,6 +203,8 @@
 | `E_CODEX_TIMEOUT` (`E_CODEX_*`) | `retrying` 증가, timeout 카운터 증가 | codex 실행 시간 초과/부하 | 즉시 `autopilot.pause`, 입력 상한 축소(10/3), 원인 제거 후 shadow 재검증 |
 | `E_CODEX_SCHEMA_INVALID` (`E_CODEX_*`) | schema_fail 증가, `degraded` 전이 가능 | codex 출력 스키마 불일치/파싱 불가 | 자동 승격 중지, `review_first` 유지, 샘플 payload/출력 비교 후 수정 전까지 full_auto 금지 |
 | `E_CODEX_EXEC_FAILED` (`E_CODEX_*`) | fail 증가, `last_error` 반복 | codex 프로세스 비정상 종료(spawn/exit/signal) | 롤백 스위치 실행(2분 템플릿), 런타임 복구 후 단계 1부터 재승격 |
+
+참고: `fallback_used` 같은 상태/텔레메트리 필드는 하위 호환 관측값이며, Codex 실행 인증의 활성 정책은 OAuth-only입니다.
 
 ## 6. 운영 권장사항
 

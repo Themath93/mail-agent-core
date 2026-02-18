@@ -35,7 +35,36 @@ const expectUnknownTool = (response: McpResponse<unknown>) => {
 	}
 };
 
-const createToolContext = (): McpRuntimeContext => createMcpContext();
+const setCodexOAuthAuthorized = (
+	context: McpRuntimeContext,
+	oauthSessionId = "sess_test_authorized",
+) => {
+	context.state.codex_auth.mode = "oauth_broker";
+	context.state.codex_auth.oauth_broker = {
+		status: "authorized",
+		oauth_session_id: oauthSessionId,
+		authorize_url: null,
+		last_error: null,
+		updated_at: new Date().toISOString(),
+	};
+};
+
+const setCodexOAuthUnauthorized = (context: McpRuntimeContext) => {
+	context.state.codex_auth.mode = "oauth_broker";
+	context.state.codex_auth.oauth_broker = {
+		status: "idle",
+		oauth_session_id: null,
+		authorize_url: null,
+		last_error: null,
+		updated_at: new Date().toISOString(),
+	};
+};
+
+const createToolContext = (): McpRuntimeContext => {
+	const context = createMcpContext();
+	setCodexOAuthAuthorized(context);
+	return context;
+};
 
 const completeLogin = (context: McpRuntimeContext) => {
 	const issued = context.state.issued_session;
@@ -483,6 +512,169 @@ describe("MCP tools", () => {
 		}
 	});
 
+	test("auth_store codex oauth 신뢰성 매트릭스: happy path는 수동 완료로 signed_in=true를 보장한다", () => {
+		const context = createToolContext();
+		const started = invokeMcpTool(
+			"auth_store.start_login",
+			{ scopes: ["openid", "profile", "offline_access"] },
+			context,
+		);
+		expect(started.ok).toBe(true);
+		if (!started.ok) {
+			throw new Error("start_login 실패");
+		}
+
+		const complete = invokeMcpTool(
+			"auth_store.complete_login",
+			{
+				code: "manual-code",
+				state: context.state.issued_session?.state ?? "",
+				code_verifier: context.state.issued_session?.code_verifier ?? "",
+			},
+			context,
+		);
+
+		expect(complete.ok).toBe(true);
+		const status = invokeMcpTool("auth_store.auth_status", {}, context);
+		expect(status.ok).toBe(true);
+		if (status.ok) {
+			expect(status.data.signed_in).toBe(true);
+			expect(status.data.pending_callback_received).toBe(false);
+		}
+	});
+
+	test.each([
+		{
+			name: "callback timeout equivalent: pending callback 없음",
+			setup: (context: McpRuntimeContext) => {
+				invokeMcpTool(
+					"auth_store.start_login",
+					{ scopes: ["Mail.Read"] },
+					context,
+				);
+			},
+			invoke: (context: McpRuntimeContext) =>
+				invokeMcpTool("auth_store.complete_login_auto", {}, context),
+			expectedCode: "E_NOT_FOUND",
+			expectedRetryable: true,
+		},
+		{
+			name: "invalid state",
+			setup: (context: McpRuntimeContext) => {
+				invokeMcpTool(
+					"auth_store.start_login",
+					{ scopes: ["Mail.Read"] },
+					context,
+				);
+			},
+			invoke: (context: McpRuntimeContext) =>
+				invokeMcpTool(
+					"auth_store.complete_login",
+					{
+						code: "manual-code",
+						state: "invalid-state",
+						code_verifier: context.state.issued_session?.code_verifier ?? "",
+					},
+					context,
+				),
+			expectedCode: "E_AUTH_FAILED",
+			expectedRetryable: false,
+		},
+		{
+			name: "consent denied equivalent: callback code 누락",
+			setup: (context: McpRuntimeContext) => {
+				invokeMcpTool(
+					"auth_store.start_login",
+					{ scopes: ["Mail.Read"] },
+					context,
+				);
+			},
+			invoke: (context: McpRuntimeContext) =>
+				invokeMcpTool(
+					"auth_store.complete_login",
+					{
+						code: "",
+						state: context.state.issued_session?.state ?? "",
+						code_verifier: context.state.issued_session?.code_verifier ?? "",
+					},
+					context,
+				),
+			expectedCode: "E_PARSE_FAILED",
+			expectedRetryable: false,
+		},
+		{
+			name: "stale session equivalent: pending callback는 있지만 issued_session이 사라진 상태",
+			setup: (context: McpRuntimeContext) => {
+				invokeMcpTool(
+					"auth_store.start_login",
+					{ scopes: ["Mail.Read"] },
+					context,
+				);
+				context.state.pending_callback = {
+					code: "auto-code",
+					state: context.state.issued_session?.state ?? "",
+					received_at: new Date().toISOString(),
+				};
+				context.state.issued_session = null;
+			},
+			invoke: (context: McpRuntimeContext) =>
+				invokeMcpTool("auth_store.complete_login_auto", {}, context),
+			expectedCode: "E_AUTH_REQUIRED",
+			expectedRetryable: false,
+		},
+		{
+			name: "logout race equivalent: start_login 직후 logout 후 manual complete",
+			setup: (context: McpRuntimeContext) => {
+				invokeMcpTool(
+					"auth_store.start_login",
+					{ scopes: ["Mail.Read"] },
+					context,
+				);
+				invokeMcpTool("auth_store.logout", {}, context);
+			},
+			invoke: (context: McpRuntimeContext) =>
+				invokeMcpTool(
+					"auth_store.complete_login",
+					{
+						code: "manual-code",
+						state: "stale-state",
+						code_verifier: "stale-verifier",
+					},
+					context,
+				),
+			expectedCode: "E_AUTH_REQUIRED",
+			expectedRetryable: false,
+		},
+		{
+			name: "callback replay equivalent: 이미 로그인 완료된 뒤 auto complete 재호출",
+			setup: (context: McpRuntimeContext) => {
+				invokeMcpTool(
+					"auth_store.start_login",
+					{ scopes: ["Mail.Read"] },
+					context,
+				);
+				completeLogin(context);
+			},
+			invoke: (context: McpRuntimeContext) =>
+				invokeMcpTool("auth_store.complete_login_auto", {}, context),
+			expectedCode: "E_NOT_FOUND",
+			expectedRetryable: true,
+		},
+	])(
+		"auth_store codex oauth 신뢰성 매트릭스 실패 경로: $name",
+		({ setup, invoke, expectedCode, expectedRetryable }) => {
+			const context = createToolContext();
+			setup(context);
+
+			const response = invoke(context);
+			expect(response.ok).toBe(false);
+			if (!response.ok) {
+				expect(response.error_code).toBe(expectedCode);
+				expect(response.retryable ?? false).toBe(expectedRetryable);
+			}
+		},
+	);
+
 	test("autopilot.tick은 manual 모드에서 E_POLICY_DENIED", () => {
 		const context = createToolContext();
 		const response = invokeMcpTool(
@@ -526,9 +718,7 @@ describe("MCP tools", () => {
 		);
 		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
 
-		context.state.codex_auth.mode = "env";
-		context.state.codex_auth.api_key_env_var = "CODEX_API_KEY";
-		context.state.codex_auth.api_key_present = false;
+		setCodexOAuthUnauthorized(context);
 
 		const signedInBefore = context.state.signed_in;
 		const accountBefore = context.state.account;
@@ -551,7 +741,7 @@ describe("MCP tools", () => {
 		expect(context.state.auth_token?.access_token).toBe(tokenBefore);
 	});
 
-	test("autopilot.tick은 codex auth mode가 잘못되면 E_CODEX_AUTH_FAILED를 반환한다", () => {
+	test("autopilot.tick은 codex auth mode가 잘못되어도 OAuth 세션 없으면 E_CODEX_AUTH_REQUIRED를 반환한다", () => {
 		const context = createToolContext();
 		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
 		completeLogin(context);
@@ -567,7 +757,7 @@ describe("MCP tools", () => {
 		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
 
 		context.state.codex_auth.mode = "envx" as unknown as "env";
-		context.state.codex_auth.api_key_present = true;
+		setCodexOAuthUnauthorized(context);
 
 		const response = invokeMcpTool(
 			"autopilot.tick",
@@ -577,7 +767,7 @@ describe("MCP tools", () => {
 
 		expect(response.ok).toBe(false);
 		if (!response.ok) {
-			expect(response.error_code).toBe("E_CODEX_AUTH_FAILED");
+			expect(response.error_code).toBe("E_CODEX_AUTH_REQUIRED");
 		}
 	});
 
@@ -596,8 +786,7 @@ describe("MCP tools", () => {
 		);
 		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
 
-		context.state.codex_auth.mode = "env";
-		context.state.codex_auth.api_key_present = true;
+		setCodexOAuthAuthorized(context);
 
 		const response = invokeMcpTool(
 			"autopilot.tick",
@@ -609,6 +798,43 @@ describe("MCP tools", () => {
 		if (response.ok) {
 			expect(response.data.auto_evidence_created).toBeGreaterThanOrEqual(0);
 			expect(response.data.auto_todo_created).toBeGreaterThanOrEqual(0);
+		}
+	});
+
+	test("autopilot.tick은 oauth_broker authorized 상태에서도 oauth_session_id 누락 시 거부한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
+
+		context.state.codex_auth.mode = "oauth_broker";
+		context.state.codex_auth.oauth_broker = {
+			status: "authorized",
+			oauth_session_id: null,
+			authorize_url: null,
+			last_error: null,
+			updated_at: new Date().toISOString(),
+		};
+
+		const response = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 1 },
+			context,
+		);
+
+		expect(response.ok).toBe(false);
+		if (!response.ok) {
+			expect(response.error_code).toBe("E_CODEX_AUTH_REQUIRED");
+			expect(response.retryable).toBe(false);
 		}
 	});
 
@@ -750,8 +976,7 @@ describe("MCP tools", () => {
 			fullAutoContext,
 		);
 		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, fullAutoContext);
-		fullAutoContext.state.codex_auth.mode = "env";
-		fullAutoContext.state.codex_auth.api_key_present = true;
+		setCodexOAuthAuthorized(fullAutoContext);
 
 		const fullAutoTick = invokeMcpTool(
 			"autopilot.tick",
@@ -812,8 +1037,7 @@ describe("MCP tools", () => {
 			} as unknown as typeof firstMessage);
 			invokeMcpTool("autopilot.set_mode", { mode }, context);
 			if (mode === "full_auto") {
-				context.state.codex_auth.mode = "env";
-				context.state.codex_auth.api_key_present = true;
+				setCodexOAuthAuthorized(context);
 			}
 			return context;
 		};
@@ -874,8 +1098,7 @@ describe("MCP tools", () => {
 		);
 
 		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
-		context.state.codex_auth.mode = "env";
-		context.state.codex_auth.api_key_present = true;
+		setCodexOAuthAuthorized(context);
 		const tickResponse = invokeMcpTool(
 			"autopilot.tick",
 			{ mail_folder: "inbox", max_messages_per_tick: 5 },
@@ -924,8 +1147,7 @@ describe("MCP tools", () => {
 			context,
 		);
 		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
-		context.state.codex_auth.mode = "env";
-		context.state.codex_auth.api_key_present = true;
+		setCodexOAuthAuthorized(context);
 
 		for (const [messagePk, message] of context.state.messages.entries()) {
 			context.state.messages.set(messagePk, {
@@ -1102,8 +1324,7 @@ describe("MCP tools", () => {
 			context,
 		);
 		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
-		context.state.codex_auth.mode = "env";
-		context.state.codex_auth.api_key_present = true;
+		setCodexOAuthAuthorized(context);
 
 		const messagePks = Array.from(context.state.messages.keys()).slice(0, 2);
 		const first = context.state.messages.get(messagePks[0] ?? "");
@@ -1180,8 +1401,7 @@ describe("MCP tools", () => {
 			context,
 		);
 		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
-		context.state.codex_auth.mode = "env";
-		context.state.codex_auth.api_key_present = true;
+		setCodexOAuthAuthorized(context);
 
 		const messagePks = Array.from(context.state.messages.keys()).slice(0, 2);
 		const first = context.state.messages.get(messagePks[0] ?? "");
@@ -1250,8 +1470,7 @@ describe("MCP tools", () => {
 			context,
 		);
 		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
-		context.state.codex_auth.mode = "env";
-		context.state.codex_auth.api_key_present = true;
+		setCodexOAuthAuthorized(context);
 
 		const firstMessagePk = Array.from(context.state.messages.keys())[0];
 		const firstMessage = firstMessagePk
@@ -1303,8 +1522,7 @@ describe("MCP tools", () => {
 			context,
 		);
 		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
-		context.state.codex_auth.mode = "env";
-		context.state.codex_auth.api_key_present = true;
+		setCodexOAuthAuthorized(context);
 
 		const messagePks = Array.from(context.state.messages.keys()).slice(0, 2);
 		for (const [index, messagePk] of messagePks.entries()) {
@@ -1607,8 +1825,7 @@ describe("MCP tools", () => {
 			context,
 		);
 		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
-		context.state.codex_auth.mode = "env";
-		context.state.codex_auth.api_key_present = true;
+		setCodexOAuthAuthorized(context);
 
 		const firstMessagePk = Array.from(
 			context.state.messages.keys(),
@@ -1654,8 +1871,7 @@ describe("MCP tools", () => {
 			context,
 		);
 		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
-		context.state.codex_auth.mode = "env";
-		context.state.codex_auth.api_key_present = true;
+		setCodexOAuthAuthorized(context);
 
 		const firstMessagePk = Array.from(
 			context.state.messages.keys(),
@@ -1708,6 +1924,7 @@ describe("MCP tools", () => {
 		const context = createMcpContext(undefined, {
 			domainMirrorAdapter: adapter,
 		});
+		setCodexOAuthAuthorized(context);
 		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
 		completeLogin(context);
 		invokeMcpTool(
@@ -1720,8 +1937,7 @@ describe("MCP tools", () => {
 			context,
 		);
 		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
-		context.state.codex_auth.mode = "env";
-		context.state.codex_auth.api_key_present = true;
+		setCodexOAuthAuthorized(context);
 
 		const tick = invokeMcpTool(
 			"autopilot.tick",
@@ -1771,6 +1987,7 @@ describe("MCP tools", () => {
 		const context = createMcpContext(undefined, {
 			domainMirrorAdapter: adapter,
 		});
+		setCodexOAuthAuthorized(context);
 		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
 		completeLogin(context);
 		invokeMcpTool(
@@ -1783,8 +2000,7 @@ describe("MCP tools", () => {
 			context,
 		);
 		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
-		context.state.codex_auth.mode = "env";
-		context.state.codex_auth.api_key_present = true;
+		setCodexOAuthAuthorized(context);
 
 		const tick = invokeMcpTool(
 			"autopilot.tick",
@@ -1830,8 +2046,7 @@ describe("MCP tools", () => {
 			context,
 		);
 		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
-		context.state.codex_auth.mode = "env";
-		context.state.codex_auth.api_key_present = true;
+		setCodexOAuthAuthorized(context);
 		context.state.autopilot.consecutive_failures = 2;
 
 		for (const messagePk of Array.from(context.state.messages.keys()).slice(
@@ -1888,8 +2103,7 @@ describe("MCP tools", () => {
 			context,
 		);
 		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
-		context.state.codex_auth.mode = "env";
-		context.state.codex_auth.api_key_present = true;
+		setCodexOAuthAuthorized(context);
 
 		const firstMessagePk = Array.from(
 			context.state.messages.keys(),
@@ -2013,8 +2227,7 @@ describe("MCP tools", () => {
 			context,
 		);
 		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
-		context.state.codex_auth.mode = "env";
-		context.state.codex_auth.api_key_present = true;
+		setCodexOAuthAuthorized(context);
 
 		for (const [messagePk, message] of context.state.messages.entries()) {
 			context.state.messages.set(messagePk, {
@@ -2106,8 +2319,7 @@ describe("MCP tools", () => {
 			context,
 		);
 		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
-		context.state.codex_auth.mode = "env";
-		context.state.codex_auth.api_key_present = true;
+		setCodexOAuthAuthorized(context);
 
 		const firstMessagePk = Array.from(context.state.messages.keys())[0];
 		if (!firstMessagePk) {
@@ -2167,8 +2379,7 @@ describe("MCP tools", () => {
 			context,
 		);
 		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
-		context.state.codex_auth.mode = "env";
-		context.state.codex_auth.api_key_present = true;
+		setCodexOAuthAuthorized(context);
 
 		const firstMessagePk = Array.from(context.state.messages.keys())[0];
 		if (!firstMessagePk) {
@@ -2345,6 +2556,7 @@ describe("MCP tools", () => {
 		const context = createMcpContext(undefined, {
 			domainMirrorAdapter: adapter,
 		});
+		setCodexOAuthAuthorized(context);
 		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
 		completeLogin(context);
 		invokeMcpTool(
@@ -2500,6 +2712,7 @@ describe("MCP tools", () => {
 		const context = createMcpContext(undefined, {
 			domainMirrorAdapter: adapter,
 		});
+		setCodexOAuthAuthorized(context);
 		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
 		completeLogin(context);
 		invokeMcpTool(
@@ -2737,6 +2950,7 @@ describe("MCP tools", () => {
 		const context = createMcpContext(undefined, {
 			domainMirrorAdapter: adapter,
 		});
+		setCodexOAuthAuthorized(context);
 		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
 		completeLogin(context);
 		invokeMcpTool(
@@ -2887,6 +3101,7 @@ describe("MCP tools", () => {
 		const context = createMcpContext(undefined, {
 			domainMirrorAdapter: adapter,
 		});
+		setCodexOAuthAuthorized(context);
 		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
 		completeLogin(context);
 		invokeMcpTool(
@@ -2899,8 +3114,7 @@ describe("MCP tools", () => {
 			context,
 		);
 		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
-		context.state.codex_auth.mode = "env";
-		context.state.codex_auth.api_key_present = true;
+		setCodexOAuthAuthorized(context);
 
 		context.state.messages.clear();
 		context.state.attachments.clear();
@@ -4388,61 +4602,63 @@ describe("MCP tools", () => {
 					break;
 			}
 
-			const input = {
-				"auth_store.start_login": {
-					scopes: ["Mail.Read", "User.Read"],
-				},
-				"auth_store.complete_login": {
-					code: "abc",
-					state: context.state.issued_session?.state ?? "state",
-					code_verifier: "challenge",
-				},
-				"auth_store.complete_login_auto": {},
-				"auth_store.auth_status": {},
-				"auth_store.logout": {},
-				"graph_mail_sync.initial_sync": {
-					mail_folder: "inbox",
-					days_back: 7,
-					select: ["id", "subject"],
-				},
-				"graph_mail_sync.delta_sync": {
-					mail_folder: "inbox",
-				},
-				"graph_mail_sync.download_attachment": {
-					graph_message_id: "graph_inbox_msg_inbox_1",
-					graph_attachment_id: "att_inbox_msg_inbox_1",
-					message_pk: "inbox_msg_inbox_1",
-				},
-				"mail_store.get_message": {
-					message_pk: "inbox_msg_inbox_1",
-				},
-				"mail_store.get_thread": {
-					thread_pk: "inbox",
-					depth: 20,
-				},
-				"workflow.create_evidence": {
-					message_pk: "inbox_msg_inbox_1",
-					snippet: "자동 추출 테스트",
-					confidence: 0.9,
-				},
-				"workflow.upsert_todo": {
-					title: "자동 todo 테스트",
-					status: "open",
-					evidence_id: "ev_123",
-				},
-				"workflow.list": {},
-				"autopilot.set_mode": {
-					mode: "full_auto",
-				},
-				"autopilot.pause": {},
-				"autopilot.resume": {},
-				"autopilot.status": {},
-				"autopilot.tick": {
-					mail_folder: "inbox",
-					max_messages_per_tick: 5,
-					max_attachments_per_tick: 2,
-				},
-			}[toolName as McpToolName] as never;
+			const input = (
+				{
+					"auth_store.start_login": {
+						scopes: ["Mail.Read", "User.Read"],
+					},
+					"auth_store.complete_login": {
+						code: "abc",
+						state: context.state.issued_session?.state ?? "state",
+						code_verifier: "challenge",
+					},
+					"auth_store.complete_login_auto": {},
+					"auth_store.auth_status": {},
+					"auth_store.logout": {},
+					"graph_mail_sync.initial_sync": {
+						mail_folder: "inbox",
+						days_back: 7,
+						select: ["id", "subject"],
+					},
+					"graph_mail_sync.delta_sync": {
+						mail_folder: "inbox",
+					},
+					"graph_mail_sync.download_attachment": {
+						graph_message_id: "graph_inbox_msg_inbox_1",
+						graph_attachment_id: "att_inbox_msg_inbox_1",
+						message_pk: "inbox_msg_inbox_1",
+					},
+					"mail_store.get_message": {
+						message_pk: "inbox_msg_inbox_1",
+					},
+					"mail_store.get_thread": {
+						thread_pk: "inbox",
+						depth: 20,
+					},
+					"workflow.create_evidence": {
+						message_pk: "inbox_msg_inbox_1",
+						snippet: "자동 추출 테스트",
+						confidence: 0.9,
+					},
+					"workflow.upsert_todo": {
+						title: "자동 todo 테스트",
+						status: "open",
+						evidence_id: "ev_123",
+					},
+					"workflow.list": {},
+					"autopilot.set_mode": {
+						mode: "full_auto",
+					},
+					"autopilot.pause": {},
+					"autopilot.resume": {},
+					"autopilot.status": {},
+					"autopilot.tick": {
+						mail_folder: "inbox",
+						max_messages_per_tick: 5,
+						max_attachments_per_tick: 2,
+					},
+				} as Record<string, unknown>
+			)[toolName] as never;
 
 			const byName = invokeMcpToolByName(toolName, input, context);
 			if (toolName === "auth_store.complete_login_auto" && byName.ok) {

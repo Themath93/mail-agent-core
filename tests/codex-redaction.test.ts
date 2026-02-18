@@ -163,6 +163,53 @@ describe("codex redaction guardrails", () => {
 		expect(JSON.stringify(health.data)).not.toContain(secret);
 	});
 
+	test("oauth session/token 유사 artifact는 status/health/log 전체에서 redaction 된다", () => {
+		const oauthSessionId = "oauth_session_live_445566778899";
+		const oauthToken = "oauth_access_token_live_abc123xyz";
+		const oauthSessionSecret = "oauth_session_secret_live_998877";
+		const state = createBaseState();
+
+		state.autopilot.last_error = `oauth_session_id=${oauthSessionId}`;
+		state.autopilot.codex_stage.last_failure_reason = `oauth_access_token=${oauthToken} oauth_session_secret=${oauthSessionSecret}`;
+		state.logs.push({
+			at: "2026-02-18T00:00:00.000Z",
+			level: "warn",
+			event: "codex_oauth_artifact",
+			message: `oauth_session_id=${oauthSessionId} oauth_access_token=${oauthToken}`,
+		});
+
+		const status = __hostTestables.getAutopilotStatus(state);
+		const health = __hostTestables.getSystemHealth(state);
+
+		expect(status.ok).toBe(true);
+		expect(health.ok).toBe(true);
+		expect(status.data.last_error).toContain("oauth_session_id=[REDACTED]");
+		expect(status.data.codex_last_failure_reason).toContain(
+			"oauth_access_token=[REDACTED]",
+		);
+		expect(status.data.codex_last_failure_reason).toContain(
+			"oauth_session_secret=[REDACTED]",
+		);
+		expect(health.data.autopilot.last_error).toContain(
+			"oauth_session_id=[REDACTED]",
+		);
+		expect(health.data.autopilot.codex_stage.last_failure_reason).toContain(
+			"oauth_access_token=[REDACTED]",
+		);
+		expect(health.data.recent_logs[0]?.message).toContain(
+			"oauth_session_id=[REDACTED]",
+		);
+		expect(health.data.recent_logs[0]?.message).toContain(
+			"oauth_access_token=[REDACTED]",
+		);
+		expect(JSON.stringify(status.data)).not.toContain(oauthSessionId);
+		expect(JSON.stringify(status.data)).not.toContain(oauthToken);
+		expect(JSON.stringify(status.data)).not.toContain(oauthSessionSecret);
+		expect(JSON.stringify(health.data)).not.toContain(oauthSessionId);
+		expect(JSON.stringify(health.data)).not.toContain(oauthToken);
+		expect(JSON.stringify(health.data)).not.toContain(oauthSessionSecret);
+	});
+
 	test("codex analyze artifact는 candidate/metadata 분리 및 metadata allowlist를 강제한다", () => {
 		const artifact = __hostTestables.buildCodexAnalyzeInputPayload({
 			message_pk: "msg_guardrail_1",

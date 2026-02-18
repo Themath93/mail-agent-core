@@ -63,6 +63,13 @@ const createState = (): McpRuntimeState => ({
 		mode: "disabled",
 		api_key_env_var: "CODEX_API_KEY",
 		api_key_present: false,
+		oauth_broker: {
+			status: "idle",
+			oauth_session_id: null,
+			authorize_url: null,
+			last_error: null,
+			updated_at: null,
+		},
 	},
 });
 
