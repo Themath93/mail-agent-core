@@ -35,6 +35,13 @@
 8. 브라우저 로그인 완료 후 콜백을 자동 감지하면 로그인 완료가 자동 처리됩니다.
 9. "로그인 상태 확인"으로 `signed_in=true`를 확인합니다.
 
+Codex OAuth 운영 시작(설치 직후 필수):
+
+10. `codex_auth.start_login`으로 Codex 로그인 URL을 발급합니다.
+11. 브라우저 인증 후 `codex_auth.complete_login_auto` 자동 완료를 최대 5분 대기합니다.
+12. 자동 완료 실패 시 callback URL/code를 사용해 `codex_auth.complete_login`을 수동 실행합니다.
+13. `codex_auth.auth_status`에서 `signed_in=true` 확인 후 Codex 연계 작업을 시작합니다.
+
 ## 4. 개발/검증 설치(현재 저장소 기준)
 
 ```bash
@@ -55,6 +62,16 @@ bun run ci
 - 목록 기능 점검: `list_messages`/`list_threads`/`list_attachments` 동작 확인
 - 운영 기능 점검: `system.health`, `reset_session` 동작 확인
 - 워크플로 기능 점검: `create_evidence` → `upsert_todo` → `workflow.list` 확인
+
+### Codex OAuth 점검 (OAuth-only 정책)
+
+- `codex_auth.auth_status`에서 `signed_in=true`인지 확인
+- signed-out이면 `codex_auth.start_login` -> `codex_auth.complete_login_auto` 순서로 재인증
+- 자동 완료 실패 시 `codex_auth.complete_login` 수동 완료로 전환
+- 세션 초기화가 필요하면 `codex_auth.logout` 후 재로그인
+- `E_CODEX_AUTH_REQUIRED` 발생 시 env 키 주입이 아닌 OAuth 재인증으로만 복구
+
+중요: env 기반 Codex 인증(`CODEX_API_KEY`, env fallback)은 운영 경로에서 비활성/폐기되었습니다.
 
 ## 6. 로그인 상태 시뮬레이션
 
@@ -90,6 +107,17 @@ bun run ci
 1. `lsof -iTCP:1270 -sTCP:LISTEN`으로 callback 포트 충돌 여부 확인
 2. 포트 점유 프로세스가 있으면 종료 후 "로그인 시작" 재실행
 3. 그래도 실패하면 `scripts/setup-macos.sh`를 다시 실행해 Native Host 등록 정보 재적용
+
+### Codex OAuth callback 실패 매트릭스
+
+| 신호 | 원인 | 2분 내 조치 |
+| --- | --- | --- |
+| `codex_auth.complete_login_auto` timeout | callback 미수신 | `codex_auth.start_login` 재실행 -> 브라우저 인증 재완료 -> auto 재시도 |
+| `pending_callback_received=true` + auto 실패 | auto loop 종료 | callback/code를 `codex_auth.complete_login`으로 수동 입력 |
+| `state 값이 일치하지 않습니다` | stale state | `codex_auth.logout` -> `codex_auth.start_login`으로 새 세션 생성 |
+| `E_CODEX_AUTH_REQUIRED` 반복 | Codex 인증 누락 | `codex_auth.auth_status` 확인 후 start/complete 재수행 |
+
+모든 케이스에서 2분 내 복구 실패 시 `autopilot.pause` -> `autopilot.set_mode (manual)`로 자동 write를 즉시 차단합니다.
 
 ## 8. 자주 발생하는 설치 이슈
 

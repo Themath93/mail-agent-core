@@ -31,6 +31,12 @@ Microsoft Graph API 기반으로 Outlook 메일과 첨부 파일을 로컬에서
 2. 5분 내 자동완료가 안 되면 callback URL 전체 또는 code를 입력해 "로그인 완료"를 수동 실행
 3. "로그인 상태 확인"에서 `signed_in=true` 확인 후 `initial_sync` → `delta_sync` 순서로 진행
 
+### Codex OAuth 운영 안내
+
+- Codex 실행 인증은 OAuth-only 정책입니다. `codex_auth.start_login` -> `codex_auth.complete_login_auto`(필요 시 `codex_auth.complete_login`) -> `codex_auth.auth_status` 순서로 운영하세요.
+- env 기반 Codex 인증(`CODEX_API_KEY`, env fallback)은 활성 경로가 아니며, `E_CODEX_AUTH_REQUIRED` 발생 시 OAuth 재로그인으로 복구해야 합니다.
+- 상세 Runbook/트러블슈팅은 `docs/chrome-extension-user-guide.md`, 설치/초기 점검 절차는 `docs/install-guide.md`를 따릅니다.
+
 ## 브랜치 정책
 
 - `main`은 운영 브랜치입니다.

@@ -395,6 +395,15 @@ export interface CodexExecRuntimeContract {
 	};
 }
 
+export interface AutopilotCodexAuthStatus {
+	mode: McpCodexAuthMode;
+	oauth_broker_status: "idle" | "pending" | "authorized" | "error";
+	oauth_session_id_present: boolean;
+	authorize_url: string | null;
+	last_error: string | null;
+	updated_at: string | null;
+}
+
 export interface AutopilotStatusOutput {
 	mode: "manual" | "review_first" | "full_auto";
 	status: string;
@@ -414,6 +423,8 @@ export interface AutopilotStatusOutput {
 	};
 	codex_last_failure_reason?: string | null;
 	codex_exec_contract?: CodexExecRuntimeContract;
+	codex_auth_state?: AutopilotCodexAuthStatus;
+	codex_auth?: AutopilotCodexAuthStatus;
 	persistence_authority: PersistenceAuthorityPolicy;
 }
 
@@ -609,13 +620,22 @@ export interface McpPendingCallback {
 	received_at: string;
 }
 
-export type McpCodexAuthMode = "disabled" | "env";
+export type McpCodexAuthMode = "disabled" | "env" | "oauth_broker";
+
+export interface McpCodexOAuthBrokerState {
+	status: "idle" | "pending" | "authorized" | "error";
+	oauth_session_id: string | null;
+	authorize_url: string | null;
+	last_error: string | null;
+	updated_at: string | null;
+}
 
 export interface McpCodexAuthState {
 	mode: McpCodexAuthMode;
 	api_key_env_var: string;
 	api_key_present: boolean;
 	opencode_connected_present?: boolean;
+	oauth_broker: McpCodexOAuthBrokerState;
 }
 
 export interface McpAttachmentRecord {
@@ -759,6 +779,13 @@ const createRuntimeState = (): McpRuntimeState => ({
 		api_key_env_var: "CODEX_API_KEY",
 		api_key_present: false,
 		opencode_connected_present: false,
+		oauth_broker: {
+			status: "idle",
+			oauth_session_id: null,
+			authorize_url: null,
+			last_error: null,
+			updated_at: null,
+		},
 	},
 });
 
@@ -1161,42 +1188,75 @@ const hasContextSignedIn = (context: McpRuntimeContext): boolean =>
 		: false;
 
 const requireCodexAuthContext = (context: McpRuntimeContext) => {
-	if (
-		CODEX_EXEC_RUNTIME_CONTRACT.flags.codex_exec_enabled &&
-		context.state.codex_auth.opencode_connected_present
-	) {
-		return null;
-	}
-
-	if (context.state.codex_auth.mode === "disabled") {
-		return null;
-	}
-
-	if (context.state.codex_auth.mode !== "env") {
-		return errorResponse(
-			"E_CODEX_AUTH_FAILED",
-			"코덱스 인증 모드 설정이 올바르지 않습니다.",
-		);
-	}
-
-	if (!context.state.codex_auth.api_key_present) {
+	const oauthBroker = context.state.codex_auth.oauth_broker;
+	const hasAuthorizedSession =
+		oauthBroker?.status === "authorized" &&
+		isNonEmptyString(oauthBroker.oauth_session_id);
+	if (!hasAuthorizedSession) {
 		return errorResponse(
 			"E_CODEX_AUTH_REQUIRED",
-			`${context.state.codex_auth.api_key_env_var} 환경변수 설정이 필요합니다.`,
-		);
-	}
-
-	if (
-		CODEX_EXEC_RUNTIME_CONTRACT.flags.codex_exec_enabled &&
-		!isEnvFallbackAllowedForRuntime()
-	) {
-		return errorResponse(
-			"E_CODEX_AUTH_REQUIRED",
-			"opencode 연결 인증이 필요합니다. env fallback 은 CI/headless 런타임에서만 허용됩니다.",
+			"codex oauth broker 인증 세션이 필요합니다.",
 		);
 	}
 
 	return null;
+};
+
+const AUTH_STATUS_OAUTH_BROKER_STATUSES = [
+	"idle",
+	"pending",
+	"authorized",
+	"error",
+] as const;
+
+const normalizeOauthBrokerStatusForStatus = (
+	value: unknown,
+): AutopilotCodexAuthStatus["oauth_broker_status"] =>
+	typeof value === "string" &&
+	AUTH_STATUS_OAUTH_BROKER_STATUSES.includes(
+		value as (typeof AUTH_STATUS_OAUTH_BROKER_STATUSES)[number],
+	)
+		? (value as AutopilotCodexAuthStatus["oauth_broker_status"])
+		: "idle";
+
+const AUTH_STATUS_BEARER_PATTERN = /(Bearer\s+)([^\s]+)/gi;
+const AUTH_STATUS_KEY_VALUE_PATTERN =
+	/((?:access|refresh|session|api)[_-]?(?:token|key|id)\s*[=:]\s*)([^\s,;]+)/gi;
+const AUTH_STATUS_QUERY_PATTERN =
+	/([?&](?:access_token|refresh_token|session_id|api_key)=)([^&#\s]+)/gi;
+
+const redactAuthStatusText = (
+	value: string | null | undefined,
+): string | null => {
+	if (!isNonEmptyString(value)) {
+		return null;
+	}
+
+	return value
+		.replace(AUTH_STATUS_BEARER_PATTERN, "$1[REDACTED]")
+		.replace(AUTH_STATUS_KEY_VALUE_PATTERN, "$1[REDACTED]")
+		.replace(AUTH_STATUS_QUERY_PATTERN, "$1[REDACTED]");
+};
+
+const buildAutopilotCodexAuthStatus = (
+	context: McpRuntimeContext,
+): AutopilotCodexAuthStatus => {
+	const codexAuth = context.state.codex_auth;
+	const oauthBroker = codexAuth.oauth_broker;
+	return {
+		mode: codexAuth.mode,
+		oauth_broker_status: normalizeOauthBrokerStatusForStatus(
+			oauthBroker.status,
+		),
+		oauth_session_id_present: isNonEmptyString(oauthBroker.oauth_session_id),
+		authorize_url: isNonEmptyString(oauthBroker.authorize_url)
+			? oauthBroker.authorize_url
+			: null,
+		last_error: redactAuthStatusText(oauthBroker.last_error),
+		updated_at: isNonEmptyString(oauthBroker.updated_at)
+			? oauthBroker.updated_at
+			: null,
+	};
 };
 
 const handleAuthStoreStartLogin = (
@@ -3317,8 +3377,10 @@ const handleAutopilotResume = (
 const handleAutopilotStatus = (
 	context: McpRuntimeContext,
 	_input: AutopilotStatusInput,
-) =>
-	okResponse<AutopilotStatusOutput>({
+) => {
+	const codexAuthState = buildAutopilotCodexAuthStatus(context);
+
+	return okResponse<AutopilotStatusOutput>({
 		mode: context.state.autopilot.mode,
 		status: context.state.autopilot.status,
 		paused: context.state.autopilot.paused,
@@ -3330,8 +3392,11 @@ const handleAutopilotStatus = (
 		codex_stage: context.state.autopilot.codex_stage,
 		...buildCodexStageObservability(context),
 		codex_exec_contract: CODEX_EXEC_RUNTIME_CONTRACT,
+		codex_auth_state: codexAuthState,
+		codex_auth: codexAuthState,
 		persistence_authority: PHASE_1_PERSISTENCE_AUTHORITY,
 	});
+};
 
 const handleAutopilotTick = (
 	context: McpRuntimeContext,

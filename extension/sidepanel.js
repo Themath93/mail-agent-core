@@ -23,6 +23,20 @@ const completeLoginButton = document.getElementById("complete-login");
 const checkAuthStatusButton = document.getElementById("check-auth-status");
 const logoutButton = document.getElementById("logout");
 const authCodeInput = document.getElementById("auth-code");
+const codexStartLoginButton = document.getElementById("codex-start-login");
+const codexCompleteLoginAutoButton = document.getElementById(
+	"codex-complete-login-auto",
+);
+const codexCompleteLoginButton = document.getElementById(
+	"codex-complete-login",
+);
+const codexCheckAuthStatusButton = document.getElementById(
+	"codex-check-auth-status",
+);
+const codexLogoutButton = document.getElementById("codex-logout");
+const codexAuthCodeInput = document.getElementById("codex-auth-code");
+const codexAuthStatus = document.getElementById("codex-auth-status");
+const codexLoginUrlText = document.getElementById("codex-login-url");
 
 const initialSyncButton = document.getElementById("initial-sync");
 const deltaSyncButton = document.getElementById("delta-sync");
@@ -92,8 +106,40 @@ const workflowListButton = document.getElementById("workflow-list");
 
 const HOST_NAME = "com.themath93.mail_agent_core.host";
 const STORAGE_KEYS = {
-	state: "pending_login_state",
-	codeVerifier: "pending_login_code_verifier",
+	graph: {
+		state: "pending_login_state",
+		codeVerifier: "pending_login_code_verifier",
+	},
+	codex: {
+		state: "pending_codex_login_state",
+		codeVerifier: "pending_codex_login_code_verifier",
+	},
+};
+
+const AUTH_PROVIDER_GRAPH = "graph";
+const AUTH_PROVIDER_CODEX = "codex";
+
+const AUTH_PROVIDERS = {
+	[AUTH_PROVIDER_GRAPH]: {
+		provider: AUTH_PROVIDER_GRAPH,
+		label: "Auth",
+		scopes: ["Mail.Read", "User.Read", "offline_access", "openid", "profile"],
+		statusNode: authStatus,
+		loginUrlNode: loginUrlText,
+		inputNode: authCodeInput,
+		startButton: startLoginButton,
+		storage: STORAGE_KEYS.graph,
+	},
+	[AUTH_PROVIDER_CODEX]: {
+		provider: AUTH_PROVIDER_CODEX,
+		label: "Codex auth",
+		scopes: ["openid", "profile", "offline_access"],
+		statusNode: codexAuthStatus,
+		loginUrlNode: codexLoginUrlText,
+		inputNode: codexAuthCodeInput,
+		startButton: codexStartLoginButton,
+		storage: STORAGE_KEYS.codex,
+	},
 };
 
 const AUTO_COMPLETE_MAX_ATTEMPTS = 300;
@@ -101,9 +147,18 @@ const AUTO_COMPLETE_BASE_DELAY_MS = 1000;
 const AUTO_COMPLETE_MAX_DELAY_MS = 3000;
 const AUTO_COMPLETE_TIMEOUT_MS = 5 * 60 * 1000;
 
-let autoCompleteTimer = null;
-let autoCompleteAttempt = 0;
-let autoCompleteStartedAt = 0;
+const autoCompleteState = {
+	[AUTH_PROVIDER_GRAPH]: {
+		timer: null,
+		attempt: 0,
+		startedAt: 0,
+	},
+	[AUTH_PROVIDER_CODEX]: {
+		timer: null,
+		attempt: 0,
+		startedAt: 0,
+	},
+};
 let autoSyncTimer = null;
 let latestMessages = [];
 let latestThreads = [];
@@ -120,10 +175,38 @@ const setAuthStatus = (value) => {
 	}
 };
 
+const setCodexAuthStatus = (value) => {
+	if (codexAuthStatus) {
+		codexAuthStatus.textContent = value;
+	}
+};
+
 const setLoginUrlText = (value) => {
 	if (loginUrlText) {
 		loginUrlText.textContent = value;
 	}
+};
+
+const setCodexLoginUrlText = (value) => {
+	if (codexLoginUrlText) {
+		codexLoginUrlText.textContent = value;
+	}
+};
+
+const setProviderAuthStatus = (provider, value) => {
+	if (provider === AUTH_PROVIDER_CODEX) {
+		setCodexAuthStatus(value);
+		return;
+	}
+	setAuthStatus(value);
+};
+
+const setProviderLoginUrlText = (provider, value) => {
+	if (provider === AUTH_PROVIDER_CODEX) {
+		setCodexLoginUrlText(value);
+		return;
+	}
+	setLoginUrlText(value);
 };
 
 const setResult = (payload) => {
@@ -446,13 +529,26 @@ const handleMcpResponse = (response) => {
 	return response.data;
 };
 
-const stopAutoCompleteLoop = () => {
-	if (autoCompleteTimer) {
-		clearTimeout(autoCompleteTimer);
-		autoCompleteTimer = null;
+const getProviderAuthConfig = (provider) =>
+	AUTH_PROVIDERS[provider] ?? AUTH_PROVIDERS[AUTH_PROVIDER_GRAPH];
+
+const buildProviderStatusPrefix = (provider) =>
+	provider === AUTH_PROVIDER_CODEX ? "Codex auth status" : "Auth status";
+
+const buildProviderPayload = (provider, payload = {}) =>
+	provider === AUTH_PROVIDER_CODEX ? { ...payload, provider } : payload;
+
+const stopAutoCompleteLoop = (provider) => {
+	const runtime = autoCompleteState[provider];
+	if (!runtime) {
+		return;
 	}
-	autoCompleteAttempt = 0;
-	autoCompleteStartedAt = 0;
+	if (runtime.timer) {
+		clearTimeout(runtime.timer);
+		runtime.timer = null;
+	}
+	runtime.attempt = 0;
+	runtime.startedAt = 0;
 };
 
 const stopAutoSyncLoop = () => {
@@ -533,37 +629,50 @@ const nextAutoCompleteDelayMs = (attempt) =>
 		AUTO_COMPLETE_MAX_DELAY_MS,
 	);
 
-const scheduleAutoComplete = (delayMs) => {
-	autoCompleteTimer = setTimeout(() => {
-		void runCompleteFromCallback();
+const scheduleAutoComplete = (provider, delayMs) => {
+	const runtime = autoCompleteState[provider];
+	if (!runtime) {
+		return;
+	}
+	runtime.timer = setTimeout(() => {
+		void runCompleteFromCallback(provider);
 	}, delayMs);
 };
 
-const setManualFallbackStatus = (message) => {
+const setManualFallbackStatus = (provider, message) => {
+	const statusPrefix = buildProviderStatusPrefix(provider);
 	if (message.length > 0) {
-		setAuthStatus(
-			`Auth status error: ${message}. callback URL 또는 code를 붙여넣고 로그인 완료를 수동 실행하세요.`,
+		setProviderAuthStatus(
+			provider,
+			`${statusPrefix} error: ${message}. callback URL 또는 code를 붙여넣고 로그인 완료를 수동 실행하세요.`,
 		);
 		return;
 	}
-	setAuthStatus(
-		"Auth status: 자동완료 대기 시간이 초과되었습니다. callback URL 또는 code를 붙여넣고 로그인 완료를 수동 실행하세요.",
+	setProviderAuthStatus(
+		provider,
+		`${statusPrefix}: 자동완료 대기 시간이 초과되었습니다. callback URL 또는 code를 붙여넣고 로그인 완료를 수동 실행하세요.`,
 	);
 };
 
-const runCompleteFromCallback = async () => {
-	autoCompleteTimer = null;
-	if (autoCompleteStartedAt === 0) {
-		autoCompleteStartedAt = Date.now();
+const runCompleteFromCallback = async (provider) => {
+	const runtime = autoCompleteState[provider];
+	if (!runtime) {
+		return;
 	}
-	autoCompleteAttempt += 1;
-	const attempt = autoCompleteAttempt;
-	const elapsedMs = Date.now() - autoCompleteStartedAt;
+	const config = getProviderAuthConfig(provider);
+	const statusPrefix = buildProviderStatusPrefix(provider);
+	runtime.timer = null;
+	if (runtime.startedAt === 0) {
+		runtime.startedAt = Date.now();
+	}
+	runtime.attempt += 1;
+	const attempt = runtime.attempt;
+	const elapsedMs = Date.now() - runtime.startedAt;
 
 	try {
 		const response = await sendNativeMessage(
 			"auth_store.complete_login_auto",
-			{},
+			buildProviderPayload(provider),
 		);
 		if (!response || typeof response !== "object") {
 			throw new Error("invalid host response");
@@ -584,17 +693,18 @@ const runCompleteFromCallback = async () => {
 					attempt >= AUTO_COMPLETE_MAX_ATTEMPTS ||
 					elapsedMs >= AUTO_COMPLETE_TIMEOUT_MS
 				) {
-					stopAutoCompleteLoop();
-					setManualFallbackStatus("");
+					stopAutoCompleteLoop(provider);
+					setManualFallbackStatus(provider, "");
 					setResult(response);
 					return;
 				}
 				if (attempt % 20 === 0) {
-					setAuthStatus(
-						`Auth status: callback 자동완료 대기 중 (${attempt}/${AUTO_COMPLETE_MAX_ATTEMPTS})`,
+					setProviderAuthStatus(
+						provider,
+						`${statusPrefix}: callback 자동완료 대기 중 (${attempt}/${AUTO_COMPLETE_MAX_ATTEMPTS})`,
 					);
 				}
-				scheduleAutoComplete(nextAutoCompleteDelayMs(attempt));
+				scheduleAutoComplete(provider, nextAutoCompleteDelayMs(attempt));
 				return;
 			}
 
@@ -603,35 +713,39 @@ const runCompleteFromCallback = async () => {
 					attempt >= AUTO_COMPLETE_MAX_ATTEMPTS ||
 					elapsedMs >= AUTO_COMPLETE_TIMEOUT_MS
 				) {
-					stopAutoCompleteLoop();
-					setManualFallbackStatus(errorMessage);
+					stopAutoCompleteLoop(provider);
+					setManualFallbackStatus(provider, errorMessage);
 					setResult(response);
 					return;
 				}
-				setAuthStatus(
-					`Auth status: 자동완료 재시도 중 (${attempt}/${AUTO_COMPLETE_MAX_ATTEMPTS}) - ${errorMessage}`,
+				setProviderAuthStatus(
+					provider,
+					`${statusPrefix}: 자동완료 재시도 중 (${attempt}/${AUTO_COMPLETE_MAX_ATTEMPTS}) - ${errorMessage}`,
 				);
-				scheduleAutoComplete(nextAutoCompleteDelayMs(attempt));
+				scheduleAutoComplete(provider, nextAutoCompleteDelayMs(attempt));
 				return;
 			}
 
-			stopAutoCompleteLoop();
-			setManualFallbackStatus(errorMessage);
+			stopAutoCompleteLoop(provider);
+			setManualFallbackStatus(provider, errorMessage);
 			setResult(response);
 			return;
 		}
 
 		const data = handleMcpResponse(response);
-		stopAutoCompleteLoop();
+		stopAutoCompleteLoop(provider);
 		chrome.storage.local.remove([
-			STORAGE_KEYS.state,
-			STORAGE_KEYS.codeVerifier,
+			config.storage.state,
+			config.storage.codeVerifier,
 		]);
 		const email = data?.account?.email ? data.account.email : "-";
-		setAuthStatus(`Auth status: signed_in=true email=${email}`);
+		setProviderAuthStatus(
+			provider,
+			`${statusPrefix}: signed_in=true email=${email}`,
+		);
 		setResult(response);
-		if (authCodeInput) {
-			authCodeInput.value = "";
+		if (config.inputNode) {
+			config.inputNode.value = "";
 		}
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
@@ -639,87 +753,112 @@ const runCompleteFromCallback = async () => {
 			attempt >= AUTO_COMPLETE_MAX_ATTEMPTS ||
 			elapsedMs >= AUTO_COMPLETE_TIMEOUT_MS
 		) {
-			stopAutoCompleteLoop();
-			setManualFallbackStatus(message);
+			stopAutoCompleteLoop(provider);
+			setManualFallbackStatus(provider, message);
 			return;
 		}
-		setAuthStatus(
-			`Auth status: 자동완료 재시도 중 (${attempt}/${AUTO_COMPLETE_MAX_ATTEMPTS}) - ${message}`,
+		setProviderAuthStatus(
+			provider,
+			`${statusPrefix}: 자동완료 재시도 중 (${attempt}/${AUTO_COMPLETE_MAX_ATTEMPTS}) - ${message}`,
 		);
-		scheduleAutoComplete(nextAutoCompleteDelayMs(attempt));
+		scheduleAutoComplete(provider, nextAutoCompleteDelayMs(attempt));
 	}
 };
 
-const startAutoCompleteLoop = () => {
-	stopAutoCompleteLoop();
-	autoCompleteStartedAt = Date.now();
-	autoCompleteAttempt = 0;
-	scheduleAutoComplete(0);
+const startAutoCompleteLoop = (provider) => {
+	const runtime = autoCompleteState[provider];
+	if (!runtime) {
+		return;
+	}
+	stopAutoCompleteLoop(provider);
+	runtime.startedAt = Date.now();
+	runtime.attempt = 0;
+	scheduleAutoComplete(provider, 0);
 };
 
-const requestAuthStatus = async () => {
+const requestAuthStatusByProvider = async (provider) => {
+	const statusPrefix = buildProviderStatusPrefix(provider);
 	try {
-		const response = await sendNativeMessage("auth_store.auth_status", {});
+		const response = await sendNativeMessage(
+			"auth_store.auth_status",
+			buildProviderPayload(provider),
+		);
 		const data = handleMcpResponse(response);
 		const email = data?.account?.email ? data.account.email : "-";
 		const signedIn = Boolean(data?.signed_in);
 		if (!signedIn && data?.pending_callback_received === true) {
-			setAuthStatus(
-				`Auth status: signed_in=false email=${email} callback 수신됨 (로그인 완료 수동 실행 가능)`,
+			setProviderAuthStatus(
+				provider,
+				`${statusPrefix}: signed_in=false email=${email} callback 수신됨 (자동/수동 완료 가능)`,
 			);
 		} else {
-			setAuthStatus(`Auth status: signed_in=${signedIn} email=${email}`);
+			setProviderAuthStatus(
+				provider,
+				`${statusPrefix}: signed_in=${signedIn} email=${email}`,
+			);
 		}
 		setResult(response);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		setAuthStatus(`Auth status error: ${message}`);
+		setProviderAuthStatus(provider, `${statusPrefix} error: ${message}`);
 	}
 };
 
-const startLogin = async () => {
-	startLoginButton?.setAttribute("disabled", "disabled");
+const startLoginByProvider = async (provider) => {
+	const config = getProviderAuthConfig(provider);
+	const statusPrefix = buildProviderStatusPrefix(provider);
+	config.startButton?.setAttribute("disabled", "disabled");
 	try {
-		const response = await sendNativeMessage("auth_store.start_login", {
-			scopes: ["Mail.Read", "User.Read", "offline_access", "openid", "profile"],
-		});
+		const response = await sendNativeMessage(
+			"auth_store.start_login",
+			buildProviderPayload(provider, { scopes: config.scopes }),
+		);
 		const data = handleMcpResponse(response);
 		chrome.storage.local.set({
-			[STORAGE_KEYS.state]: data.state,
-			[STORAGE_KEYS.codeVerifier]: data.code_verifier,
+			[config.storage.state]: data.state,
+			[config.storage.codeVerifier]: data.code_verifier,
 		});
-		setLoginUrlText(`Login URL: ${data.login_url}`);
-		setAuthStatus(
-			"Auth status: 로그인 URL을 열었고 callback 자동완료를 최대 5분 대기 중",
+		setProviderLoginUrlText(provider, `Login URL: ${data.login_url}`);
+		setProviderAuthStatus(
+			provider,
+			`${statusPrefix}: 로그인 URL을 열었고 callback 자동완료를 최대 5분 대기 중`,
 		);
 		setResult(response);
-		startAutoCompleteLoop();
+		startAutoCompleteLoop(provider);
 		window.open(data.login_url, "_blank", "noopener,noreferrer");
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		setAuthStatus(`Auth status error: ${message}`);
+		setProviderAuthStatus(provider, `${statusPrefix} error: ${message}`);
 	} finally {
-		startLoginButton?.removeAttribute("disabled");
+		config.startButton?.removeAttribute("disabled");
 	}
 };
 
-const completeLoginManual = async () => {
+const completeLoginManualByProvider = async (provider) => {
+	const config = getProviderAuthConfig(provider);
+	const statusPrefix = buildProviderStatusPrefix(provider);
 	const rawInput =
-		typeof authCodeInput?.value === "string" ? authCodeInput.value : "";
+		typeof config.inputNode?.value === "string" ? config.inputNode.value : "";
 	const parsedInput = parseAuthInput(rawInput);
 	const code = parsedInput.code;
 	if (code.length === 0) {
-		setAuthStatus("Auth status error: code를 입력하세요.");
+		setProviderAuthStatus(
+			provider,
+			`${statusPrefix} error: code를 입력하세요.`,
+		);
 		return;
 	}
 
 	chrome.storage.local.get(
-		[STORAGE_KEYS.state, STORAGE_KEYS.codeVerifier],
+		[config.storage.state, config.storage.codeVerifier],
 		async (result) => {
-			const state = result[STORAGE_KEYS.state];
-			const codeVerifier = result[STORAGE_KEYS.codeVerifier];
+			const state = result[config.storage.state];
+			const codeVerifier = result[config.storage.codeVerifier];
 			if (typeof state !== "string" || typeof codeVerifier !== "string") {
-				setAuthStatus("Auth status error: start_login을 먼저 실행하세요.");
+				setProviderAuthStatus(
+					provider,
+					`${statusPrefix} error: start_login을 먼저 실행하세요.`,
+				);
 				return;
 			}
 
@@ -728,54 +867,83 @@ const completeLoginManual = async () => {
 				parsedInput.state.length > 0 &&
 				parsedInput.state !== state
 			) {
-				setAuthStatus(
-					"Auth status error: URL의 state가 현재 로그인 세션과 다릅니다. 로그인 시작을 다시 실행하세요.",
+				setProviderAuthStatus(
+					provider,
+					`${statusPrefix} error: URL의 state가 현재 로그인 세션과 다릅니다. 로그인 시작을 다시 실행하세요.`,
 				);
 				return;
 			}
 
 			try {
-				const response = await sendNativeMessage("auth_store.complete_login", {
-					code,
-					state,
-					code_verifier: codeVerifier,
-				});
+				const response = await sendNativeMessage(
+					"auth_store.complete_login",
+					buildProviderPayload(provider, {
+						code,
+						state,
+						code_verifier: codeVerifier,
+					}),
+				);
 				const data = handleMcpResponse(response);
 				const email = data?.account?.email ? data.account.email : "-";
-				setAuthStatus(`Auth status: signed_in=true email=${email}`);
+				setProviderAuthStatus(
+					provider,
+					`${statusPrefix}: signed_in=true email=${email}`,
+				);
 				setResult(response);
 				chrome.storage.local.remove([
-					STORAGE_KEYS.state,
-					STORAGE_KEYS.codeVerifier,
+					config.storage.state,
+					config.storage.codeVerifier,
 				]);
-				if (authCodeInput) {
-					authCodeInput.value = "";
+				if (config.inputNode) {
+					config.inputNode.value = "";
 				}
-				stopAutoCompleteLoop();
+				stopAutoCompleteLoop(provider);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
-				setAuthStatus(`Auth status error: ${message}`);
+				setProviderAuthStatus(provider, `${statusPrefix} error: ${message}`);
 			}
 		},
 	);
 };
 
-const logout = async () => {
+const logoutByProvider = async (provider) => {
+	const config = getProviderAuthConfig(provider);
+	const statusPrefix = buildProviderStatusPrefix(provider);
 	try {
-		const response = await sendNativeMessage("auth_store.logout", {});
+		const response = await sendNativeMessage(
+			"auth_store.logout",
+			buildProviderPayload(provider),
+		);
 		handleMcpResponse(response);
 		chrome.storage.local.remove([
-			STORAGE_KEYS.state,
-			STORAGE_KEYS.codeVerifier,
+			config.storage.state,
+			config.storage.codeVerifier,
 		]);
-		stopAutoCompleteLoop();
-		setAuthStatus("Auth status: signed_in=false email=-");
+		stopAutoCompleteLoop(provider);
+		setProviderAuthStatus(provider, `${statusPrefix}: signed_in=false email=-`);
+		setProviderLoginUrlText(provider, "");
 		setResult(response);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		setAuthStatus(`Auth status error: ${message}`);
+		setProviderAuthStatus(provider, `${statusPrefix} error: ${message}`);
 	}
 };
+
+const startLogin = () => startLoginByProvider(AUTH_PROVIDER_GRAPH);
+const completeLoginManual = () =>
+	completeLoginManualByProvider(AUTH_PROVIDER_GRAPH);
+const requestAuthStatus = () =>
+	requestAuthStatusByProvider(AUTH_PROVIDER_GRAPH);
+const logout = () => logoutByProvider(AUTH_PROVIDER_GRAPH);
+
+const startCodexLogin = () => startLoginByProvider(AUTH_PROVIDER_CODEX);
+const completeCodexLoginManual = () =>
+	completeLoginManualByProvider(AUTH_PROVIDER_CODEX);
+const completeCodexLoginAuto = () =>
+	runCompleteFromCallback(AUTH_PROVIDER_CODEX);
+const requestCodexAuthStatus = () =>
+	requestAuthStatusByProvider(AUTH_PROVIDER_CODEX);
+const logoutCodex = () => logoutByProvider(AUTH_PROVIDER_CODEX);
 
 const readSyncInputs = () => ({
 	mail_folder:
@@ -1063,7 +1231,8 @@ const resetSession = async (clearMailbox) => {
 		handleMcpResponse(response);
 		setResult(response);
 		setAuthStatus("System: reset_session 완료");
-		stopAutoCompleteLoop();
+		stopAutoCompleteLoop(AUTH_PROVIDER_GRAPH);
+		stopAutoCompleteLoop(AUTH_PROVIDER_CODEX);
 		if (clearMailbox) {
 			latestMessages = [];
 			latestThreads = [];
@@ -1267,6 +1436,11 @@ startLoginButton?.addEventListener("click", startLogin);
 completeLoginButton?.addEventListener("click", completeLoginManual);
 checkAuthStatusButton?.addEventListener("click", requestAuthStatus);
 logoutButton?.addEventListener("click", logout);
+codexStartLoginButton?.addEventListener("click", startCodexLogin);
+codexCompleteLoginAutoButton?.addEventListener("click", completeCodexLoginAuto);
+codexCompleteLoginButton?.addEventListener("click", completeCodexLoginManual);
+codexCheckAuthStatusButton?.addEventListener("click", requestCodexAuthStatus);
+codexLogoutButton?.addEventListener("click", logoutCodex);
 
 initialSyncButton?.addEventListener("click", initialSync);
 deltaSyncButton?.addEventListener("click", deltaSync);
@@ -1316,6 +1490,11 @@ workflowListButton?.addEventListener("click", listWorkflow);
 requestAuthStatus().catch((error) => {
 	const message = error instanceof Error ? error.message : String(error);
 	setAuthStatus(`Auth status error: ${message}`);
+});
+
+requestCodexAuthStatus().catch((error) => {
+	const message = error instanceof Error ? error.message : String(error);
+	setCodexAuthStatus(`Codex auth status error: ${message}`);
 });
 
 refreshAutopilotStatus().catch((error) => {

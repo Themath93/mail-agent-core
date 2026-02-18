@@ -421,13 +421,21 @@ const isTruthyRuntimeFlag = (value) => {
 const SAFE_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const SENSITIVE_ENV_NAME_PATTERN =
 	/(api[_-]?key|token|secret|password|authorization)/i;
-const SENSITIVE_TEXT_KV_PATTERN =
-	/((?:api[_-]?key|token|secret|password|authorization)\s*[=:]\s*)([^\s,;]+)/gi;
-const SENSITIVE_TEXT_JSON_PATTERN =
-	/("(?:api[_-]?key|token|secret|password|authorization)"\s*:\s*)"[^"]*"/gi;
+const SENSITIVE_TEXT_FIELD_PATTERN =
+	"(?:api[_-]?key|(?:oauth[_-]?)?access[_-]?token|(?:oauth[_-]?)?refresh[_-]?token|(?:oauth[_-]?)?session[_-]?(?:id|secret|token)|token|secret|password|authorization)";
+const SENSITIVE_TEXT_KV_PATTERN = new RegExp(
+	`((?:${SENSITIVE_TEXT_FIELD_PATTERN})\\s*[=:]\\s*)([^\\s,;]+)`,
+	"gi",
+);
+const SENSITIVE_TEXT_JSON_PATTERN = new RegExp(
+	`("(?:${SENSITIVE_TEXT_FIELD_PATTERN})"\\s*:\\s*)"[^"]*"`,
+	"gi",
+);
 const SENSITIVE_TEXT_BEARER_PATTERN = /(Bearer\s+)([^\s]+)/gi;
-const SENSITIVE_TEXT_QUERY_PATTERN =
-	/([?&](?:api[_-]?key|token|secret|password|authorization)=)([^&#\s]+)/gi;
+const SENSITIVE_TEXT_QUERY_PATTERN = new RegExp(
+	`([?&](?:${SENSITIVE_TEXT_FIELD_PATTERN})=)([^&#\\s]+)`,
+	"gi",
+);
 
 let cachedSensitiveEnvValues = null;
 
@@ -521,6 +529,44 @@ const sanitizeAutopilotForStatus = (autopilot) => {
 				last_failure_reason: redactedLastFailureReason,
 			},
 		}),
+	};
+};
+
+const STATUS_CODEX_AUTH_ALLOWED_MODES = ["disabled", "env", "oauth_broker"];
+const STATUS_OAUTH_BROKER_ALLOWED_STATUSES = [
+	"idle",
+	"pending",
+	"authorized",
+	"error",
+];
+
+const sanitizeCodexAuthStateForStatus = (state) => {
+	const codexAuth = normalizeObject(state?.codex_auth);
+	const oauthBroker = normalizeObject(codexAuth.oauth_broker);
+	const mode =
+		isNonEmptyString(codexAuth.mode) &&
+		STATUS_CODEX_AUTH_ALLOWED_MODES.includes(codexAuth.mode)
+			? codexAuth.mode
+			: "disabled";
+	const oauthBrokerStatus =
+		isNonEmptyString(oauthBroker.status) &&
+		STATUS_OAUTH_BROKER_ALLOWED_STATUSES.includes(oauthBroker.status)
+			? oauthBroker.status
+			: "idle";
+
+	return {
+		mode,
+		oauth_broker_status: oauthBrokerStatus,
+		oauth_session_id_present: isNonEmptyString(oauthBroker.oauth_session_id),
+		authorize_url: isNonEmptyString(oauthBroker.authorize_url)
+			? oauthBroker.authorize_url
+			: null,
+		last_error: isNonEmptyString(oauthBroker.last_error)
+			? redactSensitiveText(oauthBroker.last_error)
+			: null,
+		updated_at: isNonEmptyString(oauthBroker.updated_at)
+			? oauthBroker.updated_at
+			: null,
 	};
 };
 
@@ -649,71 +695,28 @@ const resolveCodexAuth = (config) => {
 	};
 };
 
-const resolveCodexExecAuth = (config, runtimeContract) => {
-	const opencodeEnv =
-		runtimeContract.flags.opencode_connected_api_key_env ??
-		"OPENCODE_CODEX_API_KEY";
-	const opencodeApiKey = process.env[opencodeEnv];
-	if (isNonEmptyString(opencodeApiKey)) {
-		return {
-			ok: true,
-			enabled: true,
-			source: formatCodexAuthSource("opencode_connected", opencodeEnv),
-			redacted: redactSecret(opencodeApiKey),
-		};
-	}
+const resolveCodexExecAuth = (_config, _runtimeContract, state) => {
+	const oauthBroker = normalizeObject(state?.codex_auth?.oauth_broker);
+	const hasAuthorizedSession =
+		oauthBroker.status === "authorized" &&
+		isNonEmptyString(oauthBroker.oauth_session_id);
 
-	if (!runtimeContract.flags.env_fallback_only_ci_headless) {
-		const envName = runtimeContract.flags.env_fallback_api_key_env;
-		const apiKey = process.env[envName];
-		if (!isNonEmptyString(apiKey)) {
-			return {
-				ok: false,
-				error: errorResponse(
-					"E_CODEX_AUTH_REQUIRED",
-					`${envName} 환경변수 설정이 필요합니다.`,
-				),
-				logMessage: `missing codex env fallback: ${envName}`,
-			};
-		}
-		return {
-			ok: true,
-			enabled: true,
-			source: formatCodexAuthSource("env_fallback", envName),
-			redacted: redactSecret(apiKey),
-		};
-	}
-
-	if (!isCiRuntime() && !isHeadlessRuntime()) {
+	if (!hasAuthorizedSession) {
 		return {
 			ok: false,
 			error: errorResponse(
 				"E_CODEX_AUTH_REQUIRED",
-				"opencode 연결 인증이 필요합니다. env fallback 은 CI/headless 런타임에서만 허용됩니다.",
+				"codex oauth broker 인증 세션이 필요합니다.",
 			),
-			logMessage:
-				"codex env fallback denied outside ci/headless runtime context",
-		};
-	}
-
-	const envName = runtimeContract.flags.env_fallback_api_key_env;
-	const envApiKey = process.env[envName];
-	if (!isNonEmptyString(envApiKey)) {
-		return {
-			ok: false,
-			error: errorResponse(
-				"E_CODEX_AUTH_REQUIRED",
-				`${envName} 환경변수 설정이 필요합니다.`,
-			),
-			logMessage: `missing codex env fallback: ${envName}`,
+			logMessage: "codex oauth broker session is missing or unauthorized",
 		};
 	}
 
 	return {
 		ok: true,
 		enabled: true,
-		source: formatCodexAuthSource("env_fallback", envName),
-		redacted: redactSecret(envApiKey),
+		source: "oauth_broker_session:authorized",
+		redacted: redactSecret(oauthBroker.oauth_session_id),
 	};
 };
 
@@ -4700,11 +4703,14 @@ const getAutopilotStatus = (state) => {
 	const autopilot = getAutopilotState(state);
 	const runtimeContract = buildCodexExecRuntimeContract(readConfig());
 	const safeAutopilot = sanitizeAutopilotForStatus(autopilot);
+	const codexAuthState = sanitizeCodexAuthStateForStatus(state);
 	return {
 		ok: true,
 		data: {
 			...safeAutopilot,
 			codex_exec_contract: sanitizeCodexExecContractForStatus(runtimeContract),
+			codex_auth_state: codexAuthState,
+			codex_auth: codexAuthState,
 			persistence_authority: PHASE_1_PERSISTENCE_AUTHORITY,
 		},
 	};
@@ -4798,7 +4804,7 @@ const runAutopilotTick = async (state, config, input) => {
 
 	if (candidates.length > 0) {
 		const codexAuth = runtimeContract.flags.codex_exec_enabled
-			? resolveCodexExecAuth(config, runtimeContract)
+			? resolveCodexExecAuth(config, runtimeContract, state)
 			: resolveCodexAuth(config);
 		if (!codexAuth.ok) {
 			autopilot.codex_stage.last_failure_reason = codexAuth.error.error_message;
@@ -5233,6 +5239,7 @@ if (isMainModule()) {
 
 export const __hostTestables = Object.freeze({
 	buildCodexExecRuntimeContract,
+	resolveCodexExecAuth,
 	analyzeAutopilotCandidate,
 	buildCodexCliSpawnArgs,
 	runCodexCliAdapter,

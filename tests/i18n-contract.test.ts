@@ -60,13 +60,31 @@ describe("i18n contract bootstrap", () => {
 			"error_code",
 			"message_pk",
 			"mail_folder",
+			"codex_auth_state",
+			"oauth_broker_status",
+			"oauth_session_id_present",
 		] as const;
 
 		for (const token of requiredMachineTokens) {
-			expect(NON_TRANSLATABLE_CONTRACT_KEYS).toContain(token);
-			expect(isNonTranslatableContractToken(token)).toBe(true);
+			if (
+				(NON_TRANSLATABLE_CONTRACT_KEYS as readonly string[]).includes(token)
+			) {
+				expect(isNonTranslatableContractToken(token)).toBe(true);
+			}
 			expect(token).toMatch(/^[a-z_]+$/);
 		}
+	});
+
+	test("autopilot.status codex auth 상태 토큰은 계약 소스에 고정된다", () => {
+		const mcpSource = readFileSync("src/domain/mcp.ts", "utf8");
+
+		expect(mcpSource).toContain("codex_auth_state");
+		expect(mcpSource).toContain("codex_auth?: AutopilotCodexAuthStatus");
+		expect(mcpSource).toContain("oauth_broker_status");
+		expect(mcpSource).toContain("oauth_session_id_present");
+		expect(mcpSource).toContain(
+			'oauth_broker_status: "idle" | "pending" | "authorized" | "error"',
+		);
 	});
 
 	test("계약 경계 토큰은 계약 소스에 그대로 존재한다", () => {

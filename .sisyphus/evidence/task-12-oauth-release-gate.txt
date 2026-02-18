@@ -1,0 +1,26 @@
+Task 12 OAuth Release Gate Evidence
+Timestamp (UTC): 2026-02-18T11:07:31Z
+
+1) bun run test:i18n-contract
+- Result: PASS
+- Command: bunx vitest run tests/i18n-contract.test.ts
+- Summary: 1 file passed, 6 tests passed
+
+2) bun run build
+- Result: PASS
+- Command: bunx tsc -p tsconfig.json --noEmit
+
+3) bun test
+- Result: PASS
+- Summary: 230 passed, 0 failed, 1092 expect() calls
+
+4) bun run ci
+- Result: PASS
+- Includes: version:check, lint, typecheck, test, coverage
+- Coverage: 85.79% statements (>=85% gate satisfied)
+
+5) bun run test:e2e
+- Result: PASS
+- Summary: 2 passed, 0 failed
+
+Overall Gate Status: PASS
