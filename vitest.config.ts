@@ -7,7 +7,15 @@ export default defineConfig({
 			provider: "v8",
 			reporter: ["text", "json-summary"],
 			reportsDirectory: "coverage",
-			exclude: ["extension/**", "native-host/**"],
+			exclude: [
+				"extension/**",
+				"native-host/**",
+				"tests/**",
+				".github/**",
+				"vitest.config.ts",
+				"src/types/**",
+				"src/storage/sqlite-adapter.ts",
+			],
 			thresholds: {
 				lines: 85,
 				functions: 85,

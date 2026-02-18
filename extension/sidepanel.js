@@ -56,6 +56,9 @@ const autopilotMaxAttachmentsInput = document.getElementById(
 	"autopilot-max-attachments",
 );
 const autopilotStatusText = document.getElementById("autopilot-status-text");
+const autopilotHealthHintText = document.getElementById(
+	"autopilot-health-hint",
+);
 
 const systemHealthButton = document.getElementById("system-health");
 const resetSessionButton = document.getElementById("reset-session");
@@ -124,6 +127,94 @@ const setAutopilotStatusText = (value) => {
 	if (autopilotStatusText) {
 		autopilotStatusText.textContent = value;
 	}
+};
+
+const setAutopilotHealthHintText = (value) => {
+	if (autopilotHealthHintText) {
+		autopilotHealthHintText.textContent = value;
+	}
+};
+
+const readCodexStageCounters = (data) => {
+	const metrics =
+		data && typeof data.metrics === "object" && data.metrics !== null
+			? data.metrics
+			: null;
+	const codexStage =
+		data && typeof data.codex_stage === "object" && data.codex_stage !== null
+			? data.codex_stage
+			: null;
+	const codexStageMetrics =
+		data &&
+		typeof data.codex_stage_metrics === "object" &&
+		data.codex_stage_metrics !== null
+			? data.codex_stage_metrics
+			: null;
+
+	return {
+		started: Number(
+			metrics?.codex_stage_started ??
+				codexStageMetrics?.started ??
+				codexStage?.started ??
+				0,
+		),
+		success: Number(
+			metrics?.codex_stage_success ??
+				codexStageMetrics?.success ??
+				codexStage?.success ??
+				0,
+		),
+		fail: Number(
+			metrics?.codex_stage_fail ??
+				codexStageMetrics?.fail ??
+				codexStage?.fail ??
+				0,
+		),
+		timeout: Number(
+			metrics?.codex_stage_timeout ??
+				codexStageMetrics?.timeout ??
+				codexStage?.timeout ??
+				0,
+		),
+		schemaFail: Number(
+			metrics?.codex_stage_schema_fail ??
+				codexStageMetrics?.schema_fail ??
+				codexStage?.schema_fail ??
+				0,
+		),
+	};
+};
+
+const buildAutopilotHealthHint = (data) => {
+	const codexStage =
+		data && typeof data.codex_stage === "object" && data.codex_stage !== null
+			? data.codex_stage
+			: null;
+	const counters = readCodexStageCounters(data);
+	const lastFailureReason =
+		typeof data?.codex_last_failure_reason === "string"
+			? data.codex_last_failure_reason
+			: typeof codexStage?.last_failure_reason === "string"
+				? codexStage.last_failure_reason
+				: typeof data?.last_error === "string"
+					? data.last_error
+					: "";
+
+	const counterText = `started=${counters.started} success=${counters.success} fail=${counters.fail} timeout=${counters.timeout} schema_fail=${counters.schemaFail}`;
+
+	if (data?.status === "degraded") {
+		return `Autopilot hint: degraded - ${counterText}${lastFailureReason ? ` (${lastFailureReason})` : ""}`;
+	}
+	if (data?.status === "retrying") {
+		return `Autopilot hint: retrying - ${counterText}${lastFailureReason ? ` (${lastFailureReason})` : ""}`;
+	}
+	if (counters.fail > 0) {
+		return `Autopilot hint: failure observed - ${counterText}${lastFailureReason ? ` (${lastFailureReason})` : ""}`;
+	}
+	if (counters.started > 0 && counters.success === 0) {
+		return `Autopilot hint: awaiting codex success - ${counterText}`;
+	}
+	return `Autopilot hint: healthy - ${counterText}`;
 };
 
 const parseAuthInput = (rawInput) => {
@@ -783,9 +874,19 @@ const startAutoSyncLoop = () => {
 const getSystemHealth = async () => {
 	try {
 		const response = await sendNativeMessage("system.health", {});
-		handleMcpResponse(response);
+		const data = handleMcpResponse(response);
 		setResult(response);
 		setAuthStatus("System: health 조회 완료");
+		const autopilot =
+			data && typeof data.autopilot === "object" && data.autopilot !== null
+				? data.autopilot
+				: null;
+		if (autopilot) {
+			setAutopilotStatusText(
+				`Autopilot: mode=${autopilot.mode} status=${autopilot.status} paused=${Boolean(autopilot.paused)}`,
+			);
+			setAutopilotHealthHintText(buildAutopilotHealthHint(autopilot));
+		}
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		setAuthStatus(`System error: ${message}`);
@@ -844,9 +945,11 @@ const refreshAutopilotStatus = async () => {
 		setAutopilotStatusText(
 			`Autopilot: mode=${data.mode} status=${data.status} paused=${Boolean(data.paused)}`,
 		);
+		setAutopilotHealthHintText(buildAutopilotHealthHint(data));
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		setAutopilotStatusText(`Autopilot error: ${message}`);
+		setAutopilotHealthHintText("Autopilot hint: unavailable");
 	}
 };
 
@@ -1038,4 +1141,5 @@ requestAuthStatus().catch((error) => {
 refreshAutopilotStatus().catch((error) => {
 	const message = error instanceof Error ? error.message : String(error);
 	setAutopilotStatusText(`Autopilot error: ${message}`);
+	setAutopilotHealthHintText("Autopilot hint: unavailable");
 });
