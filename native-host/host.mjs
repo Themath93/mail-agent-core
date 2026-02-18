@@ -46,6 +46,24 @@ const defaultState = () => ({
 		evidences: [],
 		todos: [],
 	},
+	autopilot: {
+		mode: "manual",
+		status: "idle",
+		paused: false,
+		in_flight_run_id: null,
+		last_error: null,
+		consecutive_failures: 0,
+		last_tick_at: null,
+		metrics: {
+			ticks_total: 0,
+			ticks_success: 0,
+			ticks_failed: 0,
+			auto_evidence_created: 0,
+			auto_todo_created: 0,
+			auto_attachment_saved: 0,
+			review_candidates: 0,
+		},
+	},
 	logs: [],
 });
 
@@ -80,6 +98,59 @@ const normalizeWorkflowState = (value) => {
 	};
 };
 
+const normalizeAutopilotState = (value) => {
+	const source = normalizeObject(value);
+	const allowedModes = ["manual", "review_first", "full_auto"];
+	const allowedStatuses = [
+		"idle",
+		"syncing",
+		"analyzing",
+		"persisting",
+		"paused",
+		"degraded",
+		"retrying",
+	];
+	const rawMetrics = normalizeObject(source.metrics);
+	const asCount = (input) =>
+		typeof input === "number" && Number.isInteger(input) && input >= 0
+			? input
+			: 0;
+
+	return {
+		mode:
+			isNonEmptyString(source.mode) && allowedModes.includes(source.mode)
+				? source.mode
+				: "manual",
+		status:
+			isNonEmptyString(source.status) && allowedStatuses.includes(source.status)
+				? source.status
+				: "idle",
+		paused: Boolean(source.paused),
+		in_flight_run_id: isNonEmptyString(source.in_flight_run_id)
+			? source.in_flight_run_id
+			: null,
+		last_error: isNonEmptyString(source.last_error) ? source.last_error : null,
+		consecutive_failures:
+			typeof source.consecutive_failures === "number" &&
+			Number.isInteger(source.consecutive_failures) &&
+			source.consecutive_failures >= 0
+				? source.consecutive_failures
+				: 0,
+		last_tick_at: isNonEmptyString(source.last_tick_at)
+			? source.last_tick_at
+			: null,
+		metrics: {
+			ticks_total: asCount(rawMetrics.ticks_total),
+			ticks_success: asCount(rawMetrics.ticks_success),
+			ticks_failed: asCount(rawMetrics.ticks_failed),
+			auto_evidence_created: asCount(rawMetrics.auto_evidence_created),
+			auto_todo_created: asCount(rawMetrics.auto_todo_created),
+			auto_attachment_saved: asCount(rawMetrics.auto_attachment_saved),
+			review_candidates: asCount(rawMetrics.review_candidates),
+		},
+	};
+};
+
 const normalizeState = (value) => {
 	const base = defaultState();
 	const source = normalizeObject(value);
@@ -87,6 +158,7 @@ const normalizeState = (value) => {
 	const pendingCallback = normalizeObject(source.pending_callback);
 	const logs = Array.isArray(source.logs) ? source.logs.slice(-500) : [];
 	const workflow = normalizeWorkflowState(source.workflow);
+	const autopilot = normalizeAutopilotState(source.autopilot);
 
 	return {
 		...base,
@@ -128,6 +200,7 @@ const normalizeState = (value) => {
 			attachments: normalizeObject(mailbox.attachments),
 		},
 		workflow,
+		autopilot,
 		logs: logs,
 	};
 };
@@ -187,6 +260,97 @@ const errorResponse = (errorCode, errorMessage, retryable = false) => ({
 	error_message: errorMessage,
 	retryable: retryable,
 });
+
+const AUTOPILOT_ALLOWED_MODES = ["manual", "review_first", "full_auto"];
+const AUTOPILOT_ALLOWED_STATUSES = [
+	"idle",
+	"syncing",
+	"analyzing",
+	"persisting",
+	"paused",
+	"degraded",
+	"retrying",
+];
+const AUTOPILOT_MAX_CONSECUTIVE_FAILURES = 3;
+const AUTOPILOT_MAX_MESSAGES_PER_TICK = 30;
+const AUTOPILOT_MAX_ATTACHMENTS_PER_TICK = 10;
+const AUTOPILOT_DEFAULT_FOLDER = "inbox";
+const AUTOPILOT_DEFAULT_DAYS_BACK = 1;
+const AUTOPILOT_REVIEW_MIN_CONFIDENCE = 0.75;
+const AUTOPILOT_AUTO_MIN_CONFIDENCE = 0.92;
+
+const getAutopilotState = (state) => {
+	if (!state.autopilot || typeof state.autopilot !== "object") {
+		state.autopilot = defaultState().autopilot;
+	}
+	return state.autopilot;
+};
+
+const incrementAutopilotMetric = (state, key, count = 1) => {
+	const autopilot = getAutopilotState(state);
+	if (!autopilot.metrics || typeof autopilot.metrics !== "object") {
+		autopilot.metrics = defaultState().autopilot.metrics;
+	}
+	const current =
+		typeof autopilot.metrics[key] === "number" &&
+		Number.isInteger(autopilot.metrics[key])
+			? autopilot.metrics[key]
+			: 0;
+	autopilot.metrics[key] = current + Math.max(0, Math.trunc(count));
+};
+
+const setAutopilotStatus = (state, status) => {
+	if (!AUTOPILOT_ALLOWED_STATUSES.includes(status)) {
+		return;
+	}
+	const autopilot = getAutopilotState(state);
+	autopilot.status = status;
+	if (status === "paused") {
+		autopilot.paused = true;
+	}
+};
+
+const clearAutopilotRun = (state) => {
+	const autopilot = getAutopilotState(state);
+	autopilot.in_flight_run_id = null;
+	if (!autopilot.paused && autopilot.status !== "degraded") {
+		autopilot.status = "idle";
+	}
+};
+
+const markAutopilotFailure = (state, message) => {
+	const autopilot = getAutopilotState(state);
+	autopilot.last_error = message;
+	autopilot.consecutive_failures += 1;
+	incrementAutopilotMetric(state, "ticks_failed", 1);
+	autopilot.in_flight_run_id = null;
+	if (autopilot.consecutive_failures >= AUTOPILOT_MAX_CONSECUTIVE_FAILURES) {
+		autopilot.status = "degraded";
+		autopilot.paused = true;
+		pushLog(state, "warn", "autopilot_degraded", message);
+		return;
+	}
+	autopilot.status = autopilot.paused ? "paused" : "idle";
+};
+
+const normalizeSnippet = (value) =>
+	typeof value === "string"
+		? value.replace(/\s+/g, " ").trim().slice(0, 240)
+		: "";
+
+const buildEvidenceKey = (messagePk, snippet, locatorType = "outlook_quote") =>
+	`evk_${createHash("sha1")
+		.update(`${messagePk}:${normalizeSnippet(snippet)}:${locatorType}`)
+		.digest("hex")
+		.slice(0, 20)}`;
+
+const buildTodoKey = (title, evidenceKey, namespace = "mail-agent") =>
+	`tdk_${createHash("sha1")
+		.update(`${title.trim().toLowerCase()}:${evidenceKey}:${namespace}`)
+		.digest("hex")
+		.slice(0, 20)}`;
+
+const autopilotModeAllowsWrites = (mode) => mode === "full_auto";
 
 const generateCodeVerifier = () => toBase64Url(randomBytes(32));
 const generateCodeChallenge = (codeVerifier) =>
@@ -1466,6 +1630,7 @@ const listAttachments = async (state, config, input) => {
 const getSystemHealth = (state) => {
 	const logs = Array.isArray(state.logs) ? state.logs : [];
 	const recent = logs.slice(-20);
+	const autopilot = getAutopilotState(state);
 	return {
 		ok: true,
 		data: {
@@ -1480,6 +1645,16 @@ const getSystemHealth = (state) => {
 			workflow_todo_count: Array.isArray(state.workflow?.todos)
 				? state.workflow.todos.length
 				: 0,
+			autopilot: {
+				mode: autopilot.mode,
+				status: autopilot.status,
+				paused: autopilot.paused,
+				in_flight_run_id: autopilot.in_flight_run_id,
+				last_error: autopilot.last_error,
+				consecutive_failures: autopilot.consecutive_failures,
+				last_tick_at: autopilot.last_tick_at,
+				metrics: autopilot.metrics,
+			},
 			last_log: recent.length > 0 ? recent[recent.length - 1] : null,
 			recent_logs: recent,
 		},
@@ -1493,6 +1668,7 @@ const resetSession = (state, input) => {
 	state.auth_token = null;
 	state.issued_session = null;
 	state.pending_callback = null;
+	state.autopilot = defaultState().autopilot;
 	if (clearMailbox) {
 		state.mailbox = {
 			messages: {},
@@ -1529,6 +1705,10 @@ const createWorkflowEvidence = (state, input) => {
 		Number.isFinite(confidenceRaw) && confidenceRaw >= 0 && confidenceRaw <= 1
 			? confidenceRaw
 			: 0.7;
+	const normalizedSnippet = normalizeSnippet(input.snippet);
+	if (!isNonEmptyString(normalizedSnippet)) {
+		return errorResponse("E_PARSE_FAILED", "snippet 이 필요합니다.");
+	}
 
 	const message = state.mailbox.messages[input.message_pk];
 	if (!message) {
@@ -1541,13 +1721,31 @@ const createWorkflowEvidence = (state, input) => {
 	if (!Array.isArray(state.workflow.evidences)) {
 		state.workflow.evidences = [];
 	}
+	const evidenceKey = isNonEmptyString(input.idempotency_key)
+		? input.idempotency_key.trim()
+		: buildEvidenceKey(input.message_pk, normalizedSnippet, "outlook_quote");
+	const existingEvidence = state.workflow.evidences.find(
+		(item) =>
+			item && typeof item === "object" && item.evidence_key === evidenceKey,
+	);
+	if (existingEvidence) {
+		return {
+			ok: true,
+			data: {
+				evidence: existingEvidence,
+				created: false,
+				updated: false,
+				skipped_duplicate: true,
+			},
+		};
+	}
 
-	const evidenceId = `ev_${createHash("sha1")
-		.update(`${input.message_pk}:${input.snippet}:${Date.now()}`)
-		.digest("hex")
-		.slice(0, 12)}`;
+	const evidenceId = isNonEmptyString(input.evidence_id)
+		? input.evidence_id.trim()
+		: `ev_${evidenceKey.slice(4, 16)}`;
 	const evidence = {
 		evidence_id: evidenceId,
+		evidence_key: evidenceKey,
 		source: {
 			kind: "email",
 			id: input.message_pk,
@@ -1555,9 +1753,9 @@ const createWorkflowEvidence = (state, input) => {
 		},
 		locator: {
 			type: "outlook_quote",
-			text_quote: input.snippet,
+			text_quote: normalizedSnippet,
 		},
-		snippet: input.snippet,
+		snippet: normalizedSnippet,
 		confidence,
 		created_at: nowIso(),
 	};
@@ -1565,7 +1763,15 @@ const createWorkflowEvidence = (state, input) => {
 	state.workflow.evidences = state.workflow.evidences.slice(-500);
 	writeState(state);
 	pushLog(state, "info", "workflow_evidence", evidenceId);
-	return { ok: true, data: { evidence } };
+	return {
+		ok: true,
+		data: {
+			evidence,
+			created: true,
+			updated: false,
+			skipped_duplicate: false,
+		},
+	};
 };
 
 const upsertWorkflowTodo = (state, input) => {
@@ -1583,30 +1789,52 @@ const upsertWorkflowTodo = (state, input) => {
 		isNonEmptyString(input.status) && allowed.includes(input.status)
 			? input.status
 			: "open";
-	const todoId = isNonEmptyString(input.todo_id)
-		? input.todo_id
-		: `todo_${createHash("sha1")
-				.update(`${input.title}:${Date.now()}`)
-				.digest("hex")
-				.slice(0, 12)}`;
+	const titleNormalized = input.title.trim();
 	const evidenceId = isNonEmptyString(input.evidence_id)
 		? input.evidence_id
 		: null;
+	const evidenceKey = isNonEmptyString(input.evidence_key)
+		? input.evidence_key.trim()
+		: isNonEmptyString(evidenceId)
+			? evidenceId
+			: "none";
+	const todoKey = isNonEmptyString(input.idempotency_key)
+		? input.idempotency_key.trim()
+		: isNonEmptyString(input.todo_key)
+			? input.todo_key.trim()
+			: buildTodoKey(titleNormalized, evidenceKey, "mail-agent");
+	const todoId = isNonEmptyString(input.todo_id)
+		? input.todo_id
+		: `todo_${todoKey.slice(4, 16)}`;
 	const now = nowIso();
-	const idx = state.workflow.todos.findIndex((item) => item.todo_id === todoId);
+	const idx = state.workflow.todos.findIndex(
+		(item) => item.todo_id === todoId || item.todo_key === todoKey,
+	);
+	let created = false;
+	let skippedDuplicate = false;
 	if (idx >= 0) {
 		const prev = state.workflow.todos[idx];
+		if (
+			prev.title === titleNormalized &&
+			prev.status === status &&
+			prev.evidence_id === evidenceId
+		) {
+			skippedDuplicate = true;
+		}
 		state.workflow.todos[idx] = {
 			...prev,
-			title: input.title,
+			todo_key: todoKey,
+			title: titleNormalized,
 			status,
 			evidence_id: evidenceId,
 			updated_at: now,
 		};
 	} else {
+		created = true;
 		state.workflow.todos.push({
 			todo_id: todoId,
-			title: input.title,
+			todo_key: todoKey,
+			title: titleNormalized,
 			status,
 			evidence_id: evidenceId,
 			created_at: now,
@@ -1618,7 +1846,15 @@ const upsertWorkflowTodo = (state, input) => {
 	pushLog(state, "info", "workflow_todo", todoId);
 	const todo =
 		state.workflow.todos.find((item) => item.todo_id === todoId) ?? null;
-	return { ok: true, data: { todo } };
+	return {
+		ok: true,
+		data: {
+			todo,
+			created,
+			updated: !created,
+			skipped_duplicate: skippedDuplicate,
+		},
+	};
 };
 
 const listWorkflow = (state) => ({
@@ -1630,6 +1866,311 @@ const listWorkflow = (state) => ({
 		todos: Array.isArray(state.workflow?.todos) ? state.workflow.todos : [],
 	},
 });
+
+const listRecentMessagesForAutopilot = (state, maxMessages) =>
+	Object.values(state.mailbox.messages)
+		.filter((msg) => msg && typeof msg === "object")
+		.sort((a, b) => {
+			const ta = parseTimestamp(a.received_at) ?? 0;
+			const tb = parseTimestamp(b.received_at) ?? 0;
+			return tb - ta;
+		})
+		.slice(0, maxMessages);
+
+const hasEvidenceForMessage = (state, messagePk) => {
+	if (!Array.isArray(state.workflow?.evidences)) {
+		return false;
+	}
+	return state.workflow.evidences.some(
+		(item) => item?.source?.id === messagePk,
+	);
+};
+
+const pickAutoSnippet = (message) => {
+	const candidate = isNonEmptyString(message.body_text)
+		? message.body_text
+		: isNonEmptyString(message.subject)
+			? message.subject
+			: "메일 본문 요약";
+	return normalizeSnippet(candidate);
+};
+
+const buildAutoTodoTitle = (message) => {
+	const subject = isNonEmptyString(message.subject)
+		? message.subject.trim()
+		: "무제 메일";
+	const sender = isNonEmptyString(message.from)
+		? message.from.trim()
+		: "unknown";
+	return `[AUTO] ${subject} - 확인/처리 (${sender})`;
+};
+
+const setAutopilotMode = (state, input) => {
+	const autopilot = getAutopilotState(state);
+	const requestedMode = isNonEmptyString(input.mode) ? input.mode.trim() : "";
+	if (!AUTOPILOT_ALLOWED_MODES.includes(requestedMode)) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"mode 는 manual/review_first/full_auto 중 하나여야 합니다.",
+		);
+	}
+	autopilot.mode = requestedMode;
+	autopilot.paused = requestedMode === "manual";
+	autopilot.status = autopilot.paused ? "paused" : "idle";
+	autopilot.last_error = null;
+	autopilot.consecutive_failures = 0;
+	writeState(state);
+	pushLog(state, "info", "autopilot_mode", requestedMode);
+	return {
+		ok: true,
+		data: {
+			mode: autopilot.mode,
+			status: autopilot.status,
+			paused: autopilot.paused,
+		},
+	};
+};
+
+const pauseAutopilot = (state) => {
+	const autopilot = getAutopilotState(state);
+	autopilot.paused = true;
+	autopilot.status = "paused";
+	autopilot.in_flight_run_id = null;
+	writeState(state);
+	pushLog(state, "warn", "autopilot_pause", "paused by request");
+	return { ok: true, data: { paused: true, status: autopilot.status } };
+};
+
+const resumeAutopilot = (state) => {
+	const autopilot = getAutopilotState(state);
+	if (autopilot.mode === "manual") {
+		return errorResponse(
+			"E_POLICY_DENIED",
+			"manual 모드에서는 resume 할 수 없습니다.",
+		);
+	}
+	autopilot.paused = false;
+	autopilot.status = "idle";
+	autopilot.last_error = null;
+	autopilot.consecutive_failures = 0;
+	autopilot.in_flight_run_id = null;
+	writeState(state);
+	pushLog(state, "info", "autopilot_resume", "resumed");
+	return { ok: true, data: { paused: false, status: autopilot.status } };
+};
+
+const getAutopilotStatus = (state) => {
+	const autopilot = getAutopilotState(state);
+	return {
+		ok: true,
+		data: {
+			mode: autopilot.mode,
+			status: autopilot.status,
+			paused: autopilot.paused,
+			in_flight_run_id: autopilot.in_flight_run_id,
+			last_error: autopilot.last_error,
+			consecutive_failures: autopilot.consecutive_failures,
+			last_tick_at: autopilot.last_tick_at,
+			metrics: autopilot.metrics,
+		},
+	};
+};
+
+const runAutopilotTick = async (state, config, input) => {
+	const autopilot = getAutopilotState(state);
+	if (autopilot.mode === "manual") {
+		return errorResponse(
+			"E_POLICY_DENIED",
+			"manual 모드입니다. autopilot.set_mode 후 실행하세요.",
+		);
+	}
+	if (autopilot.paused || autopilot.status === "paused") {
+		return errorResponse("E_POLICY_DENIED", "autopilot 이 paused 상태입니다.");
+	}
+	if (isNonEmptyString(autopilot.in_flight_run_id)) {
+		return errorResponse(
+			"E_GRAPH_THROTTLED",
+			"autopilot tick 이 이미 실행 중입니다.",
+			true,
+		);
+	}
+
+	const folder = isNonEmptyString(input.mail_folder)
+		? input.mail_folder.trim()
+		: AUTOPILOT_DEFAULT_FOLDER;
+	const requestedMaxMessages = Number(input.max_messages_per_tick);
+	const maxMessages =
+		Number.isInteger(requestedMaxMessages) && requestedMaxMessages > 0
+			? Math.min(requestedMaxMessages, AUTOPILOT_MAX_MESSAGES_PER_TICK)
+			: AUTOPILOT_MAX_MESSAGES_PER_TICK;
+	const requestedMaxAttachments = Number(input.max_attachments_per_tick);
+	const maxAttachments =
+		Number.isInteger(requestedMaxAttachments) && requestedMaxAttachments > 0
+			? Math.min(requestedMaxAttachments, AUTOPILOT_MAX_ATTACHMENTS_PER_TICK)
+			: AUTOPILOT_MAX_ATTACHMENTS_PER_TICK;
+
+	const runId = `run_${Date.now()}_${randomBytes(3).toString("hex")}`;
+	autopilot.in_flight_run_id = runId;
+	autopilot.last_tick_at = nowIso();
+	autopilot.status = "syncing";
+	incrementAutopilotMetric(state, "ticks_total", 1);
+	writeState(state);
+
+	const syncResult = await deltaSync(state, config, { mail_folder: folder });
+	if (!syncResult.ok) {
+		markAutopilotFailure(state, syncResult.error_message);
+		writeState(state);
+		return syncResult;
+	}
+
+	autopilot.status = "analyzing";
+	writeState(state);
+
+	const messages = listRecentMessagesForAutopilot(state, maxMessages);
+	const candidates = messages.filter(
+		(message) =>
+			isNonEmptyString(message.message_pk) &&
+			!hasEvidenceForMessage(state, message.message_pk),
+	);
+
+	if (autopilot.mode === "review_first") {
+		incrementAutopilotMetric(state, "review_candidates", candidates.length);
+		incrementAutopilotMetric(state, "ticks_success", 1);
+		autopilot.consecutive_failures = 0;
+		autopilot.last_error = null;
+		clearAutopilotRun(state);
+		writeState(state);
+		return {
+			ok: true,
+			data: {
+				run_id: runId,
+				mode: autopilot.mode,
+				synced_changes: syncResult.data.changes,
+				review_candidates: candidates.map((message) => ({
+					message_pk: message.message_pk,
+					subject: message.subject,
+					from: message.from,
+					received_at: message.received_at,
+				})),
+			},
+		};
+	}
+
+	autopilot.status = "persisting";
+	let evidenceCreated = 0;
+	let todoCreated = 0;
+	let attachmentSaved = 0;
+	let reviewCandidates = 0;
+	let attachmentBudgetLeft = maxAttachments;
+
+	for (const message of candidates) {
+		if (!isNonEmptyString(message.message_pk)) {
+			continue;
+		}
+		const snippet = pickAutoSnippet(message);
+		if (!isNonEmptyString(snippet)) {
+			reviewCandidates += 1;
+			continue;
+		}
+		const confidence = AUTOPILOT_AUTO_MIN_CONFIDENCE;
+		if (confidence < AUTOPILOT_REVIEW_MIN_CONFIDENCE) {
+			reviewCandidates += 1;
+			continue;
+		}
+
+		const evidenceKey = buildEvidenceKey(message.message_pk, snippet);
+		const evidenceResponse = createWorkflowEvidence(state, {
+			message_pk: message.message_pk,
+			snippet,
+			confidence,
+			idempotency_key: evidenceKey,
+		});
+		if (!evidenceResponse.ok) {
+			reviewCandidates += 1;
+			continue;
+		}
+		if (evidenceResponse.data.created === true) {
+			evidenceCreated += 1;
+		}
+
+		const evidence = evidenceResponse.data.evidence;
+		const title = buildAutoTodoTitle(message);
+		const todoKey = buildTodoKey(
+			title,
+			evidence.evidence_key ?? evidence.evidence_id,
+		);
+		const todoResponse = upsertWorkflowTodo(state, {
+			title,
+			status: "open",
+			evidence_id: evidence.evidence_id,
+			evidence_key: evidence.evidence_key,
+			idempotency_key: todoKey,
+		});
+		if (todoResponse.ok && todoResponse.data.created === true) {
+			todoCreated += 1;
+		}
+
+		if (
+			attachmentBudgetLeft > 0 &&
+			Array.isArray(message.attachments) &&
+			isNonEmptyString(message.provider_message_id)
+		) {
+			for (const graphAttachmentIdRaw of message.attachments) {
+				if (attachmentBudgetLeft <= 0) {
+					break;
+				}
+				if (!isNonEmptyString(graphAttachmentIdRaw)) {
+					continue;
+				}
+				const lookupKey = attachmentLookupKey(
+					message.provider_message_id,
+					graphAttachmentIdRaw,
+				);
+				if (state.mailbox.attachments[lookupKey]) {
+					continue;
+				}
+				const attachmentResult = await downloadAttachment(state, config, {
+					graph_message_id: message.provider_message_id,
+					graph_attachment_id: graphAttachmentIdRaw,
+					message_pk: message.message_pk,
+				});
+				if (attachmentResult.ok) {
+					attachmentSaved += 1;
+					attachmentBudgetLeft -= 1;
+				}
+			}
+		}
+	}
+
+	incrementAutopilotMetric(state, "auto_evidence_created", evidenceCreated);
+	incrementAutopilotMetric(state, "auto_todo_created", todoCreated);
+	incrementAutopilotMetric(state, "auto_attachment_saved", attachmentSaved);
+	incrementAutopilotMetric(state, "review_candidates", reviewCandidates);
+	incrementAutopilotMetric(state, "ticks_success", 1);
+	autopilot.consecutive_failures = 0;
+	autopilot.last_error = null;
+	clearAutopilotRun(state);
+	writeState(state);
+	pushLog(
+		state,
+		"info",
+		"autopilot_tick",
+		`${runId} evidences=${evidenceCreated} todos=${todoCreated} attachments=${attachmentSaved}`,
+	);
+
+	return {
+		ok: true,
+		data: {
+			run_id: runId,
+			mode: autopilot.mode,
+			synced_changes: syncResult.data.changes,
+			auto_evidence_created: evidenceCreated,
+			auto_todo_created: todoCreated,
+			auto_attachment_saved: attachmentSaved,
+			review_candidates: reviewCandidates,
+		},
+	};
+};
 
 const handleAuthStatus = (state) => ({
 	ok: true,
@@ -1713,6 +2254,21 @@ const handleMessage = async (message) => {
 	}
 	if (message.action === "workflow.list") {
 		return listWorkflow(state);
+	}
+	if (message.action === "autopilot.set_mode") {
+		return setAutopilotMode(state, message);
+	}
+	if (message.action === "autopilot.pause") {
+		return pauseAutopilot(state);
+	}
+	if (message.action === "autopilot.resume") {
+		return resumeAutopilot(state);
+	}
+	if (message.action === "autopilot.status") {
+		return getAutopilotStatus(state);
+	}
+	if (message.action === "autopilot.tick") {
+		return runAutopilotTick(state, config, message);
 	}
 
 	return errorResponse("E_UNKNOWN", "unsupported action");

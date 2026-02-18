@@ -55,22 +55,40 @@ export type McpToolName =
 	| "auth_store.complete_login"
 	| "auth_store.complete_login_auto"
 	| "auth_store.auth_status"
+	| "auth_store.logout"
 	| "graph_mail_sync.initial_sync"
 	| "graph_mail_sync.delta_sync"
 	| "graph_mail_sync.download_attachment"
 	| "mail_store.get_message"
-	| "mail_store.get_thread";
+	| "mail_store.get_thread"
+	| "workflow.create_evidence"
+	| "workflow.upsert_todo"
+	| "workflow.list"
+	| "autopilot.set_mode"
+	| "autopilot.pause"
+	| "autopilot.resume"
+	| "autopilot.status"
+	| "autopilot.tick";
 
 export const MCP_TOOL_NAMES = [
 	"auth_store.start_login",
 	"auth_store.complete_login",
 	"auth_store.complete_login_auto",
 	"auth_store.auth_status",
+	"auth_store.logout",
 	"graph_mail_sync.initial_sync",
 	"graph_mail_sync.delta_sync",
 	"graph_mail_sync.download_attachment",
 	"mail_store.get_message",
 	"mail_store.get_thread",
+	"workflow.create_evidence",
+	"workflow.upsert_todo",
+	"workflow.list",
+	"autopilot.set_mode",
+	"autopilot.pause",
+	"autopilot.resume",
+	"autopilot.status",
+	"autopilot.tick",
 ] as const;
 
 export interface McpAuthAccount {
@@ -111,6 +129,12 @@ export interface AuthStoreAuthStatusOutput {
 	access_token_expires_at?: string;
 	pending_callback_received: boolean;
 	pending_callback_received_at?: string;
+}
+
+export type AuthStoreLogoutInput = Record<string, never>;
+
+export interface AuthStoreLogoutOutput {
+	signed_out: boolean;
 }
 
 export interface GraphMailSyncInitialSyncInput {
@@ -183,16 +207,164 @@ export interface MailStoreGetThreadInput {
 
 export type MailStoreGetThreadOutput = MailStoreMessage[];
 
+export interface WorkflowEvidenceRecord {
+	evidence_id: string;
+	evidence_key?: string;
+	source: {
+		kind: "email";
+		id: string;
+		thread_pk: string;
+	};
+	locator: {
+		type: "outlook_quote";
+		text_quote: string;
+	};
+	snippet: string;
+	confidence: number;
+	created_at: string;
+}
+
+export interface WorkflowTodoRecord {
+	todo_id: string;
+	todo_key?: string;
+	title: string;
+	status: "open" | "in_progress" | "done";
+	evidence_id: string | null;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface WorkflowCreateEvidenceInput {
+	message_pk: string;
+	snippet: string;
+	confidence?: number;
+	evidence_id?: string;
+	idempotency_key?: string;
+}
+
+export interface WorkflowCreateEvidenceOutput {
+	evidence: WorkflowEvidenceRecord;
+	created: boolean;
+	updated: boolean;
+	skipped_duplicate: boolean;
+}
+
+export interface WorkflowUpsertTodoInput {
+	todo_id?: string;
+	todo_key?: string;
+	title: string;
+	status?: "open" | "in_progress" | "done";
+	evidence_id?: string;
+	evidence_key?: string;
+	idempotency_key?: string;
+}
+
+export interface WorkflowUpsertTodoOutput {
+	todo: WorkflowTodoRecord | null;
+	created: boolean;
+	updated: boolean;
+	skipped_duplicate: boolean;
+}
+
+export type WorkflowListInput = Record<string, never>;
+
+export interface WorkflowListOutput {
+	evidences: WorkflowEvidenceRecord[];
+	todos: WorkflowTodoRecord[];
+}
+
+export interface AutopilotSetModeInput {
+	mode: "manual" | "review_first" | "full_auto";
+}
+
+export interface AutopilotSetModeOutput {
+	mode: "manual" | "review_first" | "full_auto";
+	status:
+		| "idle"
+		| "syncing"
+		| "analyzing"
+		| "persisting"
+		| "paused"
+		| "degraded"
+		| "retrying";
+	paused: boolean;
+}
+
+export type AutopilotPauseInput = Record<string, never>;
+export type AutopilotResumeInput = Record<string, never>;
+
+export interface AutopilotPauseOutput {
+	paused: boolean;
+	status: string;
+}
+
+export interface AutopilotResumeOutput {
+	paused: boolean;
+	status: string;
+}
+
+export type AutopilotStatusInput = Record<string, never>;
+
+export interface AutopilotMetrics {
+	ticks_total: number;
+	ticks_success: number;
+	ticks_failed: number;
+	auto_evidence_created: number;
+	auto_todo_created: number;
+	auto_attachment_saved: number;
+	review_candidates: number;
+}
+
+export interface AutopilotStatusOutput {
+	mode: "manual" | "review_first" | "full_auto";
+	status: string;
+	paused: boolean;
+	in_flight_run_id: string | null;
+	last_error: string | null;
+	consecutive_failures: number;
+	last_tick_at: string | null;
+	metrics: AutopilotMetrics;
+}
+
+export interface AutopilotTickInput {
+	mail_folder?: string;
+	max_messages_per_tick?: number;
+	max_attachments_per_tick?: number;
+}
+
+export interface AutopilotTickOutput {
+	run_id: string;
+	mode: "manual" | "review_first" | "full_auto";
+	synced_changes: {
+		added: number;
+		updated: number;
+		deleted: number;
+	};
+	auto_evidence_created: number;
+	auto_todo_created: number;
+	auto_attachment_saved: number;
+	review_candidates: number;
+}
+
 export type McpToolInput = {
 	"auth_store.start_login": AuthStoreStartLoginInput;
 	"auth_store.complete_login": AuthStoreCompleteLoginInput;
 	"auth_store.complete_login_auto": AuthStoreCompleteLoginAutoInput;
 	"auth_store.auth_status": AuthStoreAuthStatusInput;
+	"auth_store.logout": AuthStoreLogoutInput;
 	"graph_mail_sync.initial_sync": GraphMailSyncInitialSyncInput;
 	"graph_mail_sync.delta_sync": GraphMailSyncDeltaSyncInput;
 	"graph_mail_sync.download_attachment": GraphMailSyncDownloadAttachmentInput;
 	"mail_store.get_message": MailStoreGetMessageInput;
 	"mail_store.get_thread": MailStoreGetThreadInput;
+	"workflow.create_evidence": WorkflowCreateEvidenceInput;
+	"workflow.upsert_todo": WorkflowUpsertTodoInput;
+	"workflow.list": WorkflowListInput;
+	"autopilot.set_mode": AutopilotSetModeInput;
+	"autopilot.pause": AutopilotPauseInput;
+	"autopilot.resume": AutopilotResumeInput;
+	"autopilot.status": AutopilotStatusInput;
+	"autopilot.tick": AutopilotTickInput;
 };
 
 export type McpToolOutput = {
@@ -200,11 +372,20 @@ export type McpToolOutput = {
 	"auth_store.complete_login": AuthStoreCompleteLoginOutput;
 	"auth_store.complete_login_auto": AuthStoreCompleteLoginAutoOutput;
 	"auth_store.auth_status": AuthStoreAuthStatusOutput;
+	"auth_store.logout": AuthStoreLogoutOutput;
 	"graph_mail_sync.initial_sync": GraphMailSyncInitialSyncOutput;
 	"graph_mail_sync.delta_sync": GraphMailSyncDeltaSyncOutput;
 	"graph_mail_sync.download_attachment": GraphMailSyncDownloadAttachmentOutput;
 	"mail_store.get_message": MailStoreGetMessageOutput;
 	"mail_store.get_thread": MailStoreGetThreadOutput;
+	"workflow.create_evidence": WorkflowCreateEvidenceOutput;
+	"workflow.upsert_todo": WorkflowUpsertTodoOutput;
+	"workflow.list": WorkflowListOutput;
+	"autopilot.set_mode": AutopilotSetModeOutput;
+	"autopilot.pause": AutopilotPauseOutput;
+	"autopilot.resume": AutopilotResumeOutput;
+	"autopilot.status": AutopilotStatusOutput;
+	"autopilot.tick": AutopilotTickOutput;
 };
 
 export type McpToolResponse<ToolName extends McpToolName> = McpResponse<
@@ -261,6 +442,20 @@ export interface McpRuntimeState {
 	attachments: Map<string, McpAttachmentRecord>;
 	attachmentContentBySha: Map<string, McpAttachmentContentMeta>;
 	deltaLinks: Map<string, string>;
+	workflow: {
+		evidences: WorkflowEvidenceRecord[];
+		todos: WorkflowTodoRecord[];
+	};
+	autopilot: {
+		mode: "manual" | "review_first" | "full_auto";
+		status: string;
+		paused: boolean;
+		in_flight_run_id: string | null;
+		last_error: string | null;
+		consecutive_failures: number;
+		last_tick_at: string | null;
+		metrics: AutopilotMetrics;
+	};
 	signed_in: boolean;
 	auth_token: McpAuthToken | null;
 }
@@ -310,6 +505,28 @@ const createRuntimeState = (): McpRuntimeState => ({
 	attachments: new Map(),
 	attachmentContentBySha: new Map(),
 	deltaLinks: new Map(),
+	workflow: {
+		evidences: [],
+		todos: [],
+	},
+	autopilot: {
+		mode: "manual",
+		status: "idle",
+		paused: false,
+		in_flight_run_id: null,
+		last_error: null,
+		consecutive_failures: 0,
+		last_tick_at: null,
+		metrics: {
+			ticks_total: 0,
+			ticks_success: 0,
+			ticks_failed: 0,
+			auto_evidence_created: 0,
+			auto_todo_created: 0,
+			auto_attachment_saved: 0,
+			review_candidates: 0,
+		},
+	},
 	signed_in: false,
 	auth_token: null,
 });
@@ -1313,6 +1530,366 @@ const handleMailGetThread = (
 	return okResponse<MailStoreGetThreadOutput>(sorted.slice(0, input.depth));
 };
 
+const normalizeSnippet = (value: string): string =>
+	value.replace(/\s+/g, " ").trim().slice(0, 240);
+
+const buildEvidenceKey = (messagePk: string, snippet: string): string =>
+	`evk_${createHash("sha1")
+		.update(`${messagePk}:${normalizeSnippet(snippet)}:outlook_quote`)
+		.digest("hex")
+		.slice(0, 20)}`;
+
+const buildTodoKey = (title: string, evidenceKey: string): string =>
+	`tdk_${createHash("sha1")
+		.update(`${title.trim().toLowerCase()}:${evidenceKey}:mail-agent`)
+		.digest("hex")
+		.slice(0, 20)}`;
+
+const handleAuthStoreLogout = (
+	context: McpRuntimeContext,
+	_input: AuthStoreLogoutInput,
+) => {
+	context.state.signed_in = false;
+	context.state.account = null;
+	context.state.auth_token = null;
+	context.state.issued_session = null;
+	context.state.pending_callback = null;
+	return okResponse<AuthStoreLogoutOutput>({ signed_out: true });
+};
+
+const handleWorkflowCreateEvidence = (
+	context: McpRuntimeContext,
+	input: WorkflowCreateEvidenceInput,
+) => {
+	if (!isNonEmptyString(input.message_pk)) {
+		return errorResponse("E_PARSE_FAILED", "message_pk 가 필요합니다.");
+	}
+	if (!isNonEmptyString(input.snippet)) {
+		return errorResponse("E_PARSE_FAILED", "snippet 이 필요합니다.");
+	}
+	const message = context.state.messages.get(input.message_pk);
+	if (!message) {
+		return errorResponse("E_NOT_FOUND", "요청한 message 를 찾을 수 없습니다.");
+	}
+	const confidenceRaw = Number(input.confidence);
+	const confidence =
+		Number.isFinite(confidenceRaw) && confidenceRaw >= 0 && confidenceRaw <= 1
+			? confidenceRaw
+			: 0.7;
+	const snippet = normalizeSnippet(input.snippet);
+	const evidenceKey = isNonEmptyString(input.idempotency_key)
+		? input.idempotency_key.trim()
+		: buildEvidenceKey(input.message_pk, snippet);
+	const existing = context.state.workflow.evidences.find(
+		(item) => item.evidence_key === evidenceKey,
+	);
+	if (existing) {
+		return okResponse<WorkflowCreateEvidenceOutput>({
+			evidence: existing,
+			created: false,
+			updated: false,
+			skipped_duplicate: true,
+		});
+	}
+	const evidenceId = isNonEmptyString(input.evidence_id)
+		? input.evidence_id.trim()
+		: `ev_${evidenceKey.slice(4, 16)}`;
+	const evidence: WorkflowEvidenceRecord = {
+		evidence_id: evidenceId,
+		evidence_key: evidenceKey,
+		source: {
+			kind: "email",
+			id: input.message_pk,
+			thread_pk: message.provider_thread_id,
+		},
+		locator: {
+			type: "outlook_quote",
+			text_quote: snippet,
+		},
+		snippet,
+		confidence,
+		created_at: nowIso(),
+	};
+	context.state.workflow.evidences = [
+		...context.state.workflow.evidences,
+		evidence,
+	].slice(-500);
+	return okResponse<WorkflowCreateEvidenceOutput>({
+		evidence,
+		created: true,
+		updated: false,
+		skipped_duplicate: false,
+	});
+};
+
+const handleWorkflowUpsertTodo = (
+	context: McpRuntimeContext,
+	input: WorkflowUpsertTodoInput,
+) => {
+	if (!isNonEmptyString(input.title)) {
+		return errorResponse("E_PARSE_FAILED", "title 이 필요합니다.");
+	}
+	const allowed: WorkflowTodoRecord["status"][] = [
+		"open",
+		"in_progress",
+		"done",
+	];
+	const status: WorkflowTodoRecord["status"] =
+		isNonEmptyString(input.status) && allowed.includes(input.status)
+			? input.status
+			: "open";
+	const evidenceKey = isNonEmptyString(input.evidence_key)
+		? input.evidence_key.trim()
+		: isNonEmptyString(input.evidence_id)
+			? input.evidence_id.trim()
+			: "none";
+	const todoKey = isNonEmptyString(input.idempotency_key)
+		? input.idempotency_key.trim()
+		: isNonEmptyString(input.todo_key)
+			? input.todo_key.trim()
+			: buildTodoKey(input.title, evidenceKey);
+	const todoId = isNonEmptyString(input.todo_id)
+		? input.todo_id.trim()
+		: `todo_${todoKey.slice(4, 16)}`;
+	const evidenceId = isNonEmptyString(input.evidence_id)
+		? input.evidence_id.trim()
+		: null;
+	const now = nowIso();
+	const idx = context.state.workflow.todos.findIndex(
+		(item) => item.todo_id === todoId || item.todo_key === todoKey,
+	);
+	let created = false;
+	let skippedDuplicate = false;
+	if (idx >= 0) {
+		const prev = context.state.workflow.todos[idx];
+		if (
+			prev.title === input.title.trim() &&
+			prev.status === status &&
+			prev.evidence_id === evidenceId
+		) {
+			skippedDuplicate = true;
+		}
+		context.state.workflow.todos[idx] = {
+			...prev,
+			todo_id: todoId,
+			todo_key: todoKey,
+			title: input.title.trim(),
+			status,
+			evidence_id: evidenceId,
+			updated_at: now,
+		};
+	} else {
+		created = true;
+		context.state.workflow.todos.push({
+			todo_id: todoId,
+			todo_key: todoKey,
+			title: input.title.trim(),
+			status,
+			evidence_id: evidenceId,
+			created_at: now,
+			updated_at: now,
+		});
+	}
+	context.state.workflow.todos = context.state.workflow.todos.slice(-500);
+	const todo =
+		context.state.workflow.todos.find((item) => item.todo_id === todoId) ??
+		null;
+	return okResponse<WorkflowUpsertTodoOutput>({
+		todo,
+		created,
+		updated: !created,
+		skipped_duplicate: skippedDuplicate,
+	});
+};
+
+const handleWorkflowList = (
+	context: McpRuntimeContext,
+	_input: WorkflowListInput,
+) =>
+	okResponse<WorkflowListOutput>({
+		evidences: context.state.workflow.evidences,
+		todos: context.state.workflow.todos,
+	});
+
+const handleAutopilotSetMode = (
+	context: McpRuntimeContext,
+	input: AutopilotSetModeInput,
+) => {
+	if (!["manual", "review_first", "full_auto"].includes(input.mode)) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"mode 는 manual/review_first/full_auto 중 하나여야 합니다.",
+		);
+	}
+	context.state.autopilot.mode = input.mode;
+	context.state.autopilot.paused = input.mode === "manual";
+	context.state.autopilot.status = input.mode === "manual" ? "paused" : "idle";
+	context.state.autopilot.last_error = null;
+	context.state.autopilot.consecutive_failures = 0;
+	return okResponse<AutopilotSetModeOutput>({
+		mode: context.state.autopilot.mode,
+		status: context.state.autopilot.status as AutopilotSetModeOutput["status"],
+		paused: context.state.autopilot.paused,
+	});
+};
+
+const handleAutopilotPause = (
+	context: McpRuntimeContext,
+	_input: AutopilotPauseInput,
+) => {
+	context.state.autopilot.paused = true;
+	context.state.autopilot.status = "paused";
+	context.state.autopilot.in_flight_run_id = null;
+	return okResponse<AutopilotPauseOutput>({
+		paused: true,
+		status: "paused",
+	});
+};
+
+const handleAutopilotResume = (
+	context: McpRuntimeContext,
+	_input: AutopilotResumeInput,
+) => {
+	if (context.state.autopilot.mode === "manual") {
+		return errorResponse(
+			"E_POLICY_DENIED",
+			"manual 모드에서는 resume 할 수 없습니다.",
+		);
+	}
+	context.state.autopilot.paused = false;
+	context.state.autopilot.status = "idle";
+	context.state.autopilot.consecutive_failures = 0;
+	context.state.autopilot.last_error = null;
+	return okResponse<AutopilotResumeOutput>({
+		paused: false,
+		status: "idle",
+	});
+};
+
+const handleAutopilotStatus = (
+	context: McpRuntimeContext,
+	_input: AutopilotStatusInput,
+) =>
+	okResponse<AutopilotStatusOutput>({
+		mode: context.state.autopilot.mode,
+		status: context.state.autopilot.status,
+		paused: context.state.autopilot.paused,
+		in_flight_run_id: context.state.autopilot.in_flight_run_id,
+		last_error: context.state.autopilot.last_error,
+		consecutive_failures: context.state.autopilot.consecutive_failures,
+		last_tick_at: context.state.autopilot.last_tick_at,
+		metrics: context.state.autopilot.metrics,
+	});
+
+const handleAutopilotTick = (
+	context: McpRuntimeContext,
+	input: AutopilotTickInput,
+) => {
+	if (context.state.autopilot.mode === "manual") {
+		return errorResponse(
+			"E_POLICY_DENIED",
+			"manual 모드입니다. autopilot.set_mode 후 실행하세요.",
+		);
+	}
+	if (context.state.autopilot.paused) {
+		return errorResponse("E_POLICY_DENIED", "autopilot 이 paused 상태입니다.");
+	}
+	const runId = `run_${Date.now()}_${randomBytes(3).toString("hex")}`;
+	context.state.autopilot.in_flight_run_id = runId;
+	context.state.autopilot.last_tick_at = nowIso();
+	context.state.autopilot.metrics.ticks_total += 1;
+	const folder = isNonEmptyString(input.mail_folder)
+		? input.mail_folder
+		: "inbox";
+	const sync = handleGraphDeltaSync(context, { mail_folder: folder });
+	if (!sync.ok) {
+		context.state.autopilot.metrics.ticks_failed += 1;
+		context.state.autopilot.consecutive_failures += 1;
+		context.state.autopilot.last_error = sync.error_message;
+		context.state.autopilot.in_flight_run_id = null;
+		context.state.autopilot.status =
+			context.state.autopilot.consecutive_failures >= 3 ? "degraded" : "idle";
+		context.state.autopilot.paused =
+			context.state.autopilot.consecutive_failures >= 3;
+		return sync;
+	}
+
+	context.state.autopilot.status = "analyzing";
+	const maxMessages =
+		typeof input.max_messages_per_tick === "number" &&
+		Number.isInteger(input.max_messages_per_tick) &&
+		input.max_messages_per_tick > 0
+			? Math.min(30, input.max_messages_per_tick)
+			: 30;
+	const candidates = Array.from(context.state.messages.values())
+		.filter(
+			(message) =>
+				isNonEmptyString(message.message_pk) &&
+				!context.state.workflow.evidences.some(
+					(item) => item.source.id === message.message_pk,
+				),
+		)
+		.slice(0, maxMessages);
+
+	let evidenceCreated = 0;
+	let todoCreated = 0;
+	let reviewCandidates = 0;
+	if (context.state.autopilot.mode === "review_first") {
+		reviewCandidates = candidates.length;
+		context.state.autopilot.metrics.review_candidates += reviewCandidates;
+	} else {
+		for (const message of candidates) {
+			const snippet = normalizeSnippet(
+				message.body_text || message.subject || "",
+			);
+			if (!isNonEmptyString(snippet)) {
+				reviewCandidates += 1;
+				continue;
+			}
+			const evidence = handleWorkflowCreateEvidence(context, {
+				message_pk: message.message_pk,
+				snippet,
+				confidence: 0.92,
+			});
+			if (!evidence.ok) {
+				reviewCandidates += 1;
+				continue;
+			}
+			if (evidence.data.created) {
+				evidenceCreated += 1;
+			}
+			const todo = handleWorkflowUpsertTodo(context, {
+				title: `[AUTO] ${message.subject || "무제 메일"}`,
+				status: "open",
+				evidence_id: evidence.data.evidence.evidence_id,
+				evidence_key: evidence.data.evidence.evidence_key,
+			});
+			if (todo.ok && todo.data.created) {
+				todoCreated += 1;
+			}
+		}
+	}
+
+	context.state.autopilot.status = "idle";
+	context.state.autopilot.in_flight_run_id = null;
+	context.state.autopilot.consecutive_failures = 0;
+	context.state.autopilot.last_error = null;
+	context.state.autopilot.metrics.ticks_success += 1;
+	context.state.autopilot.metrics.auto_evidence_created += evidenceCreated;
+	context.state.autopilot.metrics.auto_todo_created += todoCreated;
+	context.state.autopilot.metrics.review_candidates += reviewCandidates;
+
+	return okResponse<AutopilotTickOutput>({
+		run_id: runId,
+		mode: context.state.autopilot.mode,
+		synced_changes: sync.data.changes,
+		auto_evidence_created: evidenceCreated,
+		auto_todo_created: todoCreated,
+		auto_attachment_saved: 0,
+		review_candidates: reviewCandidates,
+	});
+};
+
 const MCP_TOOL_HANDLERS: {
 	[K in McpToolName]: (
 		context: McpRuntimeContext,
@@ -1327,6 +1904,8 @@ const MCP_TOOL_HANDLERS: {
 		handleAuthStoreCompleteLoginAuto(context, input),
 	"auth_store.auth_status": (context, input) =>
 		handleAuthStoreAuthStatus(context, input),
+	"auth_store.logout": (context, input) =>
+		handleAuthStoreLogout(context, input),
 	"graph_mail_sync.initial_sync": (context, input) =>
 		handleGraphInitialSync(context, input),
 	"graph_mail_sync.delta_sync": (context, input) =>
@@ -1337,6 +1916,17 @@ const MCP_TOOL_HANDLERS: {
 		handleMailGetMessage(context, input),
 	"mail_store.get_thread": (context, input) =>
 		handleMailGetThread(context, input),
+	"workflow.create_evidence": (context, input) =>
+		handleWorkflowCreateEvidence(context, input),
+	"workflow.upsert_todo": (context, input) =>
+		handleWorkflowUpsertTodo(context, input),
+	"workflow.list": (context, input) => handleWorkflowList(context, input),
+	"autopilot.set_mode": (context, input) =>
+		handleAutopilotSetMode(context, input),
+	"autopilot.pause": (context, input) => handleAutopilotPause(context, input),
+	"autopilot.resume": (context, input) => handleAutopilotResume(context, input),
+	"autopilot.status": (context, input) => handleAutopilotStatus(context, input),
+	"autopilot.tick": (context, input) => handleAutopilotTick(context, input),
 } as const;
 const defaultContext = createMcpContext();
 
