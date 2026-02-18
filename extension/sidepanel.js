@@ -42,6 +42,21 @@ const autosyncMinutesInput = document.getElementById("autosync-minutes");
 const autosyncStartButton = document.getElementById("autosync-start");
 const autosyncStopButton = document.getElementById("autosync-stop");
 
+const autopilotModeInput = document.getElementById("autopilot-mode");
+const autopilotSetModeButton = document.getElementById("autopilot-set-mode");
+const autopilotStatusButton = document.getElementById("autopilot-status");
+const autopilotTickButton = document.getElementById("autopilot-tick");
+const autopilotPauseButton = document.getElementById("autopilot-pause");
+const autopilotResumeButton = document.getElementById("autopilot-resume");
+const autopilotFolderInput = document.getElementById("autopilot-folder");
+const autopilotMaxMessagesInput = document.getElementById(
+	"autopilot-max-messages",
+);
+const autopilotMaxAttachmentsInput = document.getElementById(
+	"autopilot-max-attachments",
+);
+const autopilotStatusText = document.getElementById("autopilot-status-text");
+
 const systemHealthButton = document.getElementById("system-health");
 const resetSessionButton = document.getElementById("reset-session");
 const resetSessionFullButton = document.getElementById("reset-session-full");
@@ -102,6 +117,12 @@ const setResult = (payload) => {
 const setAutoSyncStatus = (value) => {
 	if (autoSyncStatus) {
 		autoSyncStatus.textContent = value;
+	}
+};
+
+const setAutopilotStatusText = (value) => {
+	if (autopilotStatusText) {
+		autopilotStatusText.textContent = value;
 	}
 };
 
@@ -741,7 +762,7 @@ const downloadAttachment = async () => {
 };
 
 const runDeltaSyncOnce = async () => {
-	await deltaSync();
+	await runAutopilotTickOnce();
 };
 
 const startAutoSyncLoop = () => {
@@ -791,6 +812,107 @@ const resetSession = async (clearMailbox) => {
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		setAuthStatus(`System error: ${message}`);
+	}
+};
+
+const readAutopilotInputs = () => {
+	const mailFolder =
+		typeof autopilotFolderInput?.value === "string" &&
+		autopilotFolderInput.value.trim().length > 0
+			? autopilotFolderInput.value.trim()
+			: "inbox";
+	const maxMessagesRaw = Number(autopilotMaxMessagesInput?.value ?? "30");
+	const maxAttachmentsRaw = Number(autopilotMaxAttachmentsInput?.value ?? "10");
+	return {
+		mail_folder: mailFolder,
+		max_messages_per_tick:
+			Number.isInteger(maxMessagesRaw) && maxMessagesRaw > 0
+				? maxMessagesRaw
+				: 30,
+		max_attachments_per_tick:
+			Number.isInteger(maxAttachmentsRaw) && maxAttachmentsRaw > 0
+				? maxAttachmentsRaw
+				: 10,
+	};
+};
+
+const refreshAutopilotStatus = async () => {
+	try {
+		const response = await sendNativeMessage("autopilot.status", {});
+		const data = handleMcpResponse(response);
+		setResult(response);
+		setAutopilotStatusText(
+			`Autopilot: mode=${data.mode} status=${data.status} paused=${Boolean(data.paused)}`,
+		);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		setAutopilotStatusText(`Autopilot error: ${message}`);
+	}
+};
+
+const setAutopilotMode = async () => {
+	const mode =
+		typeof autopilotModeInput?.value === "string"
+			? autopilotModeInput.value
+			: "manual";
+	try {
+		const response = await sendNativeMessage("autopilot.set_mode", { mode });
+		handleMcpResponse(response);
+		setResult(response);
+		setAuthStatus(`Autopilot: mode 설정 완료 (${mode})`);
+		await refreshAutopilotStatus();
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		setAuthStatus(`Autopilot error: ${message}`);
+	}
+};
+
+const runAutopilotTickOnce = async () => {
+	const payload = readAutopilotInputs();
+	const response = await sendNativeMessage("autopilot.tick", payload);
+	const data = handleMcpResponse(response);
+	setResult(response);
+	setAuthStatus(
+		`Autopilot tick 완료: evidences=${data.auto_evidence_created ?? 0} todos=${data.auto_todo_created ?? 0} attachments=${data.auto_attachment_saved ?? 0}`,
+	);
+	await listMessages();
+	await listThreads();
+	await refreshAutopilotStatus();
+};
+
+const runAutopilotTick = async () => {
+	try {
+		await runAutopilotTickOnce();
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		setAuthStatus(`Autopilot error: ${message}`);
+		await refreshAutopilotStatus();
+	}
+};
+
+const pauseAutopilot = async () => {
+	try {
+		const response = await sendNativeMessage("autopilot.pause", {});
+		handleMcpResponse(response);
+		setResult(response);
+		setAuthStatus("Autopilot: pause 완료");
+		await refreshAutopilotStatus();
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		setAuthStatus(`Autopilot error: ${message}`);
+	}
+};
+
+const resumeAutopilot = async () => {
+	try {
+		const response = await sendNativeMessage("autopilot.resume", {});
+		handleMcpResponse(response);
+		setResult(response);
+		setAuthStatus("Autopilot: resume 완료");
+		await refreshAutopilotStatus();
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		setAuthStatus(`Autopilot error: ${message}`);
 	}
 };
 
@@ -894,6 +1016,12 @@ downloadAttachmentButton?.addEventListener("click", downloadAttachment);
 autosyncStartButton?.addEventListener("click", startAutoSyncLoop);
 autosyncStopButton?.addEventListener("click", stopAutoSyncLoop);
 
+autopilotSetModeButton?.addEventListener("click", setAutopilotMode);
+autopilotStatusButton?.addEventListener("click", refreshAutopilotStatus);
+autopilotTickButton?.addEventListener("click", runAutopilotTick);
+autopilotPauseButton?.addEventListener("click", pauseAutopilot);
+autopilotResumeButton?.addEventListener("click", resumeAutopilot);
+
 systemHealthButton?.addEventListener("click", getSystemHealth);
 resetSessionButton?.addEventListener("click", () => resetSession(false));
 resetSessionFullButton?.addEventListener("click", () => resetSession(true));
@@ -905,4 +1033,9 @@ workflowListButton?.addEventListener("click", listWorkflow);
 requestAuthStatus().catch((error) => {
 	const message = error instanceof Error ? error.message : String(error);
 	setAuthStatus(`Auth status error: ${message}`);
+});
+
+refreshAutopilotStatus().catch((error) => {
+	const message = error instanceof Error ? error.message : String(error);
+	setAutopilotStatusText(`Autopilot error: ${message}`);
 });

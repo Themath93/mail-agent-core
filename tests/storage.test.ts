@@ -21,6 +21,28 @@ const createState = (): McpRuntimeState => ({
 	attachments: new Map(),
 	attachmentContentBySha: new Map(),
 	deltaLinks: new Map(),
+	workflow: {
+		evidences: [],
+		todos: [],
+	},
+	autopilot: {
+		mode: "manual",
+		status: "idle",
+		paused: false,
+		in_flight_run_id: null,
+		last_error: null,
+		consecutive_failures: 0,
+		last_tick_at: null,
+		metrics: {
+			ticks_total: 0,
+			ticks_success: 0,
+			ticks_failed: 0,
+			auto_evidence_created: 0,
+			auto_todo_created: 0,
+			auto_attachment_saved: 0,
+			review_candidates: 0,
+		},
+	},
 	signed_in: false,
 	auth_token: null,
 });

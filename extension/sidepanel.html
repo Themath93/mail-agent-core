@@ -140,6 +140,30 @@
     </div>
 
     <div class="card">
+      <h2>Autopilot</h2>
+      <div class="row">
+        <select id="autopilot-mode">
+          <option value="manual">manual</option>
+          <option value="review_first">review_first</option>
+          <option value="full_auto">full_auto</option>
+        </select>
+        <button id="autopilot-set-mode" type="button">set_mode</button>
+        <button id="autopilot-status" type="button">status</button>
+      </div>
+      <div class="row">
+        <input id="autopilot-folder" type="text" value="inbox" placeholder="mail_folder" />
+        <input id="autopilot-max-messages" type="number" value="30" min="1" max="100" />
+        <input id="autopilot-max-attachments" type="number" value="10" min="1" max="50" />
+      </div>
+      <div class="row">
+        <button id="autopilot-tick" type="button">tick</button>
+        <button id="autopilot-pause" type="button">pause</button>
+        <button id="autopilot-resume" type="button">resume</button>
+      </div>
+      <p id="autopilot-status-text">Autopilot: unknown</p>
+    </div>
+
+    <div class="card">
       <h2>운영/복구</h2>
       <div class="row">
         <button id="system-health" type="button">system.health</button>
