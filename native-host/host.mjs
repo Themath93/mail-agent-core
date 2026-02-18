@@ -492,6 +492,336 @@ const PHASE_1_PERSISTENCE_AUTHORITY = Object.freeze({
 	sqlite_mirror_enabled: false,
 });
 
+const DASHBOARD_DRILLDOWN_DEFAULTS = {
+	today_mail_count: {
+		target_tool: "search.query",
+		payload: {
+			date_window: "today",
+			limit: 50,
+		},
+	},
+	today_todo_count: {
+		target_tool: "search.query",
+		payload: {
+			scope: "work_item",
+			date_window: "today",
+			limit: 50,
+		},
+	},
+	progress_status: {
+		target_tool: "timeline.list",
+		payload: {
+			date_window: "today",
+			event_types: ["status_changed"],
+			limit: 100,
+		},
+	},
+	weekly_completed_count: {
+		target_tool: "search.query",
+		payload: {
+			scope: "work_item",
+			date_window: "current_week",
+			statuses: ["done"],
+			limit: 50,
+		},
+	},
+	top_counterparties: {
+		target_tool: "search.query",
+		payload: {
+			scope: "all",
+			date_window: "last_7_days",
+			limit: 100,
+			bindings: [
+				{
+					token: "counterparty_id",
+					target_field: "counterparty_ids",
+				},
+			],
+		},
+	},
+};
+
+const toUtcDateString = (date) => {
+	const year = String(date.getUTCFullYear());
+	const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+	const day = String(date.getUTCDate()).padStart(2, "0");
+	return `${year}-${month}-${day}`;
+};
+
+const safeIsoTimestamp = (value, fallback = nowIso()) => {
+	if (!isNonEmptyString(value)) {
+		return fallback;
+	}
+	return parseTimestamp(value) === null ? fallback : value;
+};
+
+const resolveDashboardDateRange = (dateRaw, timezoneRaw) => {
+	const parsedDate =
+		isNonEmptyString(dateRaw) &&
+		parseTimestamp(`${dateRaw}T00:00:00.000Z`) !== null
+			? new Date(`${dateRaw}T00:00:00.000Z`)
+			: new Date();
+	const normalizedDate = new Date(
+		Date.UTC(
+			parsedDate.getUTCFullYear(),
+			parsedDate.getUTCMonth(),
+			parsedDate.getUTCDate(),
+		),
+	);
+	const dayIndex = normalizedDate.getUTCDay();
+	const weekStartOffset = (dayIndex + 6) % 7;
+	const weekStart = new Date(normalizedDate);
+	weekStart.setUTCDate(weekStart.getUTCDate() - weekStartOffset);
+	const weekEnd = new Date(weekStart);
+	weekEnd.setUTCDate(weekEnd.getUTCDate() + 6);
+
+	return {
+		date: toUtcDateString(normalizedDate),
+		week_start: toUtcDateString(weekStart),
+		week_end: toUtcDateString(weekEnd),
+		timezone: isNonEmptyString(timezoneRaw) ? timezoneRaw.trim() : "UTC",
+	};
+};
+
+const resolveDateWindow = (windowType) => {
+	const now = new Date();
+	const currentDate = toUtcDateString(now);
+	if (windowType === "today") {
+		return {
+			start: `${currentDate}T00:00:00.000Z`,
+			end: `${currentDate}T23:59:59.999Z`,
+		};
+	}
+
+	if (windowType === "current_week") {
+		const range = resolveDashboardDateRange(currentDate, "UTC");
+		return {
+			start: `${range.week_start}T00:00:00.000Z`,
+			end: `${range.week_end}T23:59:59.999Z`,
+		};
+	}
+
+	if (windowType === "last_7_days") {
+		const end = new Date();
+		const start = new Date(end);
+		start.setUTCDate(start.getUTCDate() - 6);
+		return {
+			start: `${toUtcDateString(start)}T00:00:00.000Z`,
+			end: `${toUtcDateString(end)}T23:59:59.999Z`,
+		};
+	}
+
+	return null;
+};
+
+const withinRange = (value, fromRaw, toRaw) => {
+	const ts = parseTimestamp(value);
+	if (ts === null) {
+		return false;
+	}
+	const fromTs = parseTimestamp(fromRaw);
+	const toTs = parseTimestamp(toRaw);
+	if (fromTs !== null && ts < fromTs) {
+		return false;
+	}
+	if (toTs !== null && ts > toTs) {
+		return false;
+	}
+	return true;
+};
+
+const parseOffsetCursor = (cursorRaw) => {
+	if (!isNonEmptyString(cursorRaw)) {
+		return 0;
+	}
+	if (!cursorRaw.startsWith("offset:")) {
+		return 0;
+	}
+	const value = Number(cursorRaw.slice("offset:".length));
+	return Number.isInteger(value) && value >= 0 ? value : 0;
+};
+
+const normalizeCounterpartyId = (value) =>
+	`counterparty:${createHash("sha1")
+		.update(value.trim().toLowerCase())
+		.digest("hex")
+		.slice(0, 12)}`;
+
+const scoreByQuery = (query, ...fields) => {
+	const normalized = query.trim().toLowerCase();
+	if (normalized.length === 0) {
+		return 0;
+	}
+	let score = 0;
+	for (const field of fields) {
+		if (!isNonEmptyString(field)) {
+			continue;
+		}
+		const text = field.toLowerCase();
+		if (text === normalized) {
+			score = Math.max(score, 1);
+			continue;
+		}
+		if (text.includes(normalized)) {
+			score = Math.max(score, 0.85);
+		}
+	}
+	return score;
+};
+
+const buildEvidenceReference = (evidence) => {
+	if (!evidence || typeof evidence !== "object") {
+		return null;
+	}
+	if (!isNonEmptyString(evidence.evidence_id)) {
+		return null;
+	}
+	const source =
+		evidence.source && typeof evidence.source === "object"
+			? evidence.source
+			: null;
+	if (!source || !isNonEmptyString(source.id)) {
+		return null;
+	}
+	const locator =
+		evidence.locator && typeof evidence.locator === "object"
+			? evidence.locator
+			: null;
+	const textQuote =
+		isNonEmptyString(locator?.text_quote) &&
+		locator.text_quote.trim().length > 0
+			? locator.text_quote.trim()
+			: normalizeSnippet(evidence.snippet);
+	if (!isNonEmptyString(textQuote)) {
+		return null;
+	}
+
+	return {
+		evidence_id: evidence.evidence_id,
+		source_kind: source.kind === "attachment" ? "attachment" : "email",
+		source_id: source.id,
+		...(isNonEmptyString(source.thread_pk)
+			? { thread_id: source.thread_pk }
+			: {}),
+		locator: {
+			type: "outlook_quote",
+			text_quote: textQuote,
+		},
+	};
+};
+
+const mapLogToTimelineEvent = (log, index) => {
+	if (!log || typeof log !== "object") {
+		return null;
+	}
+	const at = safeIsoTimestamp(log.at, nowIso());
+	const event = isNonEmptyString(log.event) ? log.event : "";
+	const payload = {
+		level: isNonEmptyString(log.level) ? log.level : "info",
+		event,
+		message: isNonEmptyString(log.message) ? log.message : "",
+	};
+
+	if (event === "initial_sync") {
+		return {
+			event_id: `log:${index}:initial_sync`,
+			event_type: "message_synced",
+			source_tool: "graph_mail_sync.initial_sync",
+			entity_id: "mailbox:initial_sync",
+			at,
+			payload,
+		};
+	}
+
+	if (event === "delta_sync") {
+		return {
+			event_id: `log:${index}:delta_sync`,
+			event_type: "message_synced",
+			source_tool: "graph_mail_sync.delta_sync",
+			entity_id: "mailbox:delta_sync",
+			at,
+			payload,
+		};
+	}
+
+	if (event === "download_attachment") {
+		return {
+			event_id: `log:${index}:download_attachment`,
+			event_type: "attachment_synced",
+			source_tool: "graph_mail_sync.download_attachment",
+			entity_id: isNonEmptyString(log.message)
+				? `attachment:${log.message}`
+				: `attachment:${index}`,
+			at,
+			payload,
+		};
+	}
+
+	if (event === "workflow_evidence") {
+		return {
+			event_id: `log:${index}:workflow_evidence`,
+			event_type: "evidence_created",
+			source_tool: "workflow.create_evidence",
+			entity_id: isNonEmptyString(log.message)
+				? `evidence:${log.message}`
+				: `evidence:${index}`,
+			at,
+			payload,
+		};
+	}
+
+	if (event === "workflow_todo") {
+		return {
+			event_id: `log:${index}:workflow_todo`,
+			event_type: "todo_updated",
+			source_tool: "workflow.upsert_todo",
+			entity_id: isNonEmptyString(log.message)
+				? `todo:${log.message}`
+				: `todo:${index}`,
+			at,
+			payload,
+		};
+	}
+
+	return null;
+};
+
+const buildTimelineEvents = (state) => {
+	const events = [];
+	const logs = Array.isArray(state.logs) ? state.logs : [];
+	for (const [index, log] of logs.entries()) {
+		const mapped = mapLogToTimelineEvent(log, index);
+		if (mapped) {
+			events.push(mapped);
+		}
+	}
+
+	const todos = Array.isArray(state.workflow?.todos)
+		? state.workflow.todos
+		: [];
+	for (const todo of todos) {
+		if (!todo || typeof todo !== "object") {
+			continue;
+		}
+		if (!isNonEmptyString(todo.todo_id)) {
+			continue;
+		}
+		events.push({
+			event_id: `todo_status:${todo.todo_id}`,
+			event_type: "status_changed",
+			source_tool: "workflow.upsert_todo",
+			entity_id: todo.todo_id,
+			at: safeIsoTimestamp(todo.updated_at || todo.created_at, nowIso()),
+			payload: {
+				title: isNonEmptyString(todo.title) ? todo.title : "",
+				status: isNonEmptyString(todo.status) ? todo.status : "open",
+			},
+		});
+	}
+
+	return events;
+};
+
 const buildAutopilotMessageFingerprint = (
 	message,
 	schemaVersion = AUTOPILOT_FINGERPRINT_SCHEMA_VERSION,
@@ -2158,6 +2488,607 @@ const listWorkflow = (state) => ({
 	},
 });
 
+const handleDashboardGetOverview = (state, input) => {
+	if (input === null || typeof input !== "object" || Array.isArray(input)) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"dashboard.get_overview input 은 객체여야 합니다.",
+		);
+	}
+
+	const range = resolveDashboardDateRange(input.date, input.timezone);
+	const messages = Object.values(state.mailbox?.messages || {}).filter(
+		(item) => item && typeof item === "object",
+	);
+	const todos = Array.isArray(state.workflow?.todos)
+		? state.workflow.todos
+		: [];
+	const evidences = Array.isArray(state.workflow?.evidences)
+		? state.workflow.evidences
+		: [];
+
+	const topLimitRaw = Number(input.top_counterparties_limit);
+	const topLimit =
+		Number.isInteger(topLimitRaw) && topLimitRaw > 0
+			? Math.min(topLimitRaw, 20)
+			: 5;
+
+	const todayMailCount = messages.filter(
+		(message) =>
+			isNonEmptyString(message.received_at) &&
+			message.received_at.startsWith(range.date),
+	).length;
+
+	const todayTodoCount = todos.filter((todo) => {
+		const timestamp = safeIsoTimestamp(todo.updated_at || todo.created_at, "");
+		return isNonEmptyString(timestamp) && timestamp.startsWith(range.date);
+	}).length;
+
+	const openCount = todos.filter((todo) => todo?.status === "open").length;
+	const inProgressCount = todos.filter(
+		(todo) => todo?.status === "in_progress",
+	).length;
+	const doneCount = todos.filter((todo) => todo?.status === "done").length;
+	const completionRate =
+		todos.length > 0
+			? Number((doneCount / Math.max(todos.length, 1)).toFixed(4))
+			: 0;
+
+	const weeklyCompletedCount = todos.filter((todo) => {
+		if (todo?.status !== "done") {
+			return false;
+		}
+		const timestamp = safeIsoTimestamp(todo.updated_at || todo.created_at, "");
+		if (!isNonEmptyString(timestamp)) {
+			return false;
+		}
+		return withinRange(
+			timestamp,
+			`${range.week_start}T00:00:00.000Z`,
+			`${range.week_end}T23:59:59.999Z`,
+		);
+	}).length;
+
+	const counterparties = new Map();
+	const senderByMessagePk = new Map();
+	for (const message of messages) {
+		const sender = isNonEmptyString(message.from) ? message.from.trim() : "-";
+		const counterpartyId = normalizeCounterpartyId(sender);
+		const at = safeIsoTimestamp(message.received_at, nowIso());
+		senderByMessagePk.set(message.message_pk, sender);
+		const existing = counterparties.get(counterpartyId);
+		if (existing) {
+			existing.message_count += 1;
+			if (at > existing.last_interaction_at) {
+				existing.last_interaction_at = at;
+			}
+			continue;
+		}
+		counterparties.set(counterpartyId, {
+			contact_id: counterpartyId,
+			display_name: sender,
+			message_count: 1,
+			todo_count: 0,
+			last_interaction_at: at,
+		});
+	}
+
+	const evidenceById = new Map();
+	for (const evidence of evidences) {
+		if (!evidence || typeof evidence !== "object") {
+			continue;
+		}
+		if (!isNonEmptyString(evidence.evidence_id)) {
+			continue;
+		}
+		evidenceById.set(evidence.evidence_id, evidence);
+	}
+
+	for (const todo of todos) {
+		if (!isNonEmptyString(todo?.evidence_id)) {
+			continue;
+		}
+		const evidence = evidenceById.get(todo.evidence_id);
+		const messagePk = evidence?.source?.id;
+		if (!isNonEmptyString(messagePk)) {
+			continue;
+		}
+		const sender = senderByMessagePk.get(messagePk);
+		if (!isNonEmptyString(sender)) {
+			continue;
+		}
+		const counterpartyId = normalizeCounterpartyId(sender);
+		const item = counterparties.get(counterpartyId);
+		if (!item) {
+			continue;
+		}
+		item.todo_count += 1;
+	}
+
+	const topCounterparties = Array.from(counterparties.values())
+		.sort((a, b) => {
+			if (b.message_count !== a.message_count) {
+				return b.message_count - a.message_count;
+			}
+			if (b.todo_count !== a.todo_count) {
+				return b.todo_count - a.todo_count;
+			}
+			return (b.last_interaction_at || "").localeCompare(
+				a.last_interaction_at || "",
+			);
+		})
+		.slice(0, topLimit)
+		.map((item) => ({
+			contact_id: item.contact_id,
+			display_name: item.display_name,
+			message_count: item.message_count,
+			todo_count: item.todo_count,
+			last_interaction_at: item.last_interaction_at,
+		}));
+
+	return {
+		ok: true,
+		data: {
+			generated_at: nowIso(),
+			range,
+			kpis: {
+				today_mail_count: todayMailCount,
+				today_todo_count: todayTodoCount,
+				progress_status: {
+					open_count: openCount,
+					in_progress_count: inProgressCount,
+					done_count: doneCount,
+					completion_rate: completionRate,
+				},
+				weekly_completed_count: weeklyCompletedCount,
+				top_counterparties: topCounterparties,
+			},
+			drilldowns: DASHBOARD_DRILLDOWN_DEFAULTS,
+		},
+	};
+};
+
+const handleSearchQuery = (state, input) => {
+	if (input === null || typeof input !== "object" || Array.isArray(input)) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"search.query input 은 객체여야 합니다.",
+		);
+	}
+	if (!isNonEmptyString(input.query)) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"search.query 는 query 가 필요합니다.",
+		);
+	}
+
+	const query = input.query.trim();
+	const allowedScopes = [
+		"all",
+		"mail",
+		"attachment",
+		"work_item",
+		"timeline_event",
+	];
+	const scope =
+		isNonEmptyString(input.scope) && allowedScopes.includes(input.scope)
+			? input.scope
+			: "all";
+	const allowedSorts = ["relevance", "newest", "oldest"];
+	const sort =
+		isNonEmptyString(input.sort) && allowedSorts.includes(input.sort)
+			? input.sort
+			: "relevance";
+	const limitRaw = Number(input.limit);
+	const limit =
+		Number.isInteger(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 200) : 20;
+	const offset = parseOffsetCursor(input.cursor);
+
+	const filters =
+		input.filters &&
+		typeof input.filters === "object" &&
+		!Array.isArray(input.filters)
+			? input.filters
+			: {};
+	const dateWindow =
+		isNonEmptyString(filters.date_window) &&
+		["today", "current_week", "last_7_days"].includes(filters.date_window)
+			? resolveDateWindow(filters.date_window)
+			: null;
+	const fromFilter = isNonEmptyString(filters.from) ? filters.from : null;
+	const toFilter = isNonEmptyString(filters.to) ? filters.to : null;
+	const hasEvidenceFilter =
+		typeof filters.has_evidence === "boolean" ? filters.has_evidence : null;
+	const statusFilterSet =
+		Array.isArray(filters.statuses) && filters.statuses.length > 0
+			? new Set(filters.statuses.filter((value) => isNonEmptyString(value)))
+			: null;
+	const counterpartyFilterSet =
+		Array.isArray(filters.counterparty_ids) &&
+		filters.counterparty_ids.length > 0
+			? new Set(
+					filters.counterparty_ids.filter((value) => isNonEmptyString(value)),
+				)
+			: null;
+	const eventTypeFilterSet =
+		Array.isArray(filters.event_types) && filters.event_types.length > 0
+			? new Set(filters.event_types.filter((value) => isNonEmptyString(value)))
+			: null;
+	const sourceToolFilterSet =
+		Array.isArray(filters.source_tools) && filters.source_tools.length > 0
+			? new Set(filters.source_tools.filter((value) => isNonEmptyString(value)))
+			: null;
+
+	const messages = Object.values(state.mailbox?.messages || {}).filter(
+		(item) => item && typeof item === "object",
+	);
+	const attachments = Object.values(state.mailbox?.attachments || {}).filter(
+		(item) => item && typeof item === "object",
+	);
+	const todos = Array.isArray(state.workflow?.todos)
+		? state.workflow.todos
+		: [];
+	const evidences = Array.isArray(state.workflow?.evidences)
+		? state.workflow.evidences
+		: [];
+
+	const messageByPk = new Map();
+	for (const message of messages) {
+		if (isNonEmptyString(message.message_pk)) {
+			messageByPk.set(message.message_pk, message);
+		}
+	}
+
+	const evidenceById = new Map();
+	const evidenceByMessagePk = new Map();
+	for (const evidence of evidences) {
+		const reference = buildEvidenceReference(evidence);
+		if (!reference) {
+			continue;
+		}
+		evidenceById.set(reference.evidence_id, reference);
+		const list = evidenceByMessagePk.get(reference.source_id) || [];
+		list.push(reference);
+		evidenceByMessagePk.set(reference.source_id, list);
+	}
+
+	const candidates = [];
+
+	if (scope === "all" || scope === "mail") {
+		for (const message of messages) {
+			const subject = isNonEmptyString(message.subject)
+				? message.subject
+				: "(제목 없음)";
+			const sender = isNonEmptyString(message.from) ? message.from : "-";
+			const snippet = normalizeSnippet(
+				isNonEmptyString(message.body_text) ? message.body_text : subject,
+			);
+			const score = scoreByQuery(query, subject, sender, snippet);
+			if (score <= 0) {
+				continue;
+			}
+			const evidenceLocators =
+				evidenceByMessagePk.get(message.message_pk) || [];
+			const availableActions = ["open_source", "open_timeline"];
+			if (evidenceLocators.length > 0) {
+				availableActions.push("jump_evidence");
+			}
+			candidates.push({
+				item: {
+					result_id: `mail:${message.message_pk}`,
+					source_type: "mail",
+					source_id: message.message_pk,
+					...(isNonEmptyString(message.provider_thread_id)
+						? { thread_id: message.provider_thread_id }
+						: {}),
+					title: subject,
+					snippet,
+					score,
+					occurred_at: safeIsoTimestamp(message.received_at, nowIso()),
+					evidence_locators: evidenceLocators,
+					available_actions: availableActions,
+				},
+				meta: {
+					has_evidence: evidenceLocators.length > 0,
+					status: null,
+					counterparty_id: normalizeCounterpartyId(sender),
+					event_type: null,
+					source_tool: null,
+				},
+			});
+		}
+	}
+
+	if (scope === "all" || scope === "attachment") {
+		for (const attachment of attachments) {
+			const title = isNonEmptyString(attachment.graph_attachment_id)
+				? attachment.graph_attachment_id
+				: attachment.attachment_pk;
+			const snippet = isNonEmptyString(attachment.relative_path)
+				? attachment.relative_path
+				: attachment.attachment_pk;
+			const score = scoreByQuery(
+				query,
+				title,
+				snippet,
+				attachment.attachment_pk,
+			);
+			if (score <= 0) {
+				continue;
+			}
+			const relatedMessage = messageByPk.get(attachment.message_pk);
+			candidates.push({
+				item: {
+					result_id: `attachment:${attachment.attachment_pk}`,
+					source_type: "attachment",
+					source_id: attachment.attachment_pk,
+					title,
+					snippet,
+					score,
+					occurred_at: safeIsoTimestamp(relatedMessage?.received_at, nowIso()),
+					evidence_locators: [],
+					available_actions: ["open_source", "open_timeline"],
+				},
+				meta: {
+					has_evidence: false,
+					status: null,
+					counterparty_id: null,
+					event_type: null,
+					source_tool: null,
+				},
+			});
+		}
+	}
+
+	if (scope === "all" || scope === "work_item") {
+		for (const todo of todos) {
+			if (
+				!todo ||
+				typeof todo !== "object" ||
+				!isNonEmptyString(todo.todo_id)
+			) {
+				continue;
+			}
+			const title = isNonEmptyString(todo.title) ? todo.title : "(제목 없음)";
+			const status = isNonEmptyString(todo.status) ? todo.status : "open";
+			const snippet = `상태: ${status}`;
+			const score = scoreByQuery(query, title, snippet, todo.todo_id);
+			if (score <= 0) {
+				continue;
+			}
+			const evidenceRef = isNonEmptyString(todo.evidence_id)
+				? evidenceById.get(todo.evidence_id)
+				: null;
+			const evidenceLocators = evidenceRef ? [evidenceRef] : [];
+			const availableActions = ["open_timeline"];
+			if (evidenceLocators.length > 0) {
+				availableActions.push("jump_evidence");
+			}
+			candidates.push({
+				item: {
+					result_id: `work_item:${todo.todo_id}`,
+					source_type: "work_item",
+					source_id: todo.todo_id,
+					title,
+					snippet,
+					score,
+					occurred_at: safeIsoTimestamp(
+						todo.updated_at || todo.created_at,
+						nowIso(),
+					),
+					evidence_locators: evidenceLocators,
+					available_actions: availableActions,
+				},
+				meta: {
+					has_evidence: evidenceLocators.length > 0,
+					status,
+					counterparty_id: null,
+					event_type: null,
+					source_tool: "workflow.upsert_todo",
+				},
+			});
+		}
+	}
+
+	if (scope === "all" || scope === "timeline_event") {
+		for (const event of buildTimelineEvents(state)) {
+			const score = scoreByQuery(
+				query,
+				event.event_type,
+				event.source_tool,
+				event.entity_id,
+				isNonEmptyString(event.payload?.message) ? event.payload.message : "",
+			);
+			if (score <= 0) {
+				continue;
+			}
+			candidates.push({
+				item: {
+					result_id: `timeline:${event.event_id}`,
+					source_type: "timeline_event",
+					source_id: event.event_id,
+					title: `${event.event_type} | ${event.source_tool}`,
+					snippet: isNonEmptyString(event.payload?.message)
+						? event.payload.message
+						: event.entity_id,
+					score,
+					occurred_at: event.at,
+					evidence_locators: [],
+					available_actions: ["open_timeline"],
+				},
+				meta: {
+					has_evidence: false,
+					status: null,
+					counterparty_id: null,
+					event_type: event.event_type,
+					source_tool: event.source_tool,
+				},
+			});
+		}
+	}
+
+	const filtered = candidates.filter((candidate) => {
+		const occurredAt = candidate.item.occurred_at;
+
+		if (
+			dateWindow &&
+			!withinRange(occurredAt, dateWindow.start, dateWindow.end)
+		) {
+			return false;
+		}
+
+		if (
+			(fromFilter && !withinRange(occurredAt, fromFilter, null)) ||
+			(toFilter && !withinRange(occurredAt, null, toFilter))
+		) {
+			return false;
+		}
+
+		if (
+			hasEvidenceFilter !== null &&
+			Boolean(candidate.meta.has_evidence) !== hasEvidenceFilter
+		) {
+			return false;
+		}
+
+		if (statusFilterSet) {
+			if (candidate.item.source_type !== "work_item") {
+				return false;
+			}
+			if (!statusFilterSet.has(candidate.meta.status)) {
+				return false;
+			}
+		}
+
+		if (counterpartyFilterSet) {
+			if (candidate.item.source_type !== "mail") {
+				return false;
+			}
+			if (!counterpartyFilterSet.has(candidate.meta.counterparty_id)) {
+				return false;
+			}
+		}
+
+		if (eventTypeFilterSet) {
+			if (candidate.item.source_type !== "timeline_event") {
+				return false;
+			}
+			if (!eventTypeFilterSet.has(candidate.meta.event_type)) {
+				return false;
+			}
+		}
+
+		if (sourceToolFilterSet) {
+			if (candidate.item.source_type !== "timeline_event") {
+				return false;
+			}
+			if (!sourceToolFilterSet.has(candidate.meta.source_tool)) {
+				return false;
+			}
+		}
+
+		return true;
+	});
+
+	filtered.sort((a, b) => {
+		if (sort === "newest") {
+			return (
+				(parseTimestamp(b.item.occurred_at) || 0) -
+				(parseTimestamp(a.item.occurred_at) || 0)
+			);
+		}
+		if (sort === "oldest") {
+			return (
+				(parseTimestamp(a.item.occurred_at) || 0) -
+				(parseTimestamp(b.item.occurred_at) || 0)
+			);
+		}
+		if (b.item.score !== a.item.score) {
+			return b.item.score - a.item.score;
+		}
+		return (
+			(parseTimestamp(b.item.occurred_at) || 0) -
+			(parseTimestamp(a.item.occurred_at) || 0)
+		);
+	});
+
+	const paged = filtered.slice(offset, offset + limit);
+	const nextOffset = offset + paged.length;
+
+	return {
+		ok: true,
+		data: {
+			items: paged.map((candidate) => candidate.item),
+			...(nextOffset < filtered.length
+				? { next_cursor: `offset:${nextOffset}` }
+				: {}),
+			total_estimate: filtered.length,
+		},
+	};
+};
+
+const handleTimelineList = (state, input) => {
+	if (input === null || typeof input !== "object" || Array.isArray(input)) {
+		return errorResponse(
+			"E_PARSE_FAILED",
+			"timeline.list input 은 객체여야 합니다.",
+		);
+	}
+
+	const includePayload = input.include_payload === true;
+	const limitRaw = Number(input.limit);
+	const limit =
+		Number.isInteger(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 500) : 50;
+	const offset = parseOffsetCursor(input.cursor);
+	const entityId = isNonEmptyString(input.entity_id) ? input.entity_id : null;
+	const eventTypeSet =
+		Array.isArray(input.event_types) && input.event_types.length > 0
+			? new Set(input.event_types.filter((value) => isNonEmptyString(value)))
+			: null;
+	const sourceToolSet =
+		Array.isArray(input.source_tools) && input.source_tools.length > 0
+			? new Set(input.source_tools.filter((value) => isNonEmptyString(value)))
+			: null;
+	const fromFilter = isNonEmptyString(input.from) ? input.from : null;
+	const toFilter = isNonEmptyString(input.to) ? input.to : null;
+
+	const filtered = buildTimelineEvents(state)
+		.filter((event) => {
+			if (entityId && event.entity_id !== entityId) {
+				return false;
+			}
+			if (eventTypeSet && !eventTypeSet.has(event.event_type)) {
+				return false;
+			}
+			if (sourceToolSet && !sourceToolSet.has(event.source_tool)) {
+				return false;
+			}
+			if (
+				(fromFilter && !withinRange(event.at, fromFilter, null)) ||
+				(toFilter && !withinRange(event.at, null, toFilter))
+			) {
+				return false;
+			}
+			return true;
+		})
+		.sort((a, b) => (parseTimestamp(b.at) || 0) - (parseTimestamp(a.at) || 0));
+
+	const paged = filtered.slice(offset, offset + limit);
+	const nextOffset = offset + paged.length;
+
+	return {
+		ok: true,
+		data: {
+			events: paged.map((event) =>
+				includePayload ? event : { ...event, payload: {} },
+			),
+			...(nextOffset < filtered.length
+				? { next_cursor: `offset:${nextOffset}` }
+				: {}),
+		},
+	};
+};
+
 const listRecentMessagesForAutopilot = (state, maxMessages) =>
 	Object.values(state.mailbox.messages)
 		.filter((msg) => msg && typeof msg === "object")
@@ -3081,6 +4012,15 @@ const handleMessage = async (message) => {
 	}
 	if (message.action === "workflow.list") {
 		return listWorkflow(state);
+	}
+	if (message.action === "dashboard.get_overview") {
+		return handleDashboardGetOverview(state, message);
+	}
+	if (message.action === "search.query") {
+		return handleSearchQuery(state, message);
+	}
+	if (message.action === "timeline.list") {
+		return handleTimelineList(state, message);
 	}
 	if (message.action === "autopilot.set_mode") {
 		return setAutopilotMode(state, message);
