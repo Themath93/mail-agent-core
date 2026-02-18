@@ -62,6 +62,20 @@ const defaultState = () => ({
 			auto_todo_created: 0,
 			auto_attachment_saved: 0,
 			review_candidates: 0,
+			codex_stage_started: 0,
+			codex_stage_success: 0,
+			codex_stage_fail: 0,
+			codex_stage_timeout: 0,
+			codex_stage_schema_fail: 0,
+		},
+		codex_stage: {
+			started: 0,
+			success: 0,
+			fail: 0,
+			timeout: 0,
+			schema_fail: 0,
+			last_failure_reason: null,
+			last_run_correlation: [],
 		},
 	},
 	logs: [],
@@ -72,6 +86,10 @@ const defaultConfig = () => ({
 	client_id: "",
 	redirect_uri: "http://127.0.0.1:1270/mcp/callback",
 	callback_poll_ms: 1000,
+	codex_auth: {
+		mode: "disabled",
+		api_key_env: "CODEX_API_KEY",
+	},
 });
 
 const normalizeObject = (value) =>
@@ -147,6 +165,30 @@ const normalizeAutopilotState = (value) => {
 			auto_todo_created: asCount(rawMetrics.auto_todo_created),
 			auto_attachment_saved: asCount(rawMetrics.auto_attachment_saved),
 			review_candidates: asCount(rawMetrics.review_candidates),
+			codex_stage_started: asCount(rawMetrics.codex_stage_started),
+			codex_stage_success: asCount(rawMetrics.codex_stage_success),
+			codex_stage_fail: asCount(rawMetrics.codex_stage_fail),
+			codex_stage_timeout: asCount(rawMetrics.codex_stage_timeout),
+			codex_stage_schema_fail: asCount(rawMetrics.codex_stage_schema_fail),
+		},
+		codex_stage: {
+			started: asCount(source.codex_stage?.started),
+			success: asCount(source.codex_stage?.success),
+			fail: asCount(source.codex_stage?.fail),
+			timeout: asCount(source.codex_stage?.timeout),
+			schema_fail: asCount(source.codex_stage?.schema_fail),
+			last_failure_reason: isNonEmptyString(
+				source.codex_stage?.last_failure_reason,
+			)
+				? source.codex_stage.last_failure_reason
+				: null,
+			last_run_correlation: Array.isArray(
+				source.codex_stage?.last_run_correlation,
+			)
+				? source.codex_stage.last_run_correlation
+						.filter((item) => item && typeof item === "object")
+						.slice(-30)
+				: [],
 		},
 	};
 };
@@ -207,7 +249,14 @@ const normalizeState = (value) => {
 
 const normalizeConfig = (value) => {
 	const source = normalizeObject(value);
+	const codexAuth = normalizeObject(source.codex_auth);
 	const base = defaultConfig();
+	const codexAuthBase = base.codex_auth;
+	const codexAuthMode =
+		isNonEmptyString(codexAuth.mode) &&
+		["disabled", "env"].includes(codexAuth.mode)
+			? codexAuth.mode
+			: codexAuthBase.mode;
 	return {
 		tenant: isNonEmptyString(source.tenant)
 			? source.tenant.trim()
@@ -223,6 +272,12 @@ const normalizeConfig = (value) => {
 			source.callback_poll_ms >= 200
 				? source.callback_poll_ms
 				: base.callback_poll_ms,
+		codex_auth: {
+			mode: codexAuthMode,
+			api_key_env: isNonEmptyString(codexAuth.api_key_env)
+				? codexAuth.api_key_env.trim()
+				: codexAuthBase.api_key_env,
+		},
 	};
 };
 
@@ -272,12 +327,70 @@ const AUTOPILOT_ALLOWED_STATUSES = [
 	"retrying",
 ];
 const AUTOPILOT_MAX_CONSECUTIVE_FAILURES = 3;
+const AUTOPILOT_CODEX_ANALYZE_TIMEOUT_MS = 1500;
+const AUTOPILOT_CODEX_ANALYZE_MAX_RETRIES = 2;
+const AUTOPILOT_CODEX_STAGE_FAILURE_THRESHOLD = 2;
 const AUTOPILOT_MAX_MESSAGES_PER_TICK = 30;
 const AUTOPILOT_MAX_ATTACHMENTS_PER_TICK = 10;
 const AUTOPILOT_DEFAULT_FOLDER = "inbox";
 const AUTOPILOT_DEFAULT_DAYS_BACK = 1;
 const AUTOPILOT_REVIEW_MIN_CONFIDENCE = 0.75;
 const AUTOPILOT_AUTO_MIN_CONFIDENCE = 0.92;
+const CODEX_AUTH_ALLOWED_MODES = ["disabled", "env"];
+
+const redactSecret = (value) => {
+	if (!isNonEmptyString(value)) {
+		return "[REDACTED]";
+	}
+	return "[REDACTED]";
+};
+
+const resolveCodexAuth = (config) => {
+	const authConfig =
+		config && typeof config.codex_auth === "object"
+			? config.codex_auth
+			: defaultConfig().codex_auth;
+	const mode = isNonEmptyString(authConfig.mode)
+		? authConfig.mode.trim()
+		: "disabled";
+
+	if (!CODEX_AUTH_ALLOWED_MODES.includes(mode)) {
+		return {
+			ok: false,
+			error: errorResponse(
+				"E_CODEX_AUTH_FAILED",
+				"codex auth mode 설정이 올바르지 않습니다.",
+			),
+			logMessage: `invalid codex auth mode: ${mode}`,
+		};
+	}
+
+	if (mode === "disabled") {
+		return { ok: true, enabled: false };
+	}
+
+	const apiKeyEnv = isNonEmptyString(authConfig.api_key_env)
+		? authConfig.api_key_env.trim()
+		: "CODEX_API_KEY";
+	const apiKey = process.env[apiKeyEnv];
+	if (!isNonEmptyString(apiKey)) {
+		return {
+			ok: false,
+			error: errorResponse(
+				"E_CODEX_AUTH_REQUIRED",
+				`${apiKeyEnv} 환경변수 설정이 필요합니다.`,
+			),
+			logMessage: `missing codex auth env: ${apiKeyEnv}`,
+		};
+	}
+
+	return {
+		ok: true,
+		enabled: true,
+		source: `env:${apiKeyEnv}`,
+		redacted: redactSecret(apiKey),
+	};
+};
 
 const getAutopilotState = (state) => {
 	if (!state.autopilot || typeof state.autopilot !== "object") {
@@ -321,6 +434,7 @@ const clearAutopilotRun = (state) => {
 const markAutopilotFailure = (state, message) => {
 	const autopilot = getAutopilotState(state);
 	autopilot.last_error = message;
+	autopilot.codex_stage.last_failure_reason = message;
 	autopilot.consecutive_failures += 1;
 	incrementAutopilotMetric(state, "ticks_failed", 1);
 	autopilot.in_flight_run_id = null;
@@ -330,13 +444,74 @@ const markAutopilotFailure = (state, message) => {
 		pushLog(state, "warn", "autopilot_degraded", message);
 		return;
 	}
-	autopilot.status = autopilot.paused ? "paused" : "idle";
+	autopilot.status = autopilot.paused ? "paused" : "retrying";
 };
+
+const updateCodexStageStatusFromMetrics = (state) => {
+	const autopilot = getAutopilotState(state);
+	autopilot.codex_stage.started = autopilot.metrics.codex_stage_started;
+	autopilot.codex_stage.success = autopilot.metrics.codex_stage_success;
+	autopilot.codex_stage.fail = autopilot.metrics.codex_stage_fail;
+	autopilot.codex_stage.timeout = autopilot.metrics.codex_stage_timeout;
+	autopilot.codex_stage.schema_fail = autopilot.metrics.codex_stage_schema_fail;
+};
+
+const setCodexStageRunCorrelation = (state, runCorrelation) => {
+	const autopilot = getAutopilotState(state);
+	autopilot.codex_stage.last_run_correlation = Array.isArray(runCorrelation)
+		? runCorrelation.slice(-30)
+		: [];
+};
+
+const buildCodexStageObservability = (autopilot) => ({
+	codex_stage_metrics: {
+		started: autopilot.metrics.codex_stage_started,
+		success: autopilot.metrics.codex_stage_success,
+		fail: autopilot.metrics.codex_stage_fail,
+		timeout: autopilot.metrics.codex_stage_timeout,
+		schema_fail: autopilot.metrics.codex_stage_schema_fail,
+	},
+	codex_last_failure_reason:
+		autopilot.codex_stage.last_failure_reason ?? autopilot.last_error,
+});
 
 const normalizeSnippet = (value) =>
 	typeof value === "string"
 		? value.replace(/\s+/g, " ").trim().slice(0, 240)
 		: "";
+
+const normalizeFingerprintBody = (value) =>
+	typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
+
+const AUTOPILOT_FINGERPRINT_SCHEMA_VERSION = "v1";
+
+const PHASE_1_PERSISTENCE_AUTHORITY = Object.freeze({
+	phase: "phase_1",
+	source_of_truth: "native-host/state.json",
+	sqlite_mirror: "deferred",
+	sqlite_mirror_enabled: false,
+});
+
+const buildAutopilotMessageFingerprint = (
+	message,
+	schemaVersion = AUTOPILOT_FINGERPRINT_SCHEMA_VERSION,
+) => {
+	const normalizedBody = normalizeFingerprintBody(
+		isNonEmptyString(message.body_text) ? message.body_text : message.subject,
+	);
+	const normalizedInternetMessageId = isNonEmptyString(
+		message.internet_message_id,
+	)
+		? message.internet_message_id.trim().toLowerCase()
+		: "";
+	return [
+		message.message_pk,
+		normalizedInternetMessageId,
+		message.received_at,
+		normalizedBody,
+		schemaVersion,
+	].join(":");
+};
 
 const buildEvidenceKey = (messagePk, snippet, locatorType = "outlook_quote") =>
 	`evk_${createHash("sha1")
@@ -351,6 +526,122 @@ const buildTodoKey = (title, evidenceKey, namespace = "mail-agent") =>
 		.slice(0, 20)}`;
 
 const autopilotModeAllowsWrites = (mode) => mode === "full_auto";
+
+const deriveDeterministicTodoKey = (title, evidenceKey) =>
+	buildTodoKey(title, evidenceKey, "mail-agent");
+
+const persistAnalyzedCandidateViaWorkflow = (state, analyzed) => {
+	const proposal = analyzed.proposal;
+	if (proposal === null) {
+		return {
+			review_candidate: true,
+			evidence_created: 0,
+			todo_created: 0,
+			evidence_writes: 0,
+			todo_writes: 0,
+		};
+	}
+
+	const message = analyzed.message;
+	if (!isNonEmptyString(message.message_pk)) {
+		return {
+			review_candidate: true,
+			evidence_created: 0,
+			todo_created: 0,
+			evidence_writes: 0,
+			todo_writes: 0,
+		};
+	}
+
+	if (proposal.confidence < AUTOPILOT_REVIEW_MIN_CONFIDENCE) {
+		return {
+			review_candidate: true,
+			evidence_created: 0,
+			todo_created: 0,
+			evidence_writes: 0,
+			todo_writes: 0,
+		};
+	}
+
+	const messageFingerprint = buildAutopilotMessageFingerprint(message);
+	const evidenceKey = buildEvidenceKey(message.message_pk, messageFingerprint);
+	const evidenceResponse = createWorkflowEvidence(state, {
+		message_pk: message.message_pk,
+		snippet: proposal.snippet,
+		confidence: proposal.confidence,
+		idempotency_key: evidenceKey,
+	});
+	if (!evidenceResponse.ok) {
+		return {
+			review_candidate: true,
+			evidence_created: 0,
+			todo_created: 0,
+			evidence_writes: 0,
+			todo_writes: 0,
+		};
+	}
+
+	const evidence = evidenceResponse.data.evidence;
+	const persistedEvidenceKey = isNonEmptyString(evidence?.evidence_key)
+		? evidence.evidence_key.trim()
+		: "";
+	if (
+		!isNonEmptyString(persistedEvidenceKey) ||
+		persistedEvidenceKey !== evidenceKey
+	) {
+		return {
+			review_candidate: true,
+			evidence_created: evidenceResponse.data.created === true ? 1 : 0,
+			todo_created: 0,
+			evidence_writes: 1,
+			todo_writes: 0,
+		};
+	}
+	const deterministicTodoKeyFromEvidence = deriveDeterministicTodoKey(
+		proposal.todo_title,
+		persistedEvidenceKey,
+	);
+	const todoResponse = upsertWorkflowTodo(state, {
+		title: proposal.todo_title,
+		status: "open",
+		evidence_id: evidence.evidence_id,
+		evidence_key: persistedEvidenceKey,
+		todo_key: deterministicTodoKeyFromEvidence,
+		idempotency_key: deterministicTodoKeyFromEvidence,
+	});
+	if (!todoResponse.ok) {
+		return {
+			review_candidate: true,
+			evidence_created: evidenceResponse.data.created === true ? 1 : 0,
+			todo_created: 0,
+			evidence_writes: 1,
+			todo_writes: 0,
+		};
+	}
+	const persistedTodoKey = isNonEmptyString(todoResponse.data.todo?.todo_key)
+		? todoResponse.data.todo.todo_key.trim()
+		: "";
+	if (
+		!isNonEmptyString(persistedTodoKey) ||
+		persistedTodoKey !== deterministicTodoKeyFromEvidence
+	) {
+		return {
+			review_candidate: true,
+			evidence_created: evidenceResponse.data.created === true ? 1 : 0,
+			todo_created: 0,
+			evidence_writes: 1,
+			todo_writes: 1,
+		};
+	}
+
+	return {
+		review_candidate: false,
+		evidence_created: evidenceResponse.data.created === true ? 1 : 0,
+		todo_created: todoResponse.data.created === true ? 1 : 0,
+		evidence_writes: 1,
+		todo_writes: 1,
+	};
+};
 
 const generateCodeVerifier = () => toBase64Url(randomBytes(32));
 const generateCodeChallenge = (codeVerifier) =>
@@ -1654,6 +1945,9 @@ const getSystemHealth = (state) => {
 				consecutive_failures: autopilot.consecutive_failures,
 				last_tick_at: autopilot.last_tick_at,
 				metrics: autopilot.metrics,
+				codex_stage: autopilot.codex_stage,
+				...buildCodexStageObservability(autopilot),
+				persistence_authority: PHASE_1_PERSISTENCE_AUTHORITY,
 			},
 			last_log: recent.length > 0 ? recent[recent.length - 1] : null,
 			recent_logs: recent,
@@ -1740,9 +2034,7 @@ const createWorkflowEvidence = (state, input) => {
 		};
 	}
 
-	const evidenceId = isNonEmptyString(input.evidence_id)
-		? input.evidence_id.trim()
-		: `ev_${evidenceKey.slice(4, 16)}`;
+	const evidenceId = `ev_${evidenceKey.slice(4, 16)}`;
 	const evidence = {
 		evidence_id: evidenceId,
 		evidence_key: evidenceKey,
@@ -1803,12 +2095,10 @@ const upsertWorkflowTodo = (state, input) => {
 		: isNonEmptyString(input.todo_key)
 			? input.todo_key.trim()
 			: buildTodoKey(titleNormalized, evidenceKey, "mail-agent");
-	const todoId = isNonEmptyString(input.todo_id)
-		? input.todo_id
-		: `todo_${todoKey.slice(4, 16)}`;
+	const todoId = `todo_${todoKey.slice(4, 16)}`;
 	const now = nowIso();
 	const idx = state.workflow.todos.findIndex(
-		(item) => item.todo_id === todoId || item.todo_key === todoKey,
+		(item) => item.todo_key === todoKey,
 	);
 	let created = false;
 	let skippedDuplicate = false;
@@ -1823,6 +2113,7 @@ const upsertWorkflowTodo = (state, input) => {
 		}
 		state.workflow.todos[idx] = {
 			...prev,
+			todo_id: prev.todo_id,
 			todo_key: todoKey,
 			title: titleNormalized,
 			status,
@@ -1886,13 +2177,13 @@ const hasEvidenceForMessage = (state, messagePk) => {
 	);
 };
 
-const pickAutoSnippet = (message) => {
-	const candidate = isNonEmptyString(message.body_text)
-		? message.body_text
-		: isNonEmptyString(message.subject)
-			? message.subject
-			: "메일 본문 요약";
-	return normalizeSnippet(candidate);
+const selectAutopilotCandidates = (state, maxMessages) => {
+	const messages = listRecentMessagesForAutopilot(state, maxMessages);
+	return messages.filter(
+		(message) =>
+			isNonEmptyString(message.message_pk) &&
+			!hasEvidenceForMessage(state, message.message_pk),
+	);
 };
 
 const buildAutoTodoTitle = (message) => {
@@ -1903,6 +2194,407 @@ const buildAutoTodoTitle = (message) => {
 		? message.from.trim()
 		: "unknown";
 	return `[AUTO] ${subject} - 확인/처리 (${sender})`;
+};
+
+const CODEX_PROPOSAL_SCHEMA_VERSION = "codex_proposal.v1";
+
+const isRecord = (value) =>
+	value !== null && typeof value === "object" && !Array.isArray(value);
+
+const unknownKeys = (value, allowed) =>
+	Object.keys(value).filter((key) => !allowed.includes(key));
+
+const parseCodexProposalOutput = (raw) => {
+	let parsed = raw;
+
+	if (typeof raw === "string") {
+		const trimmed = raw.trim();
+		if (trimmed.length === 0) {
+			return {
+				ok: false,
+				error_code: "E_CODEX_OUTPUT_INVALID_JSON",
+				error_message: "codex 출력이 비어 있습니다.",
+			};
+		}
+
+		try {
+			parsed = JSON.parse(trimmed);
+		} catch {
+			return {
+				ok: false,
+				error_code: "E_CODEX_OUTPUT_INVALID_JSON",
+				error_message: "codex 출력은 단일 JSON 객체여야 합니다.",
+			};
+		}
+	}
+
+	if (!isRecord(parsed)) {
+		return {
+			ok: false,
+			error_code: "E_CODEX_OUTPUT_INVALID_TYPE",
+			error_message: "codex 출력 루트는 객체여야 합니다.",
+		};
+	}
+
+	const rootUnknown = unknownKeys(parsed, ["schema_version", "proposal"]);
+	if (rootUnknown.length > 0) {
+		return {
+			ok: false,
+			error_code: "E_CODEX_OUTPUT_UNKNOWN_FIELD",
+			error_message: `codex 출력 루트에 알 수 없는 필드가 있습니다: ${rootUnknown.join(", ")}`,
+		};
+	}
+
+	if (!Object.prototype.hasOwnProperty.call(parsed, "schema_version")) {
+		return {
+			ok: false,
+			error_code: "E_CODEX_OUTPUT_MISSING_FIELD",
+			error_message: "codex 출력에 schema_version 필드가 필요합니다.",
+		};
+	}
+
+	if (parsed.schema_version !== CODEX_PROPOSAL_SCHEMA_VERSION) {
+		return {
+			ok: false,
+			error_code: "E_CODEX_OUTPUT_SCHEMA_VERSION",
+			error_message: `지원되지 않는 schema_version 입니다: ${String(parsed.schema_version)}`,
+		};
+	}
+
+	if (!Object.prototype.hasOwnProperty.call(parsed, "proposal")) {
+		return {
+			ok: false,
+			error_code: "E_CODEX_OUTPUT_MISSING_FIELD",
+			error_message: "codex 출력에 proposal 필드가 필요합니다.",
+		};
+	}
+
+	if (!isRecord(parsed.proposal)) {
+		return {
+			ok: false,
+			error_code: "E_CODEX_OUTPUT_INVALID_TYPE",
+			error_message: "proposal 은 객체여야 합니다.",
+		};
+	}
+
+	const proposal = parsed.proposal;
+	const proposalUnknown = unknownKeys(proposal, [
+		"snippet",
+		"confidence",
+		"todo_title",
+	]);
+	if (proposalUnknown.length > 0) {
+		return {
+			ok: false,
+			error_code: "E_CODEX_OUTPUT_UNKNOWN_FIELD",
+			error_message: `proposal 에 알 수 없는 필드가 있습니다: ${proposalUnknown.join(", ")}`,
+		};
+	}
+
+	if (!Object.prototype.hasOwnProperty.call(proposal, "snippet")) {
+		return {
+			ok: false,
+			error_code: "E_CODEX_OUTPUT_MISSING_FIELD",
+			error_message: "proposal.snippet 필드가 필요합니다.",
+		};
+	}
+
+	if (!Object.prototype.hasOwnProperty.call(proposal, "confidence")) {
+		return {
+			ok: false,
+			error_code: "E_CODEX_OUTPUT_MISSING_FIELD",
+			error_message: "proposal.confidence 필드가 필요합니다.",
+		};
+	}
+
+	if (!Object.prototype.hasOwnProperty.call(proposal, "todo_title")) {
+		return {
+			ok: false,
+			error_code: "E_CODEX_OUTPUT_MISSING_FIELD",
+			error_message: "proposal.todo_title 필드가 필요합니다.",
+		};
+	}
+
+	const snippet = normalizeSnippet(proposal.snippet);
+	if (typeof proposal.snippet !== "string" || snippet.length === 0) {
+		return {
+			ok: false,
+			error_code: "E_CODEX_OUTPUT_INVALID_FIELD",
+			error_message: "proposal.snippet 은 비어있지 않은 문자열이어야 합니다.",
+		};
+	}
+
+	if (
+		typeof proposal.confidence !== "number" ||
+		!Number.isFinite(proposal.confidence) ||
+		proposal.confidence < 0 ||
+		proposal.confidence > 1
+	) {
+		return {
+			ok: false,
+			error_code: "E_CODEX_OUTPUT_INVALID_FIELD",
+			error_message: "proposal.confidence 는 0 이상 1 이하 숫자여야 합니다.",
+		};
+	}
+
+	if (
+		typeof proposal.todo_title !== "string" ||
+		proposal.todo_title.trim().length === 0
+	) {
+		return {
+			ok: false,
+			error_code: "E_CODEX_OUTPUT_INVALID_FIELD",
+			error_message:
+				"proposal.todo_title 은 비어있지 않은 문자열이어야 합니다.",
+		};
+	}
+
+	return {
+		ok: true,
+		value: {
+			snippet,
+			confidence: proposal.confidence,
+			todo_title: proposal.todo_title.trim(),
+		},
+	};
+};
+
+const buildDefaultCodexProposalOutput = (message, payload) =>
+	JSON.stringify({
+		schema_version: CODEX_PROPOSAL_SCHEMA_VERSION,
+		proposal: {
+			snippet: normalizeSnippet(payload.body_text),
+			confidence: AUTOPILOT_AUTO_MIN_CONFIDENCE,
+			todo_title: buildAutoTodoTitle(message),
+		},
+	});
+
+const resolveCodexProposalRawOutput = (message, payload) => {
+	if (
+		message &&
+		typeof message === "object" &&
+		Object.prototype.hasOwnProperty.call(message, "__codex_output_raw")
+	) {
+		return message.__codex_output_raw;
+	}
+
+	return buildDefaultCodexProposalOutput(message, payload);
+};
+
+const resolveCodexRetryPlan = (message) => {
+	if (message === null || typeof message !== "object") {
+		return null;
+	}
+	const rawPlan = message.__codex_retry_plan;
+	if (
+		rawPlan === null ||
+		typeof rawPlan !== "object" ||
+		Array.isArray(rawPlan)
+	) {
+		return null;
+	}
+	const kind =
+		typeof rawPlan.kind === "string" ? rawPlan.kind.trim().toLowerCase() : "";
+	if (!["timeout", "transient", "terminal"].includes(kind)) {
+		return null;
+	}
+	const failAttemptsRaw = Number(rawPlan.fail_attempts);
+	const failAttempts =
+		Number.isInteger(failAttemptsRaw) && failAttemptsRaw > 0
+			? failAttemptsRaw
+			: 1;
+	return {
+		kind,
+		fail_attempts: failAttempts,
+		message:
+			typeof rawPlan.message === "string" && rawPlan.message.trim().length > 0
+				? rawPlan.message.trim()
+				: null,
+	};
+};
+
+const resolveCodexAttemptFailure = (message, attempt) => {
+	const plan = resolveCodexRetryPlan(message);
+	if (plan === null || attempt > plan.fail_attempts) {
+		return null;
+	}
+	if (plan.kind === "timeout") {
+		return {
+			classification: "retriable",
+			message:
+				plan.message ??
+				`codex 분석이 ${AUTOPILOT_CODEX_ANALYZE_TIMEOUT_MS}ms 제한 시간을 초과했습니다.`,
+		};
+	}
+	if (plan.kind === "transient") {
+		return {
+			classification: "retriable",
+			message: plan.message ?? "codex 분석 일시 오류가 발생했습니다.",
+		};
+	}
+	return {
+		classification: "terminal",
+		message:
+			plan.message ?? "codex 분석에서 복구 불가능한 오류가 발생했습니다.",
+	};
+};
+
+const buildAutopilotCandidatePayload = (message) => {
+	const subject = isNonEmptyString(message.subject)
+		? message.subject.trim()
+		: "무제 메일";
+	const from = isNonEmptyString(message.from) ? message.from.trim() : "unknown";
+	const bodyText = normalizeFingerprintBody(
+		isNonEmptyString(message.body_text) ? message.body_text : subject,
+	).slice(0, 2000);
+	const internetMessageId = isNonEmptyString(message.internet_message_id)
+		? message.internet_message_id.trim().toLowerCase()
+		: "";
+	return {
+		message_pk: message.message_pk,
+		internet_message_id: internetMessageId,
+		received_at: message.received_at,
+		subject,
+		from,
+		body_text: bodyText,
+		has_attachments: Boolean(message.has_attachments),
+	};
+};
+
+const analyzeAutopilotCandidate = (message) => {
+	const payload = buildAutopilotCandidatePayload(message);
+	const maxAttempts = AUTOPILOT_CODEX_ANALYZE_MAX_RETRIES + 1;
+	let exhaustedRetriableMessage = null;
+	for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+		const attemptFailure = resolveCodexAttemptFailure(message, attempt);
+		if (attemptFailure !== null) {
+			if (attemptFailure.classification === "retriable") {
+				exhaustedRetriableMessage = attemptFailure.message;
+				if (attempt < maxAttempts) {
+					continue;
+				}
+				break;
+			}
+			return {
+				message,
+				payload,
+				proposal: null,
+				review_reason: "analysis_failed",
+				failure_class: "terminal",
+				failure_kind: "analysis_fail",
+				attempt_count: attempt,
+				failure_message: attemptFailure.message,
+			};
+		}
+
+		const codexOutput = resolveCodexProposalRawOutput(message, payload);
+		const parsed = parseCodexProposalOutput(codexOutput);
+		if (!parsed.ok) {
+			return {
+				message,
+				payload,
+				proposal: null,
+				review_reason: "codex_schema_invalid",
+				parse_error: {
+					code: parsed.error_code,
+					message: parsed.error_message,
+				},
+				failure_class: "terminal",
+				failure_kind: "schema_fail",
+				attempt_count: attempt,
+			};
+		}
+		return {
+			message,
+			payload,
+			proposal: {
+				message_pk: payload.message_pk,
+				subject: payload.subject,
+				from: payload.from,
+				received_at: payload.received_at,
+				snippet: parsed.value.snippet,
+				confidence: parsed.value.confidence,
+				todo_title: parsed.value.todo_title,
+				candidate_payload: payload,
+			},
+			review_reason: null,
+			attempt_count: attempt,
+		};
+	}
+
+	return {
+		message,
+		payload,
+		proposal: null,
+		review_reason: "codex_retriable_exhausted",
+		failure_class: "retriable",
+		failure_kind: "timeout",
+		attempt_count: maxAttempts,
+		failure_message: `${
+			exhaustedRetriableMessage ?? "codex 분석 재시도 한도를 초과했습니다."
+		} (attempts=${maxAttempts}/${maxAttempts})`,
+	};
+};
+
+const analyzeAutopilotCandidates = (state, candidates) =>
+	candidates
+		.map((message) => {
+			try {
+				return analyzeAutopilotCandidate(message);
+			} catch {
+				pushLog(
+					state,
+					"warn",
+					"codex_analyze",
+					`candidate analysis failed: ${message.message_pk ?? "unknown"}`,
+				);
+				return {
+					message,
+					payload: buildAutopilotCandidatePayload(message),
+					proposal: null,
+					review_reason: "analysis_failed",
+					failure_kind: "analysis_fail",
+				};
+			}
+		})
+		.map((result) => {
+			if (
+				result.review_reason === "codex_schema_invalid" &&
+				result.parse_error
+			) {
+				pushLog(
+					state,
+					"warn",
+					"codex_schema_invalid",
+					`${result.message.message_pk ?? "unknown"}: ${result.parse_error.code} ${result.parse_error.message}`,
+				);
+			}
+			return result;
+		});
+
+const buildAutopilotStageFailureMatrix = (
+	analyzedCandidates,
+	proposalCount,
+) => {
+	const retriableFailures = analyzedCandidates.filter(
+		(item) => item.failure_class === "retriable",
+	).length;
+	const terminalFailures = analyzedCandidates.filter(
+		(item) => item.failure_class === "terminal",
+	).length;
+	const totalFailures = retriableFailures + terminalFailures;
+	const retriableExhausted = retriableFailures > 0 && proposalCount === 0;
+	const thresholdBreached =
+		totalFailures >= AUTOPILOT_CODEX_STAGE_FAILURE_THRESHOLD;
+
+	return {
+		retriable_failures: retriableFailures,
+		terminal_failures: terminalFailures,
+		total_failures: totalFailures,
+		proposal_count: proposalCount,
+		retriable_exhausted: retriableExhausted,
+		threshold_breached: thresholdBreached,
+	};
 };
 
 const setAutopilotMode = (state, input) => {
@@ -1972,6 +2664,9 @@ const getAutopilotStatus = (state) => {
 			consecutive_failures: autopilot.consecutive_failures,
 			last_tick_at: autopilot.last_tick_at,
 			metrics: autopilot.metrics,
+			codex_stage: autopilot.codex_stage,
+			...buildCodexStageObservability(autopilot),
+			persistence_authority: PHASE_1_PERSISTENCE_AUTHORITY,
 		},
 	};
 };
@@ -1982,6 +2677,12 @@ const runAutopilotTick = async (state, config, input) => {
 		return errorResponse(
 			"E_POLICY_DENIED",
 			"manual 모드입니다. autopilot.set_mode 후 실행하세요.",
+		);
+	}
+	if (autopilot.status === "degraded") {
+		return errorResponse(
+			"E_POLICY_DENIED",
+			`autopilot 이 degraded 상태입니다. ${autopilot.last_error ?? "복구 후 resume 하세요."}`,
 		);
 	}
 	if (autopilot.paused || autopilot.status === "paused") {
@@ -2026,15 +2727,155 @@ const runAutopilotTick = async (state, config, input) => {
 	autopilot.status = "analyzing";
 	writeState(state);
 
-	const messages = listRecentMessagesForAutopilot(state, maxMessages);
-	const candidates = messages.filter(
-		(message) =>
-			isNonEmptyString(message.message_pk) &&
-			!hasEvidenceForMessage(state, message.message_pk),
+	const candidates = selectAutopilotCandidates(state, maxMessages);
+	const runCorrelation = candidates.map((message) => ({
+		run_id: runId,
+		correlation_id: `corr_${createHash("sha1")
+			.update(`${runId}:${message.message_pk}`)
+			.digest("hex")
+			.slice(0, 16)}`,
+		message_pk: message.message_pk,
+		candidate_stage: "selected",
+		analysis_stage: "review",
+		persistence_stage: "not_run",
+	}));
+	const runCorrelationByMessagePk = new Map(
+		runCorrelation.map((item) => [item.message_pk, item]),
 	);
+	incrementAutopilotMetric(state, "codex_stage_started", candidates.length);
+	for (const correlation of runCorrelation) {
+		pushLog(
+			state,
+			"info",
+			"autopilot_candidate_selected",
+			`${correlation.correlation_id} ${correlation.message_pk}`,
+		);
+	}
+
+	if (candidates.length > 0) {
+		const codexAuth = resolveCodexAuth(config);
+		if (!codexAuth.ok) {
+			autopilot.codex_stage.last_failure_reason = codexAuth.error.error_message;
+			updateCodexStageStatusFromMetrics(state);
+			setCodexStageRunCorrelation(state, runCorrelation);
+			markAutopilotFailure(state, codexAuth.error.error_message);
+			pushLog(state, "warn", "codex_auth", codexAuth.logMessage);
+			writeState(state);
+			return codexAuth.error;
+		}
+		if (codexAuth.enabled) {
+			pushLog(
+				state,
+				"info",
+				"codex_auth",
+				`resolved ${codexAuth.source} ${codexAuth.redacted}`,
+			);
+		}
+	}
+
+	const analyzedCandidates = analyzeAutopilotCandidates(state, candidates);
+	for (const analyzed of analyzedCandidates) {
+		const correlation = runCorrelationByMessagePk.get(
+			analyzed.message.message_pk,
+		);
+		if (analyzed.proposal !== null) {
+			incrementAutopilotMetric(state, "codex_stage_success", 1);
+			if (correlation) {
+				correlation.analysis_stage = "proposal";
+				pushLog(
+					state,
+					"info",
+					"autopilot_analysis",
+					`${correlation.correlation_id} proposal`,
+				);
+			}
+			continue;
+		}
+
+		incrementAutopilotMetric(state, "codex_stage_fail", 1);
+		if (analyzed.failure_kind === "timeout") {
+			incrementAutopilotMetric(state, "codex_stage_timeout", 1);
+		}
+		if (analyzed.failure_kind === "schema_fail") {
+			incrementAutopilotMetric(state, "codex_stage_schema_fail", 1);
+		}
+		if (isNonEmptyString(analyzed.failure_message)) {
+			autopilot.codex_stage.last_failure_reason = analyzed.failure_message;
+		} else if (isNonEmptyString(analyzed.parse_error?.message)) {
+			autopilot.codex_stage.last_failure_reason = analyzed.parse_error.message;
+		}
+		if (correlation) {
+			if (analyzed.review_reason === "codex_schema_invalid") {
+				correlation.analysis_stage = "codex_schema_invalid";
+			} else if (analyzed.review_reason === "codex_retriable_exhausted") {
+				correlation.analysis_stage = "codex_retriable_exhausted";
+			} else if (analyzed.review_reason === "analysis_failed") {
+				correlation.analysis_stage = "analysis_failed";
+			} else {
+				correlation.analysis_stage = "review";
+			}
+			pushLog(
+				state,
+				"warn",
+				"autopilot_analysis",
+				`${correlation.correlation_id} ${correlation.analysis_stage}`,
+			);
+		}
+	}
+	updateCodexStageStatusFromMetrics(state);
+	const analysisProposals = analyzedCandidates
+		.map((item) => item.proposal)
+		.filter((item) => item !== null);
+	const failureMatrix = buildAutopilotStageFailureMatrix(
+		analyzedCandidates,
+		analysisProposals.length,
+	);
+	if (failureMatrix.retriable_exhausted) {
+		const details = analyzedCandidates
+			.map((item) => item.failure_message)
+			.filter((item) => isNonEmptyString(item))
+			.join(" | ");
+		const failureMessage =
+			details.length > 0 ? details : "codex 분석 재시도 한도를 초과했습니다.";
+		autopilot.codex_stage.last_failure_reason = failureMessage;
+		setCodexStageRunCorrelation(state, runCorrelation);
+		markAutopilotFailure(state, failureMessage);
+		writeState(state);
+		return errorResponse(
+			"E_CODEX_ANALYZE_RETRY_EXHAUSTED",
+			failureMessage,
+			true,
+		);
+	}
+	if (autopilot.mode === "full_auto" && failureMatrix.threshold_breached) {
+		const failureMessage = `codex 분석 실패 임계치(${AUTOPILOT_CODEX_STAGE_FAILURE_THRESHOLD})를 초과했습니다. retriable=${failureMatrix.retriable_failures}, terminal=${failureMatrix.terminal_failures}, sync=+${syncResult.data.changes.added} ~${syncResult.data.changes.updated} -${syncResult.data.changes.deleted}`;
+		autopilot.codex_stage.last_failure_reason = failureMessage;
+		setCodexStageRunCorrelation(state, runCorrelation);
+		markAutopilotFailure(state, failureMessage);
+		writeState(state);
+		return errorResponse(
+			"E_CODEX_ANALYZE_RETRY_EXHAUSTED",
+			failureMessage,
+			failureMatrix.retriable_failures > 0,
+		);
+	}
 
 	if (autopilot.mode === "review_first") {
-		incrementAutopilotMetric(state, "review_candidates", candidates.length);
+		incrementAutopilotMetric(
+			state,
+			"review_candidates",
+			analysisProposals.length,
+		);
+		for (const correlation of runCorrelation) {
+			correlation.persistence_stage = "skipped_review_first";
+			pushLog(
+				state,
+				"info",
+				"autopilot_persistence",
+				`${correlation.correlation_id} skipped_review_first`,
+			);
+		}
+		setCodexStageRunCorrelation(state, runCorrelation);
 		incrementAutopilotMetric(state, "ticks_success", 1);
 		autopilot.consecutive_failures = 0;
 		autopilot.last_error = null;
@@ -2046,12 +2887,8 @@ const runAutopilotTick = async (state, config, input) => {
 				run_id: runId,
 				mode: autopilot.mode,
 				synced_changes: syncResult.data.changes,
-				review_candidates: candidates.map((message) => ({
-					message_pk: message.message_pk,
-					subject: message.subject,
-					from: message.from,
-					received_at: message.received_at,
-				})),
+				run_correlation: runCorrelation,
+				review_candidates: analysisProposals,
 			},
 		};
 	}
@@ -2059,56 +2896,38 @@ const runAutopilotTick = async (state, config, input) => {
 	autopilot.status = "persisting";
 	let evidenceCreated = 0;
 	let todoCreated = 0;
+	let evidenceWrites = 0;
+	let todoWrites = 0;
 	let attachmentSaved = 0;
 	let reviewCandidates = 0;
 	let attachmentBudgetLeft = maxAttachments;
 
-	for (const message of candidates) {
-		if (!isNonEmptyString(message.message_pk)) {
-			continue;
-		}
-		const snippet = pickAutoSnippet(message);
-		if (!isNonEmptyString(snippet)) {
-			reviewCandidates += 1;
-			continue;
-		}
-		const confidence = AUTOPILOT_AUTO_MIN_CONFIDENCE;
-		if (confidence < AUTOPILOT_REVIEW_MIN_CONFIDENCE) {
-			reviewCandidates += 1;
-			continue;
-		}
-
-		const evidenceKey = buildEvidenceKey(message.message_pk, snippet);
-		const evidenceResponse = createWorkflowEvidence(state, {
-			message_pk: message.message_pk,
-			snippet,
-			confidence,
-			idempotency_key: evidenceKey,
-		});
-		if (!evidenceResponse.ok) {
-			reviewCandidates += 1;
-			continue;
-		}
-		if (evidenceResponse.data.created === true) {
-			evidenceCreated += 1;
-		}
-
-		const evidence = evidenceResponse.data.evidence;
-		const title = buildAutoTodoTitle(message);
-		const todoKey = buildTodoKey(
-			title,
-			evidence.evidence_key ?? evidence.evidence_id,
+	for (const analyzed of analyzedCandidates) {
+		const persistResult = persistAnalyzedCandidateViaWorkflow(state, analyzed);
+		const correlation = runCorrelationByMessagePk.get(
+			analyzed.message.message_pk,
 		);
-		const todoResponse = upsertWorkflowTodo(state, {
-			title,
-			status: "open",
-			evidence_id: evidence.evidence_id,
-			evidence_key: evidence.evidence_key,
-			idempotency_key: todoKey,
-		});
-		if (todoResponse.ok && todoResponse.data.created === true) {
-			todoCreated += 1;
+		reviewCandidates += persistResult.review_candidate ? 1 : 0;
+		evidenceCreated += persistResult.evidence_created;
+		todoCreated += persistResult.todo_created;
+		evidenceWrites += persistResult.evidence_writes;
+		todoWrites += persistResult.todo_writes;
+		if (correlation) {
+			correlation.persistence_stage = persistResult.review_candidate
+				? "review_candidate"
+				: "persisted";
+			pushLog(
+				state,
+				persistResult.review_candidate ? "warn" : "info",
+				"autopilot_persistence",
+				`${correlation.correlation_id} ${correlation.persistence_stage}`,
+			);
 		}
+		if (persistResult.review_candidate) {
+			continue;
+		}
+
+		const message = analyzed.message;
 
 		if (
 			attachmentBudgetLeft > 0 &&
@@ -2147,8 +2966,13 @@ const runAutopilotTick = async (state, config, input) => {
 	incrementAutopilotMetric(state, "auto_attachment_saved", attachmentSaved);
 	incrementAutopilotMetric(state, "review_candidates", reviewCandidates);
 	incrementAutopilotMetric(state, "ticks_success", 1);
+	if (failureMatrix.total_failures === 0) {
+		autopilot.codex_stage.last_failure_reason = null;
+	}
 	autopilot.consecutive_failures = 0;
 	autopilot.last_error = null;
+	updateCodexStageStatusFromMetrics(state);
+	setCodexStageRunCorrelation(state, runCorrelation);
 	clearAutopilotRun(state);
 	writeState(state);
 	pushLog(
@@ -2166,8 +2990,11 @@ const runAutopilotTick = async (state, config, input) => {
 			synced_changes: syncResult.data.changes,
 			auto_evidence_created: evidenceCreated,
 			auto_todo_created: todoCreated,
+			auto_evidence_writes: evidenceWrites,
+			auto_todo_writes: todoWrites,
 			auto_attachment_saved: attachmentSaved,
 			review_candidates: reviewCandidates,
+			run_correlation: runCorrelation,
 		},
 	};
 };

@@ -81,6 +81,25 @@
 - Todo 생성/갱신: `workflow.upsert_todo` (title/status/evidence_id)
 - 워크플로 목록 확인: `workflow.list`
 
+## 4.8 Codex 자동화 롤아웃 게이트/롤백
+
+- 기본 롤아웃 순서: `review_first`(shadow) -> `full_auto`(승격)
+- 승격 전 필수 확인(`autopilot.status`):
+  - `codex_stage_metrics.started > 0`
+  - `codex_stage_metrics.fail = 0`
+  - `codex_stage_metrics.schema_fail = 0`
+  - `codex_stage_metrics.timeout = 0`
+  - `review_candidates`가 운영 허용치 이하(팀 운영 기준 문서에 정의)
+- 승격 명령: `autopilot.set_mode`에 `mode=full_auto` 적용 후 첫 `autopilot.tick` 결과에서 `auto_evidence_writes`/`auto_todo_writes`와 `workflow.list` 실제 건수가 일치하는지 확인
+
+### 장애 시 즉시 롤백 스위치
+
+1. 즉시 차단: `autopilot.pause`
+2. 자동쓰기 차단 유지: `autopilot.set_mode`를 `review_first` 또는 `manual`로 전환
+3. 상태 확인: `autopilot.status`에서 `status`, `paused`, `last_error`, `codex_last_failure_reason` 점검
+4. 데이터 무결성 확인: `workflow.list` 재조회로 장애 시점 이후 비정상 추가 write 여부 확인
+5. 복구 재개: 원인 제거 후 `autopilot.resume` -> `review_first`로 재검증 -> 기준 충족 시에만 `full_auto` 재승격
+
 ## 5. 자주 발생하는 문제와 대응
 
 - `E_AUTH_REQUIRED`

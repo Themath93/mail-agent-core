@@ -41,10 +41,29 @@ const createState = (): McpRuntimeState => ({
 			auto_todo_created: 0,
 			auto_attachment_saved: 0,
 			review_candidates: 0,
+			codex_stage_started: 0,
+			codex_stage_success: 0,
+			codex_stage_fail: 0,
+			codex_stage_timeout: 0,
+			codex_stage_schema_fail: 0,
+		},
+		codex_stage: {
+			started: 0,
+			success: 0,
+			fail: 0,
+			timeout: 0,
+			schema_fail: 0,
+			last_failure_reason: null,
+			last_run_correlation: [],
 		},
 	},
 	signed_in: false,
 	auth_token: null,
+	codex_auth: {
+		mode: "disabled",
+		api_key_env_var: "CODEX_API_KEY",
+		api_key_present: false,
+	},
 });
 
 const sampleMessage: MailStoreMessage = {

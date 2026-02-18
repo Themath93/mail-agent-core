@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { describe, expect, test } from "vitest";
 import {
+	CODEX_PROPOSAL_SCHEMA_VERSION,
 	MCP_TOOL_NAMES,
 	type MailStoreGetThreadInput,
 	type McpResponse,
@@ -12,6 +13,7 @@ import {
 	invokeMcpToolByName,
 	isOkResponse,
 	okResponse,
+	parseCodexProposalOutput,
 } from "../src/domain/mcp.js";
 
 const expectParseFailure = (response: McpResponse<unknown>) => {
@@ -65,6 +67,68 @@ describe("MCP 응답 타입", () => {
 	test("지원 도구 전체를 기준 검증한다", () => {
 		expect(Array.isArray(MCP_TOOL_NAMES)).toBe(true);
 		expect(MCP_TOOL_NAMES.length).toBe(18);
+	});
+
+	test("codex proposal parser는 schema v1 유효 payload를 수용한다", () => {
+		const parsed = parseCodexProposalOutput({
+			schema_version: CODEX_PROPOSAL_SCHEMA_VERSION,
+			proposal: {
+				snippet: "  후속 조치 필요  ",
+				confidence: 0.9,
+				todo_title: "  [AUTO] 후속 처리  ",
+			},
+		});
+
+		expect(parsed.ok).toBe(true);
+		if (parsed.ok) {
+			expect(parsed.value.snippet).toBe("후속 조치 필요");
+			expect(parsed.value.confidence).toBe(0.9);
+			expect(parsed.value.todo_title).toBe("[AUTO] 후속 처리");
+		}
+	});
+
+	test("codex proposal parser는 malformed JSON 문자열을 거부한다", () => {
+		const parsed = parseCodexProposalOutput("{ invalid_json ");
+
+		expect(parsed.ok).toBe(false);
+		if (!parsed.ok) {
+			expect(parsed.error.code).toBe("E_CODEX_OUTPUT_INVALID_JSON");
+			expect(parsed.error.message).toContain("JSON 객체");
+		}
+	});
+
+	test("codex proposal parser는 필수 필드 누락 payload를 거부한다", () => {
+		const parsed = parseCodexProposalOutput({
+			schema_version: CODEX_PROPOSAL_SCHEMA_VERSION,
+			proposal: {
+				snippet: "근거",
+				todo_title: "[AUTO] 누락 테스트",
+			},
+		});
+
+		expect(parsed.ok).toBe(false);
+		if (!parsed.ok) {
+			expect(parsed.error.code).toBe("E_CODEX_OUTPUT_MISSING_FIELD");
+			expect(parsed.error.message).toContain("proposal.confidence");
+		}
+	});
+
+	test("codex proposal parser는 unknown field payload를 거부한다", () => {
+		const parsed = parseCodexProposalOutput({
+			schema_version: CODEX_PROPOSAL_SCHEMA_VERSION,
+			proposal: {
+				snippet: "근거",
+				confidence: 0.9,
+				todo_title: "[AUTO] unknown field",
+				extra: "nope",
+			},
+		});
+
+		expect(parsed.ok).toBe(false);
+		if (!parsed.ok) {
+			expect(parsed.error.code).toBe("E_CODEX_OUTPUT_UNKNOWN_FIELD");
+			expect(parsed.error.message).toContain("extra");
+		}
 	});
 });
 
@@ -363,7 +427,145 @@ describe("MCP tools", () => {
 		}
 	});
 
-	test("autopilot.set_mode/review_first + tick은 review 후보를 만든다", () => {
+	test("autopilot.set_mode는 허용되지 않은 mode를 거부한다", () => {
+		const context = createToolContext();
+		const response = invokeMcpToolByName(
+			"autopilot.set_mode",
+			{ mode: "invalid_mode" },
+			context,
+		);
+
+		expect(response.ok).toBe(false);
+		if (!response.ok) {
+			expect(response.error_code).toBe("E_PARSE_FAILED");
+		}
+	});
+
+	test("autopilot.tick은 codex auth 누락 시 E_CODEX_AUTH_REQUIRED를 반환하고 Graph 로그인 상태를 유지한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
+
+		context.state.codex_auth.mode = "env";
+		context.state.codex_auth.api_key_env_var = "CODEX_API_KEY";
+		context.state.codex_auth.api_key_present = false;
+
+		const signedInBefore = context.state.signed_in;
+		const accountBefore = context.state.account;
+		const tokenBefore = context.state.auth_token?.access_token;
+
+		const response = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 5 },
+			context,
+		);
+
+		expect(response.ok).toBe(false);
+		if (!response.ok) {
+			expect(response.error_code).toBe("E_CODEX_AUTH_REQUIRED");
+		}
+		expect(context.state.workflow.evidences).toHaveLength(0);
+		expect(context.state.workflow.todos).toHaveLength(0);
+		expect(context.state.signed_in).toBe(signedInBefore);
+		expect(context.state.account).toEqual(accountBefore);
+		expect(context.state.auth_token?.access_token).toBe(tokenBefore);
+	});
+
+	test("autopilot.tick은 codex auth mode가 잘못되면 E_CODEX_AUTH_FAILED를 반환한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
+
+		context.state.codex_auth.mode = "envx" as unknown as "env";
+		context.state.codex_auth.api_key_present = true;
+
+		const response = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 5 },
+			context,
+		);
+
+		expect(response.ok).toBe(false);
+		if (!response.ok) {
+			expect(response.error_code).toBe("E_CODEX_AUTH_FAILED");
+		}
+	});
+
+	test("autopilot.tick은 codex auth가 준비되면 기존 full_auto 흐름을 계속 수행한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
+
+		context.state.codex_auth.mode = "env";
+		context.state.codex_auth.api_key_present = true;
+
+		const response = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 5 },
+			context,
+		);
+
+		expect(response.ok).toBe(true);
+		if (response.ok) {
+			expect(response.data.auto_evidence_created).toBeGreaterThanOrEqual(0);
+			expect(response.data.auto_todo_created).toBeGreaterThanOrEqual(0);
+		}
+	});
+
+	test("autopilot.tick은 mail_folder 누락 시 inbox 기본값을 사용한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+		invokeMcpTool("autopilot.set_mode", { mode: "review_first" }, context);
+
+		const response = invokeMcpTool("autopilot.tick", {}, context);
+
+		expect(response.ok).toBe(true);
+		if (response.ok) {
+			expect(response.data.run_id).toContain("run_");
+		}
+	});
+
+	test("autopilot.set_mode/review_first + tick은 codex 분석 제안만 반환하고 workflow를 쓰지 않는다", () => {
 		const context = createToolContext();
 		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
 		completeLogin(context);
@@ -391,11 +593,30 @@ describe("MCP tools", () => {
 		);
 		expect(tickResponse.ok).toBe(true);
 		if (tickResponse.ok) {
-			expect(tickResponse.data.review_candidates).toBeGreaterThanOrEqual(0);
+			expect(tickResponse.data.auto_evidence_created).toBe(0);
+			expect(tickResponse.data.auto_todo_created).toBe(0);
+			expect(tickResponse.data.analysis_proposals).toBeDefined();
+			expect(tickResponse.data.analysis_proposals?.length).toBeGreaterThan(0);
+			const firstProposal = tickResponse.data.analysis_proposals?.[0];
+			expect(firstProposal?.candidate_payload.message_pk).toBeDefined();
+			expect(firstProposal?.candidate_payload.internet_message_id).toContain(
+				"@",
+			);
+			expect(firstProposal?.candidate_payload.subject).toBeDefined();
+			expect(firstProposal?.candidate_payload.from).toBeDefined();
+			expect(firstProposal?.candidate_payload.body_text.length).toBeGreaterThan(
+				0,
+			);
+			expect(
+				firstProposal?.candidate_payload.has_attachments,
+			).not.toBeUndefined();
 		}
+
+		expect(context.state.workflow.evidences).toHaveLength(0);
+		expect(context.state.workflow.todos).toHaveLength(0);
 	});
 
-	test("autopilot.set_mode/full_auto + tick은 evidence/todo를 생성한다", () => {
+	test("autopilot.set_mode/full_auto + tick은 분석 결과를 workflow 경로로만 영속화한다", () => {
 		const context = createToolContext();
 		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
 		completeLogin(context);
@@ -410,6 +631,8 @@ describe("MCP tools", () => {
 		);
 
 		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
+		context.state.codex_auth.mode = "env";
+		context.state.codex_auth.api_key_present = true;
 		const tickResponse = invokeMcpTool(
 			"autopilot.tick",
 			{ mail_folder: "inbox", max_messages_per_tick: 5 },
@@ -419,6 +642,469 @@ describe("MCP tools", () => {
 		if (tickResponse.ok) {
 			expect(tickResponse.data.auto_evidence_created).toBeGreaterThanOrEqual(0);
 			expect(tickResponse.data.auto_todo_created).toBeGreaterThanOrEqual(0);
+			expect(tickResponse.data.auto_evidence_writes).toBeGreaterThanOrEqual(0);
+			expect(tickResponse.data.auto_todo_writes).toBeGreaterThanOrEqual(0);
+			expect(tickResponse.data.analysis_proposals).toBeUndefined();
+			expect(context.state.workflow.evidences.length).toBe(
+				tickResponse.data.auto_evidence_created,
+			);
+			expect(context.state.workflow.todos.length).toBe(
+				tickResponse.data.auto_todo_created,
+			);
+			expect(
+				context.state.workflow.evidences.every(
+					(item) =>
+						typeof item.evidence_key === "string" &&
+						item.evidence_key.length > 0,
+				),
+			).toBe(true);
+			expect(
+				context.state.workflow.todos.every(
+					(item) =>
+						typeof item.todo_key === "string" && item.todo_key.length > 0,
+				),
+			).toBe(true);
+		}
+	});
+
+	test("autopilot.full_auto tick은 검증된 proposal 개수와 workflow write 개수를 일치시키고 evidence_key에서 todo_key를 결정한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
+		context.state.codex_auth.mode = "env";
+		context.state.codex_auth.api_key_present = true;
+
+		for (const [messagePk, message] of context.state.messages.entries()) {
+			context.state.messages.set(messagePk, {
+				...message,
+				__codex_output_raw: {
+					schema_version: CODEX_PROPOSAL_SCHEMA_VERSION,
+					proposal: {
+						snippet: `${message.message_pk} 근거`,
+						confidence: 0.95,
+						todo_title: `[AUTO] ${message.message_pk} 후속 작업`,
+					},
+				},
+			} as unknown as typeof message);
+		}
+
+		const tick = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 2 },
+			context,
+		);
+		expect(tick.ok).toBe(true);
+		if (!tick.ok) {
+			throw new Error(`tick 실패: ${tick.error_code} ${tick.error_message}`);
+		}
+		expect(tick.data.auto_evidence_created).toBeGreaterThan(0);
+		expect(tick.data.auto_todo_created).toBeGreaterThan(0);
+		expect(tick.data.auto_evidence_writes).toBe(
+			tick.data.auto_evidence_created,
+		);
+		expect(tick.data.auto_todo_writes).toBe(tick.data.auto_todo_created);
+		expect(tick.data.auto_todo_writes).toBe(tick.data.auto_evidence_writes);
+		expect(tick.data.review_candidates).toBe(0);
+		expect(context.state.workflow.evidences).toHaveLength(
+			tick.data.auto_evidence_writes,
+		);
+		expect(context.state.workflow.todos).toHaveLength(
+			tick.data.auto_todo_writes,
+		);
+
+		for (const todo of context.state.workflow.todos) {
+			const evidence = context.state.workflow.evidences.find(
+				(item) => item.evidence_id === todo.evidence_id,
+			);
+			expect(evidence).toBeDefined();
+			const expectedTodoKey = `tdk_${createHash("sha1")
+				.update(
+					`${todo.title.trim().toLowerCase()}:${evidence?.evidence_key ?? "none"}:mail-agent`,
+				)
+				.digest("hex")
+				.slice(0, 20)}`;
+			expect(todo.todo_key).toBe(expectedTodoKey);
+		}
+	});
+
+	test("autopilot.tick은 결정적 fingerprint 키를 사용하고 동일 payload replay에 추가 기록을 만들지 않는다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
+
+		const first = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 5 },
+			context,
+		);
+		expect(first.ok).toBe(true);
+		if (!first.ok) {
+			throw new Error("첫 tick 실패");
+		}
+
+		const evidencesAfterFirst = [...context.state.workflow.evidences];
+		const todosAfterFirst = [...context.state.workflow.todos];
+		expect(evidencesAfterFirst.length).toBeGreaterThan(0);
+		expect(todosAfterFirst.length).toBeGreaterThan(0);
+
+		const firstEvidence = evidencesAfterFirst[0];
+		const sourceMessage = context.state.messages.get(firstEvidence.source.id);
+		if (!sourceMessage) {
+			throw new Error("근거 source 메시지를 찾을 수 없습니다.");
+		}
+		const normalizedBody = (
+			sourceMessage.body_text ||
+			sourceMessage.subject ||
+			""
+		)
+			.replace(/\s+/g, " ")
+			.trim();
+		const fingerprint = [
+			sourceMessage.message_pk,
+			sourceMessage.internet_message_id.trim().toLowerCase(),
+			sourceMessage.received_at,
+			normalizedBody,
+			"v1",
+		].join(":");
+		const expectedEvidenceKey = `evk_${createHash("sha1")
+			.update(
+				`${sourceMessage.message_pk}:${fingerprint.replace(/\s+/g, " ").trim().slice(0, 240)}:outlook_quote`,
+			)
+			.digest("hex")
+			.slice(0, 20)}`;
+		expect(firstEvidence.evidence_key).toBe(expectedEvidenceKey);
+
+		const expectedTodoTitle = `[AUTO] ${sourceMessage.subject || "무제 메일"}`;
+		const expectedTodoKey = `tdk_${createHash("sha1")
+			.update(
+				`${expectedTodoTitle.trim().toLowerCase()}:${expectedEvidenceKey}:mail-agent`,
+			)
+			.digest("hex")
+			.slice(0, 20)}`;
+		const linkedTodo = todosAfterFirst.find(
+			(todo) => todo.evidence_id === firstEvidence.evidence_id,
+		);
+		expect(linkedTodo?.todo_key).toBe(expectedTodoKey);
+
+		const second = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 5 },
+			context,
+		);
+		expect(second.ok).toBe(true);
+
+		const linkedEvidenceCountBefore = evidencesAfterFirst.filter(
+			(item) => item.source.id === sourceMessage.message_pk,
+		).length;
+		const linkedEvidenceCountAfter = context.state.workflow.evidences.filter(
+			(item) => item.source.id === sourceMessage.message_pk,
+		).length;
+		expect(linkedEvidenceCountAfter).toBe(linkedEvidenceCountBefore);
+
+		const linkedTodoCountBefore = todosAfterFirst.filter(
+			(item) => item.evidence_id === firstEvidence.evidence_id,
+		).length;
+		const linkedTodoCountAfter = context.state.workflow.todos.filter(
+			(item) => item.evidence_id === firstEvidence.evidence_id,
+		).length;
+		expect(linkedTodoCountAfter).toBe(linkedTodoCountBefore);
+	});
+
+	test("autopilot.status는 phase 1 persistence authority를 명시한다", () => {
+		const context = createToolContext();
+		const status = invokeMcpTool("autopilot.status", {}, context);
+		expect(status.ok).toBe(true);
+		if (!status.ok) {
+			throw new Error("status 조회 실패");
+		}
+		expect(status.data.persistence_authority).toEqual({
+			phase: "phase_1",
+			source_of_truth: "native-host/state.json",
+			sqlite_mirror: "deferred",
+			sqlite_mirror_enabled: false,
+		});
+	});
+
+	test("autopilot.status는 codex stage 카운터와 마지막 실패 사유를 노출한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 2,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
+		context.state.codex_auth.mode = "env";
+		context.state.codex_auth.api_key_present = true;
+
+		const messagePks = Array.from(context.state.messages.keys()).slice(0, 2);
+		const first = context.state.messages.get(messagePks[0] ?? "");
+		const second = context.state.messages.get(messagePks[1] ?? "");
+		if (!first || !second) {
+			throw new Error("테스트용 메시지 준비 실패");
+		}
+		context.state.messages.set(first.message_pk, {
+			...first,
+			__codex_output_raw: "{ bad_json",
+		} as unknown as typeof first);
+		context.state.messages.set(second.message_pk, {
+			...second,
+			__codex_output_raw: {
+				schema_version: CODEX_PROPOSAL_SCHEMA_VERSION,
+				proposal: {
+					snippet: "정상 제안",
+					confidence: 0.95,
+					todo_title: "[AUTO] 정상 제안",
+				},
+			},
+		} as unknown as typeof second);
+
+		const tick = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 2 },
+			context,
+		);
+		expect(tick.ok).toBe(true);
+		if (!tick.ok) {
+			throw new Error("tick 실패");
+		}
+		expect(tick.data.run_correlation.length).toBeGreaterThanOrEqual(2);
+		expect(
+			tick.data.run_correlation.some(
+				(item) => item.analysis_stage === "codex_schema_invalid",
+			),
+		).toBe(true);
+		expect(
+			tick.data.run_correlation.some(
+				(item) => item.persistence_stage === "persisted",
+			),
+		).toBe(true);
+
+		const status = invokeMcpTool("autopilot.status", {}, context);
+		expect(status.ok).toBe(true);
+		if (!status.ok) {
+			throw new Error("status 실패");
+		}
+		expect(status.data.metrics.codex_stage_started).toBeGreaterThanOrEqual(2);
+		expect(status.data.metrics.codex_stage_success).toBeGreaterThanOrEqual(1);
+		expect(status.data.metrics.codex_stage_fail).toBeGreaterThanOrEqual(1);
+		expect(status.data.metrics.codex_stage_schema_fail).toBeGreaterThanOrEqual(
+			1,
+		);
+		expect(status.data.metrics.codex_stage_timeout).toBe(0);
+		expect(status.data.codex_stage.last_failure_reason).toContain("codex 출력");
+		expect(status.data.codex_stage.last_run_correlation.length).toBeGreaterThan(
+			0,
+		);
+	});
+
+	test("autopilot.tick은 codex timeout 실패를 correlation과 counter에 반영한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 2,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
+		context.state.codex_auth.mode = "env";
+		context.state.codex_auth.api_key_present = true;
+
+		const messagePks = Array.from(context.state.messages.keys()).slice(0, 2);
+		const first = context.state.messages.get(messagePks[0] ?? "");
+		const second = context.state.messages.get(messagePks[1] ?? "");
+		if (!first || !second) {
+			throw new Error("테스트용 메시지 준비 실패");
+		}
+		context.state.messages.set(first.message_pk, {
+			...first,
+			__codex_retry_plan: {
+				kind: "timeout",
+				fail_attempts: 10,
+				message: "timeout for status",
+			},
+		} as unknown as typeof first);
+		context.state.messages.set(second.message_pk, {
+			...second,
+			__codex_output_raw: {
+				schema_version: CODEX_PROPOSAL_SCHEMA_VERSION,
+				proposal: {
+					snippet: "정상 제안",
+					confidence: 0.95,
+					todo_title: "[AUTO] 정상 제안",
+				},
+			},
+		} as unknown as typeof second);
+
+		const tick = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 2 },
+			context,
+		);
+		expect(tick.ok).toBe(true);
+		if (!tick.ok) {
+			throw new Error("tick 실패");
+		}
+		expect(
+			tick.data.run_correlation.some(
+				(item) => item.analysis_stage === "codex_retriable_exhausted",
+			),
+		).toBe(true);
+
+		const status = invokeMcpTool("autopilot.status", {}, context);
+		expect(status.ok).toBe(true);
+		if (!status.ok) {
+			throw new Error("status 실패");
+		}
+		expect(status.data.metrics.codex_stage_timeout).toBeGreaterThanOrEqual(1);
+		expect(status.data.metrics.codex_stage_fail).toBeGreaterThanOrEqual(1);
+		expect(status.data.codex_stage.last_failure_reason).toContain(
+			"timeout for status",
+		);
+	});
+
+	test("autopilot.status는 codex stage observability 요약 필드를 노출한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 2,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
+		context.state.codex_auth.mode = "env";
+		context.state.codex_auth.api_key_present = true;
+
+		const firstMessagePk = Array.from(context.state.messages.keys())[0];
+		const firstMessage = firstMessagePk
+			? context.state.messages.get(firstMessagePk)
+			: null;
+		if (!firstMessagePk || !firstMessage) {
+			throw new Error("테스트용 메시지 준비 실패");
+		}
+		context.state.messages.set(firstMessagePk, {
+			...firstMessage,
+			__codex_output_raw: "{ bad_json",
+		} as unknown as typeof firstMessage);
+
+		const tick = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 1 },
+			context,
+		);
+		expect(tick.ok).toBe(true);
+		if (!tick.ok) {
+			throw new Error("tick 실패");
+		}
+
+		const status = invokeMcpTool("autopilot.status", {}, context);
+		expect(status.ok).toBe(true);
+		if (!status.ok) {
+			throw new Error("status 실패");
+		}
+		expect(status.data.codex_stage_metrics).toBeDefined();
+		expect(status.data.codex_stage_metrics?.started).toBeGreaterThanOrEqual(1);
+		expect(status.data.codex_stage_metrics?.fail).toBeGreaterThanOrEqual(1);
+		expect(status.data.codex_stage_metrics?.schema_fail).toBeGreaterThanOrEqual(
+			1,
+		);
+		expect(status.data.codex_last_failure_reason).toContain("codex 출력");
+	});
+
+	test("autopilot.tick run_correlation은 candidate/analysis/persistence를 같은 correlation_id로 연결한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 2,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
+		context.state.codex_auth.mode = "env";
+		context.state.codex_auth.api_key_present = true;
+
+		const messagePks = Array.from(context.state.messages.keys()).slice(0, 2);
+		for (const [index, messagePk] of messagePks.entries()) {
+			const message = context.state.messages.get(messagePk);
+			if (!message) {
+				continue;
+			}
+			context.state.messages.set(messagePk, {
+				...message,
+				__codex_output_raw:
+					index === 0
+						? {
+								schema_version: CODEX_PROPOSAL_SCHEMA_VERSION,
+								proposal: {
+									snippet: "정상 제안",
+									confidence: 0.95,
+									todo_title: "[AUTO] 정상 제안",
+								},
+							}
+						: "{ bad_json",
+			} as unknown as typeof message);
+		}
+
+		const tick = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 2 },
+			context,
+		);
+		expect(tick.ok).toBe(true);
+		if (!tick.ok) {
+			throw new Error("tick 실패");
+		}
+		expect(tick.data.run_correlation.length).toBeGreaterThanOrEqual(2);
+		for (const item of tick.data.run_correlation) {
+			expect(item.run_id).toBe(tick.data.run_id);
+			expect(item.correlation_id).toMatch(/^corr_[0-9a-f]{16}$/);
+			expect(item.candidate_stage).toBe("selected");
+			expect(item.analysis_stage).toMatch(
+				/proposal|review|codex_schema_invalid|codex_retriable_exhausted|analysis_failed/,
+			);
+			expect(item.persistence_stage).toMatch(
+				/persisted|review_candidate|not_run|skipped_review_first/,
+			);
 		}
 	});
 
@@ -476,6 +1162,37 @@ describe("MCP tools", () => {
 		}
 	});
 
+	test("autopilot.tick 동기화 실패 누적 시 degraded 전환을 적용한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
+
+		for (let attempt = 1; attempt <= 3; attempt += 1) {
+			for (const [messagePk, message] of context.state.messages.entries()) {
+				context.state.messages.set(messagePk, {
+					...message,
+					__codex_retry_plan: {
+						kind: "timeout",
+						fail_attempts: 10,
+						message: "forced timeout",
+					},
+				} as unknown as typeof message);
+			}
+
+			const tick = invokeMcpTool(
+				"autopilot.tick",
+				{ mail_folder: "inbox", max_messages_per_tick: 0 },
+				context,
+			);
+			expect(tick.ok).toBe(false);
+			if (!tick.ok) {
+				expect(tick.error_code).toBe("E_AUTH_REQUIRED");
+			}
+		}
+
+		expect(context.state.autopilot.status).toBe("degraded");
+		expect(context.state.autopilot.paused).toBe(true);
+	});
+
 	test("autopilot.full_auto tick은 빈 snippet 및 evidence 생성 실패를 review 후보로 누적한다", () => {
 		const context = createToolContext();
 		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
@@ -527,6 +1244,681 @@ describe("MCP tools", () => {
 		}
 	});
 
+	test("autopilot.full_auto tick은 codex schema parse 실패 시 write 없이 review 후보로 라우팅한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
+
+		for (const [messagePk, message] of context.state.messages.entries()) {
+			context.state.messages.set(messagePk, {
+				...message,
+				__codex_output_raw: "{ bad_json",
+			} as unknown as typeof message);
+		}
+
+		const tick = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 1 },
+			context,
+		);
+
+		expect(tick.ok).toBe(true);
+		if (!tick.ok) {
+			throw new Error("tick 실패");
+		}
+		expect(tick.data.auto_evidence_created).toBe(0);
+		expect(tick.data.auto_todo_created).toBe(0);
+		expect(tick.data.review_candidates).toBeGreaterThan(0);
+		expect(context.state.workflow.evidences).toHaveLength(0);
+		expect(context.state.workflow.todos).toHaveLength(0);
+	});
+
+	test("autopilot.full_auto tick은 codex timeout 재시도를 한도 내에서 수행한 뒤 성공한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
+
+		const firstMessagePk = Array.from(
+			context.state.messages.keys(),
+		)[0] as string;
+		const firstMessage = context.state.messages.get(firstMessagePk);
+		expect(firstMessagePk).toBeDefined();
+		expect(firstMessage).toBeDefined();
+		context.state.messages.set(firstMessagePk, {
+			...(firstMessage as NonNullable<typeof firstMessage>),
+			__codex_retry_plan: {
+				kind: "timeout",
+				fail_attempts: 2,
+				message: "codex timeout once",
+			},
+		} as unknown as NonNullable<typeof firstMessage>);
+
+		const tick = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 1 },
+			context,
+		);
+
+		expect(tick.ok).toBe(true);
+		if (!tick.ok) {
+			throw new Error("tick 실패");
+		}
+		expect(tick.data.auto_evidence_created).toBeGreaterThanOrEqual(1);
+		expect(context.state.autopilot.consecutive_failures).toBe(0);
+	});
+
+	test("autopilot.full_auto tick은 codex transient 재시도 후 recovery 시 write를 수행한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
+		context.state.codex_auth.mode = "env";
+		context.state.codex_auth.api_key_present = true;
+
+		const firstMessagePk = Array.from(
+			context.state.messages.keys(),
+		)[0] as string;
+		const firstMessage = context.state.messages.get(firstMessagePk);
+		expect(firstMessagePk).toBeDefined();
+		expect(firstMessage).toBeDefined();
+		context.state.messages.set(firstMessagePk, {
+			...(firstMessage as NonNullable<typeof firstMessage>),
+			__codex_retry_plan: {
+				kind: "transient",
+				fail_attempts: 2,
+				message: "codex transient once",
+			},
+		} as unknown as NonNullable<typeof firstMessage>);
+
+		const tick = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 1 },
+			context,
+		) as {
+			ok: true;
+			data: { auto_evidence_created: number; auto_todo_created: number };
+		};
+
+		expect(tick.ok).toBe(true);
+		expect(tick.data.auto_evidence_created).toBeGreaterThanOrEqual(1);
+		expect(tick.data.auto_todo_created).toBeGreaterThanOrEqual(1);
+		expect(context.state.autopilot.consecutive_failures).toBe(0);
+	});
+
+	test("autopilot.full_auto tick은 codex timeout 재시도 최대 시도 횟수를 결정적으로 고정한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
+		context.state.codex_auth.mode = "env";
+		context.state.codex_auth.api_key_present = true;
+
+		const firstMessagePk = Array.from(
+			context.state.messages.keys(),
+		)[0] as string;
+		const firstMessage = context.state.messages.get(firstMessagePk);
+		expect(firstMessagePk).toBeDefined();
+		expect(firstMessage).toBeDefined();
+		context.state.messages.set(firstMessagePk, {
+			...(firstMessage as NonNullable<typeof firstMessage>),
+			__codex_retry_plan: {
+				kind: "timeout",
+				fail_attempts: 99,
+				message: "forced deterministic timeout",
+			},
+		} as unknown as NonNullable<typeof firstMessage>);
+
+		const tick = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 1 },
+			context,
+		);
+
+		expect(tick.ok).toBe(false);
+		const tickError = tick as {
+			ok: false;
+			error_code: string;
+			error_message: string;
+		};
+		expect(tickError.error_code).toBe("E_CODEX_ANALYZE_RETRY_EXHAUSTED");
+		expect(tickError.error_message).toContain("attempts=3/3");
+		expect(context.state.workflow.evidences).toHaveLength(0);
+		expect(context.state.workflow.todos).toHaveLength(0);
+	});
+
+	test("autopilot.full_auto tick은 stage 실패 임계치 초과 시 degraded 전환과 write 차단을 적용하고 sync 진단을 보존한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 2,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
+		context.state.codex_auth.mode = "env";
+		context.state.codex_auth.api_key_present = true;
+		context.state.autopilot.consecutive_failures = 2;
+
+		for (const messagePk of Array.from(context.state.messages.keys()).slice(
+			0,
+			2,
+		)) {
+			const message = context.state.messages.get(messagePk);
+			if (!message) {
+				continue;
+			}
+			context.state.messages.set(messagePk, {
+				...message,
+				__codex_retry_plan: {
+					kind: "timeout",
+					fail_attempts: 10,
+					message: `threshold timeout ${messagePk}`,
+				},
+			} as unknown as typeof message);
+		}
+
+		const tick = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 3 },
+			context,
+		);
+
+		expect(tick.ok).toBe(false);
+		const tickError = tick as {
+			ok: false;
+			error_code: string;
+			error_message: string;
+		};
+		expect(tickError.error_code).toBe("E_CODEX_ANALYZE_RETRY_EXHAUSTED");
+		expect(tickError.error_message).toContain("retriable=2");
+		expect(tickError.error_message).toContain("sync=+");
+		expect(context.state.autopilot.status).toBe("degraded");
+		expect(context.state.autopilot.paused).toBe(true);
+		expect(context.state.autopilot.last_error).toContain("sync=+");
+		expect(context.state.workflow.evidences).toHaveLength(0);
+		expect(context.state.workflow.todos).toHaveLength(0);
+	});
+
+	test("autopilot.full_auto tick은 codex terminal 실패를 review로 격리하고 write를 만들지 않는다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
+		context.state.codex_auth.mode = "env";
+		context.state.codex_auth.api_key_present = true;
+
+		const firstMessagePk = Array.from(
+			context.state.messages.keys(),
+		)[0] as string;
+		const firstMessage = context.state.messages.get(firstMessagePk);
+		expect(firstMessagePk).toBeDefined();
+		expect(firstMessage).toBeDefined();
+		for (const messagePk of Array.from(context.state.messages.keys())) {
+			if (messagePk !== firstMessagePk) {
+				context.state.messages.delete(messagePk);
+			}
+		}
+		context.state.threadMessages.set("inbox", [firstMessagePk]);
+		context.state.messages.set(firstMessagePk, {
+			...(firstMessage as NonNullable<typeof firstMessage>),
+			__codex_retry_plan: {
+				kind: "terminal",
+				fail_attempts: 1,
+				message: "forced terminal",
+			},
+		} as unknown as NonNullable<typeof firstMessage>);
+
+		const tick = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 1 },
+			context,
+		);
+		expect(tick.ok).toBe(true);
+		if (!tick.ok) {
+			throw new Error("tick 실패");
+		}
+		expect(tick.data.auto_evidence_writes).toBe(0);
+		expect(tick.data.auto_todo_writes).toBe(0);
+		expect(tick.data.review_candidates).toBeGreaterThan(0);
+		expect(context.state.workflow.evidences).toHaveLength(0);
+		expect(context.state.workflow.todos).toHaveLength(0);
+	});
+
+	test("autopilot.tick은 codex retriable 실패 반복 시 degraded 전환 후 진단을 유지한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
+
+		for (let attempt = 1; attempt <= 3; attempt += 1) {
+			for (const [messagePk, message] of context.state.messages.entries()) {
+				context.state.messages.set(messagePk, {
+					...message,
+					__codex_retry_plan: {
+						kind: "timeout",
+						fail_attempts: 10,
+						message: "forced timeout",
+					},
+				} as unknown as typeof message);
+			}
+
+			const tick = invokeMcpTool(
+				"autopilot.tick",
+				{ mail_folder: "inbox", max_messages_per_tick: 1 },
+				context,
+			);
+			expect(tick.ok).toBe(false);
+			const tickError = tick as {
+				ok: false;
+				error_code: string;
+				retryable: boolean;
+			};
+			expect(tickError.error_code).toBe("E_CODEX_ANALYZE_RETRY_EXHAUSTED");
+			expect(tickError.retryable).toBe(true);
+		}
+
+		expect(context.state.autopilot.status).toBe("degraded");
+		expect(context.state.autopilot.paused).toBe(true);
+		expect(context.state.autopilot.last_error).toContain("forced timeout");
+		expect(context.state.workflow.evidences).toHaveLength(0);
+		expect(context.state.workflow.todos).toHaveLength(0);
+
+		const blocked = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 1 },
+			context,
+		);
+		expect(blocked.ok).toBe(false);
+		const blockedError = blocked as {
+			ok: false;
+			error_code: string;
+			error_message: string;
+		};
+		expect(blockedError.error_code).toBe("E_POLICY_DENIED");
+		expect(blockedError.error_message).toContain("degraded");
+		expect(blockedError.error_message).toContain("forced timeout");
+		expect(context.state.workflow.evidences).toHaveLength(0);
+		expect(context.state.workflow.todos).toHaveLength(0);
+	});
+
+	test("autopilot.full_auto tick은 terminal 실패 임계치 초과 시 retryable=false 에러로 중단한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+		invokeMcpTool(
+			"graph_mail_sync.delta_sync",
+			{ mail_folder: "inbox" },
+			context,
+		);
+		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
+		context.state.codex_auth.mode = "env";
+		context.state.codex_auth.api_key_present = true;
+
+		for (const [messagePk, message] of context.state.messages.entries()) {
+			context.state.messages.set(messagePk, {
+				...message,
+				__codex_retry_plan: {
+					kind: "terminal",
+					fail_attempts: 1,
+					message: "forced terminal threshold",
+				},
+			} as unknown as typeof message);
+		}
+
+		const tick = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 2 },
+			context,
+		);
+		expect(tick.ok).toBe(false);
+		const tickError = tick as {
+			ok: false;
+			error_code: string;
+			retryable: boolean;
+			error_message: string;
+		};
+		expect(tickError.error_code).toBe("E_CODEX_ANALYZE_RETRY_EXHAUSTED");
+		expect(tickError.retryable).toBe(false);
+		expect(tickError.error_message).toContain("임계치");
+		expect(context.state.autopilot.status).toBe("retrying");
+		expect(context.state.autopilot.paused).toBe(false);
+	});
+
+	test("autopilot.full_auto tick은 저신뢰 codex proposal을 review로만 라우팅한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
+
+		for (const [messagePk, message] of context.state.messages.entries()) {
+			context.state.messages.set(messagePk, {
+				...message,
+				__codex_output_raw: {
+					schema_version: CODEX_PROPOSAL_SCHEMA_VERSION,
+					proposal: {
+						snippet: "저신뢰 제안",
+						confidence: 0.5,
+						todo_title: "[AUTO] 저신뢰 테스트",
+					},
+				},
+			} as unknown as typeof message);
+		}
+
+		const tick = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 1 },
+			context,
+		);
+
+		expect(tick.ok).toBe(true);
+		if (!tick.ok) {
+			throw new Error("tick 실패");
+		}
+		expect(tick.data.auto_evidence_created).toBe(0);
+		expect(tick.data.auto_todo_created).toBe(0);
+		expect(tick.data.review_candidates).toBeGreaterThan(0);
+		expect(context.state.workflow.evidences).toHaveLength(0);
+		expect(context.state.workflow.todos).toHaveLength(0);
+	});
+
+	test("autopilot.full_auto tick은 valid/invalid proposal 혼합 시 write/review 카운트를 분리 집계한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
+		context.state.codex_auth.mode = "env";
+		context.state.codex_auth.api_key_present = true;
+
+		const firstMessagePk = Array.from(context.state.messages.keys())[0];
+		if (!firstMessagePk) {
+			throw new Error("메시지 준비 실패");
+		}
+		const firstMessage = context.state.messages.get(firstMessagePk);
+		if (!firstMessage) {
+			throw new Error("첫 메시지 조회 실패");
+		}
+		for (const messagePk of Array.from(context.state.messages.keys())) {
+			if (messagePk !== firstMessagePk) {
+				context.state.messages.delete(messagePk);
+			}
+		}
+		context.state.threadMessages.set("inbox", [firstMessagePk]);
+		context.state.messages.set(firstMessagePk, {
+			...firstMessage,
+			__codex_output_raw: "{ bad_json",
+		} as unknown as typeof firstMessage);
+
+		const tick = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 2 },
+			context,
+		);
+
+		expect(tick.ok).toBe(true);
+		if (!tick.ok) {
+			throw new Error("tick 실패");
+		}
+		expect(tick.data.auto_evidence_writes).toBeGreaterThanOrEqual(1);
+		expect(tick.data.auto_todo_writes).toBeGreaterThanOrEqual(1);
+		expect(tick.data.auto_evidence_created).toBe(
+			tick.data.auto_evidence_writes,
+		);
+		expect(tick.data.auto_todo_created).toBe(tick.data.auto_todo_writes);
+		expect(tick.data.review_candidates).toBeGreaterThanOrEqual(0);
+		expect(context.state.workflow.evidences.length).toBe(
+			tick.data.auto_evidence_writes,
+		);
+		expect(context.state.workflow.todos.length).toBe(
+			tick.data.auto_todo_writes,
+		);
+	});
+
+	test("autopilot.full_auto tick은 후보 payload 접근 예외를 analysis_failed review로 격리한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
+		context.state.codex_auth.mode = "env";
+		context.state.codex_auth.api_key_present = true;
+
+		const firstMessagePk = Array.from(context.state.messages.keys())[0];
+		if (!firstMessagePk) {
+			throw new Error("메시지 준비 실패");
+		}
+		const firstMessage = context.state.messages.get(firstMessagePk);
+		if (!firstMessage) {
+			throw new Error("메시지 조회 실패");
+		}
+		for (const messagePk of Array.from(context.state.messages.keys())) {
+			if (messagePk !== firstMessagePk) {
+				context.state.messages.delete(messagePk);
+			}
+		}
+		context.state.threadMessages.set("inbox", [firstMessagePk]);
+
+		const throwingOutput: {
+			proposal: { snippet: string; confidence: number; todo_title: string };
+			schema_version?: string;
+		} = {
+			proposal: {
+				snippet: "강제 예외",
+				confidence: 0.95,
+				todo_title: "[AUTO] 강제 예외",
+			},
+		};
+		Object.defineProperty(throwingOutput, "schema_version", {
+			get() {
+				throw new Error("schema_version read failed");
+			},
+			enumerable: true,
+			configurable: true,
+		});
+		const throwingMessage = {
+			...firstMessage,
+			__codex_output_raw: throwingOutput,
+		} as unknown as typeof firstMessage;
+		context.state.messages.set(firstMessagePk, throwingMessage);
+
+		const tick = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 1 },
+			context,
+		);
+		expect(tick.ok).toBe(true);
+		if (!tick.ok) {
+			throw new Error("tick 실패");
+		}
+		expect(tick.data.auto_evidence_writes).toBeGreaterThanOrEqual(0);
+		expect(tick.data.auto_todo_writes).toBeGreaterThanOrEqual(0);
+		expect(tick.data.review_candidates).toBeGreaterThan(0);
+		expect(context.state.workflow.evidences.length).toBe(
+			tick.data.auto_evidence_writes,
+		);
+		expect(context.state.workflow.todos.length).toBe(
+			tick.data.auto_todo_writes,
+		);
+	});
+
+	test("autopilot.tick은 max_messages_per_tick이 0일 때 기본 메시지 한도를 사용한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+		invokeMcpTool("autopilot.set_mode", { mode: "review_first" }, context);
+
+		const tick = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 0 },
+			context,
+		);
+
+		expect(tick.ok).toBe(true);
+		if (!tick.ok) {
+			throw new Error("tick 실패");
+		}
+		expect(tick.data.analysis_proposals).toBeDefined();
+		expect(tick.data.analysis_proposals?.length).toBeGreaterThan(0);
+	});
+
+	test("autopilot.review_first tick은 internet_message_id 누락 후보를 빈 문자열로 정규화한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+		invokeMcpTool("autopilot.set_mode", { mode: "review_first" }, context);
+
+		const firstMessagePk = Array.from(
+			context.state.messages.keys(),
+		)[0] as string;
+		const firstMessage = context.state.messages.get(firstMessagePk);
+		expect(firstMessagePk).toBeDefined();
+		expect(firstMessage).toBeDefined();
+		for (const messagePk of Array.from(context.state.messages.keys())) {
+			if (messagePk !== firstMessagePk) {
+				context.state.messages.delete(messagePk);
+			}
+		}
+		context.state.threadMessages.set("inbox", [firstMessagePk]);
+		context.state.messages.set(firstMessagePk, {
+			...(firstMessage as NonNullable<typeof firstMessage>),
+			internet_message_id: "   ",
+			__codex_output_raw: {
+				schema_version: CODEX_PROPOSAL_SCHEMA_VERSION,
+				proposal: {
+					snippet: "정규화 테스트",
+					confidence: 0.92,
+					todo_title: "[AUTO] 정규화 테스트",
+				},
+			},
+		} as unknown as NonNullable<typeof firstMessage>);
+
+		const tick = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 1 },
+			context,
+		);
+		expect(tick.ok).toBe(true);
+		if (!tick.ok) {
+			throw new Error("tick 실패");
+		}
+		expect(
+			tick.data.analysis_proposals?.[0]?.candidate_payload.internet_message_id,
+		).toBe("");
+	});
+
 	test("workflow.create_evidence는 idempotency를 보장하고 confidence 기본값을 사용한다", () => {
 		const context = createToolContext();
 		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
@@ -571,10 +1963,74 @@ describe("MCP tools", () => {
 			expect(duplicate.data.created).toBe(false);
 			expect(duplicate.data.skipped_duplicate).toBe(true);
 		}
+
+		const missingSnippet = invokeMcpTool(
+			"workflow.create_evidence",
+			{
+				message_pk: "inbox_msg_inbox_1",
+				snippet: "   ",
+			},
+			context,
+		);
+		expect(missingSnippet.ok).toBe(false);
+		const missingSnippetError = missingSnippet as {
+			ok: false;
+			error_code: string;
+			error_message: string;
+		};
+		expect(missingSnippetError.error_code).toBe("E_PARSE_FAILED");
+		expect(missingSnippetError.error_message).toContain("snippet");
+
+		const missingMessagePk = invokeMcpTool(
+			"workflow.create_evidence",
+			{
+				message_pk: "   ",
+				snippet: "근거",
+			},
+			context,
+		);
+		expect(missingMessagePk.ok).toBe(false);
+		const missingMessagePkError = missingMessagePk as {
+			ok: false;
+			error_code: string;
+			error_message: string;
+		};
+		expect(missingMessagePkError.error_code).toBe("E_PARSE_FAILED");
+		expect(missingMessagePkError.error_message).toContain("message_pk");
+
+		const missingMessage = invokeMcpTool(
+			"workflow.create_evidence",
+			{
+				message_pk: "missing_message_pk",
+				snippet: "근거",
+			},
+			context,
+		);
+		expect(missingMessage.ok).toBe(false);
+		if (!missingMessage.ok) {
+			expect(missingMessage.error_code).toBe("E_NOT_FOUND");
+		}
 	});
 
 	test("workflow.upsert_todo는 생성/중복감지/업데이트 분기를 처리한다", () => {
 		const context = createToolContext();
+
+		const withoutEvidence = invokeMcpTool(
+			"workflow.upsert_todo",
+			{
+				title: "증빙 없는 할 일",
+				status: "open",
+			},
+			context,
+		);
+		expect(withoutEvidence.ok).toBe(true);
+		if (withoutEvidence.ok) {
+			const todoKey = withoutEvidence.data.todo?.todo_key;
+			expect(withoutEvidence.data.todo?.evidence_id).toBeNull();
+			expect(todoKey).toBeDefined();
+			expect(typeof todoKey).toBe("string");
+			expect(todoKey?.startsWith("tdk_")).toBe(true);
+		}
 
 		const invalidStatus = invokeMcpToolByName(
 			"workflow.upsert_todo",
@@ -608,7 +2064,8 @@ describe("MCP tools", () => {
 		const duplicate = invokeMcpTool(
 			"workflow.upsert_todo",
 			{
-				todo_id: created.data.todo.todo_id,
+				todo_id: "model_supplied_id_should_be_ignored",
+				idempotency_key: created.data.todo.todo_key,
 				title: "후속 작업",
 				status: "open",
 				evidence_id: "ev_1",
@@ -639,6 +2096,50 @@ describe("MCP tools", () => {
 			expect(updated.data.skipped_duplicate).toBe(false);
 			expect(updated.data.todo.status).toBe("done");
 		}
+
+		context.state.workflow.todos = Array.from({ length: 501 }, (_, index) => ({
+			todo_id: index === 0 ? "todo_target" : `todo_seed_${index}`,
+			todo_key: index === 0 ? "todo_target_key" : `todo_seed_key_${index}`,
+			title: `seed-${index}`,
+			status: "open" as const,
+			evidence_id: null,
+			created_at: "2026-02-18T00:00:00.000Z",
+			updated_at: "2026-02-18T00:00:00.000Z",
+		}));
+
+		const trimmed = invokeMcpTool(
+			"workflow.upsert_todo",
+			{
+				todo_id: "todo_target",
+				todo_key: "todo_target_key",
+				title: "경계 테스트",
+				status: "open",
+			},
+			context,
+		);
+		expect(trimmed.ok).toBe(true);
+		if (trimmed.ok) {
+			expect(trimmed.data.created).toBe(false);
+			expect(trimmed.data.updated).toBe(true);
+			expect(trimmed.data.todo).toBeNull();
+		}
+
+		const missingTitle = invokeMcpToolByName(
+			"workflow.upsert_todo",
+			{
+				title: "  ",
+				status: "open",
+			},
+			context,
+		);
+		expect(missingTitle.ok).toBe(false);
+		const missingTitleError = missingTitle as {
+			ok: false;
+			error_code: string;
+			error_message: string;
+		};
+		expect(missingTitleError.error_code).toBe("E_PARSE_FAILED");
+		expect(missingTitleError.error_message).toContain("title");
 	});
 
 	test("auth_store.logout은 인증 상태를 초기화한다", () => {
