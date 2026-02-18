@@ -115,7 +115,7 @@ export const buildEmailDeepLink = (
 			return buildEmailFallbackLink(quoteText, "missing_email_web_link");
 		}
 
-		throw new Error("webLink 는 빈 값일 수 없습니다.");
+		throw new Error("메일 링크(webLink)는 빈 값일 수 없습니다.");
 	}
 
 	if (
@@ -126,7 +126,7 @@ export const buildEmailDeepLink = (
 			return buildEmailFallbackLink(quoteText, "invalid_email_web_link");
 		}
 
-		throw new Error("webLink 는 절대 URL 이어야 합니다.");
+		throw new Error("메일 링크(webLink)는 절대 URL이어야 합니다.");
 	}
 
 	if (quoteText === undefined || quoteText.length === 0) {

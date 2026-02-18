@@ -59,7 +59,7 @@ describe("Evidence 파싱/검증", () => {
 		}
 
 		expect(result.errors).toMatchObject([
-			{ path: "root", message: "Evidence 값은 객체여야 합니다." },
+			{ path: "root", message: "근거 값은 객체여야 합니다." },
 		]);
 	});
 
