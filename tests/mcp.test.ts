@@ -1,7 +1,11 @@
 import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import {
 	CODEX_PROPOSAL_SCHEMA_VERSION,
+	type DomainMirrorAdapter,
 	MCP_TOOL_NAMES,
 	type MailStoreGetThreadInput,
 	type McpResponse,
@@ -44,6 +48,72 @@ const completeLogin = (context: McpRuntimeContext) => {
 		},
 		context,
 	);
+};
+
+const createStoredZipBuffer = (
+	entries: Array<{ name: string; content: string }>,
+): Buffer => {
+	const localParts: Buffer[] = [];
+	const centralParts: Buffer[] = [];
+	let localOffset = 0;
+
+	for (const entry of entries) {
+		const nameBuffer = Buffer.from(entry.name, "utf8");
+		const dataBuffer = Buffer.from(entry.content, "utf8");
+
+		const localHeader = Buffer.alloc(30);
+		localHeader.writeUInt32LE(0x04034b50, 0);
+		localHeader.writeUInt16LE(20, 4);
+		localHeader.writeUInt16LE(0, 6);
+		localHeader.writeUInt16LE(0, 8);
+		localHeader.writeUInt16LE(0, 10);
+		localHeader.writeUInt16LE(0, 12);
+		localHeader.writeUInt32LE(0, 14);
+		localHeader.writeUInt32LE(dataBuffer.length, 18);
+		localHeader.writeUInt32LE(dataBuffer.length, 22);
+		localHeader.writeUInt16LE(nameBuffer.length, 26);
+		localHeader.writeUInt16LE(0, 28);
+
+		const centralHeader = Buffer.alloc(46);
+		centralHeader.writeUInt32LE(0x02014b50, 0);
+		centralHeader.writeUInt16LE(20, 4);
+		centralHeader.writeUInt16LE(20, 6);
+		centralHeader.writeUInt16LE(0, 8);
+		centralHeader.writeUInt16LE(0, 10);
+		centralHeader.writeUInt16LE(0, 12);
+		centralHeader.writeUInt16LE(0, 14);
+		centralHeader.writeUInt32LE(0, 16);
+		centralHeader.writeUInt32LE(dataBuffer.length, 20);
+		centralHeader.writeUInt32LE(dataBuffer.length, 24);
+		centralHeader.writeUInt16LE(nameBuffer.length, 28);
+		centralHeader.writeUInt16LE(0, 30);
+		centralHeader.writeUInt16LE(0, 32);
+		centralHeader.writeUInt16LE(0, 34);
+		centralHeader.writeUInt16LE(0, 36);
+		centralHeader.writeUInt32LE(0, 38);
+		centralHeader.writeUInt32LE(localOffset, 42);
+
+		localParts.push(localHeader, nameBuffer, dataBuffer);
+		centralParts.push(centralHeader, nameBuffer);
+		localOffset += localHeader.length + nameBuffer.length + dataBuffer.length;
+	}
+
+	const centralDirectory = Buffer.concat(centralParts);
+	const endOfCentralDirectory = Buffer.alloc(22);
+	endOfCentralDirectory.writeUInt32LE(0x06054b50, 0);
+	endOfCentralDirectory.writeUInt16LE(0, 4);
+	endOfCentralDirectory.writeUInt16LE(0, 6);
+	endOfCentralDirectory.writeUInt16LE(entries.length, 8);
+	endOfCentralDirectory.writeUInt16LE(entries.length, 10);
+	endOfCentralDirectory.writeUInt32LE(centralDirectory.length, 12);
+	endOfCentralDirectory.writeUInt32LE(localOffset, 16);
+	endOfCentralDirectory.writeUInt16LE(0, 20);
+
+	return Buffer.concat([
+		...localParts,
+		centralDirectory,
+		endOfCentralDirectory,
+	]);
 };
 
 describe("MCP 응답 타입", () => {
@@ -616,6 +686,179 @@ describe("MCP tools", () => {
 		expect(context.state.workflow.todos).toHaveLength(0);
 	});
 
+	test("autopilot mode gate는 manual/review_first/full_auto 정책을 분리 적용한다", () => {
+		const manualContext = createToolContext();
+		const manualTick = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 1 },
+			manualContext,
+		);
+		expect(manualTick.ok).toBe(false);
+		if (!manualTick.ok) {
+			expect(manualTick.error_code).toBe("E_POLICY_DENIED");
+		}
+
+		const reviewContext = createToolContext();
+		invokeMcpTool(
+			"auth_store.start_login",
+			{ scopes: ["Mail.Read"] },
+			reviewContext,
+		);
+		completeLogin(reviewContext);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			reviewContext,
+		);
+		invokeMcpTool(
+			"autopilot.set_mode",
+			{ mode: "review_first" },
+			reviewContext,
+		);
+
+		const reviewTick = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 1 },
+			reviewContext,
+		);
+		expect(reviewTick.ok).toBe(true);
+		if (!reviewTick.ok) {
+			throw new Error("review_first tick 실패");
+		}
+		expect(reviewTick.data.analysis_proposals?.length).toBeGreaterThan(0);
+		expect(reviewTick.data.auto_evidence_created).toBe(0);
+		expect(reviewTick.data.auto_todo_created).toBe(0);
+
+		const fullAutoContext = createToolContext();
+		invokeMcpTool(
+			"auth_store.start_login",
+			{ scopes: ["Mail.Read"] },
+			fullAutoContext,
+		);
+		completeLogin(fullAutoContext);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			fullAutoContext,
+		);
+		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, fullAutoContext);
+		fullAutoContext.state.codex_auth.mode = "env";
+		fullAutoContext.state.codex_auth.api_key_present = true;
+
+		const fullAutoTick = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 1 },
+			fullAutoContext,
+		);
+		expect(fullAutoTick.ok).toBe(true);
+		if (!fullAutoTick.ok) {
+			throw new Error("full_auto tick 실패");
+		}
+		expect(fullAutoTick.data.analysis_proposals).toBeUndefined();
+		expect(fullAutoTick.data.auto_evidence_writes).toBeGreaterThanOrEqual(0);
+		expect(fullAutoTick.data.auto_todo_writes).toBeGreaterThanOrEqual(0);
+	});
+
+	test("shadow-mode 비교는 review_first 단계에서 authority drift 없이 full_auto 승격 전 결과를 보존한다", () => {
+		const prepareContext = (mode: "review_first" | "full_auto") => {
+			const context = createToolContext();
+			invokeMcpTool(
+				"auth_store.start_login",
+				{ scopes: ["Mail.Read"] },
+				context,
+			);
+			completeLogin(context);
+			invokeMcpTool(
+				"graph_mail_sync.initial_sync",
+				{
+					mail_folder: "inbox",
+					days_back: 1,
+					select: ["id", "subject"],
+				},
+				context,
+			);
+			const firstMessagePk = Array.from(context.state.messages.keys())[0];
+			if (!firstMessagePk) {
+				throw new Error("메시지 준비 실패");
+			}
+			const firstMessage = context.state.messages.get(firstMessagePk);
+			if (!firstMessage) {
+				throw new Error("첫 메시지 조회 실패");
+			}
+			for (const messagePk of Array.from(context.state.messages.keys())) {
+				if (messagePk !== firstMessagePk) {
+					context.state.messages.delete(messagePk);
+				}
+			}
+			context.state.threadMessages.set("inbox", [firstMessagePk]);
+			context.state.messages.set(firstMessagePk, {
+				...firstMessage,
+				__codex_output_raw: {
+					schema_version: CODEX_PROPOSAL_SCHEMA_VERSION,
+					proposal: {
+						snippet: "shadow-compare-snippet",
+						confidence: 0.95,
+						todo_title: "[AUTO] shadow-compare-title",
+					},
+				},
+			} as unknown as typeof firstMessage);
+			invokeMcpTool("autopilot.set_mode", { mode }, context);
+			if (mode === "full_auto") {
+				context.state.codex_auth.mode = "env";
+				context.state.codex_auth.api_key_present = true;
+			}
+			return context;
+		};
+
+		const reviewContext = prepareContext("review_first");
+		const reviewTick = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 1 },
+			reviewContext,
+		);
+		expect(reviewTick.ok).toBe(true);
+		if (!reviewTick.ok) {
+			throw new Error("review_first tick 실패");
+		}
+		expect(reviewTick.data.auto_evidence_writes).toBe(0);
+		expect(reviewTick.data.auto_todo_writes).toBe(0);
+		expect(reviewContext.state.workflow.evidences).toHaveLength(0);
+		expect(reviewContext.state.workflow.todos).toHaveLength(0);
+		const shadowProposal = reviewTick.data.analysis_proposals?.[0];
+		expect(shadowProposal?.snippet).toBe("shadow-compare-snippet");
+		expect(shadowProposal?.todo_title).toBe("[AUTO] shadow-compare-title");
+
+		const fullAutoContext = prepareContext("full_auto");
+		const fullAutoTick = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 1 },
+			fullAutoContext,
+		);
+		expect(fullAutoTick.ok).toBe(true);
+		if (!fullAutoTick.ok) {
+			throw new Error("full_auto tick 실패");
+		}
+		expect(fullAutoTick.data.analysis_proposals).toBeUndefined();
+		expect(fullAutoTick.data.auto_evidence_writes).toBe(1);
+		expect(fullAutoTick.data.auto_todo_writes).toBe(1);
+		expect(fullAutoContext.state.workflow.evidences).toHaveLength(1);
+		expect(fullAutoContext.state.workflow.todos).toHaveLength(1);
+		expect(fullAutoContext.state.workflow.evidences[0]?.snippet).toBe(
+			shadowProposal?.snippet,
+		);
+		expect(fullAutoContext.state.workflow.todos[0]?.title).toBe(
+			shadowProposal?.todo_title,
+		);
+	});
+
 	test("autopilot.set_mode/full_auto + tick은 분석 결과를 workflow 경로로만 영속화한다", () => {
 		const context = createToolContext();
 		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
@@ -1105,7 +1348,30 @@ describe("MCP tools", () => {
 			expect(item.persistence_stage).toMatch(
 				/persisted|review_candidate|not_run|skipped_review_first/,
 			);
+			expect(item.attempt === null || Number.isInteger(item.attempt)).toBe(
+				true,
+			);
+			expect(
+				item.duration_ms === null ||
+					(typeof item.duration_ms === "number" && item.duration_ms >= 0),
+			).toBe(true);
+			expect(item.exit_code === null || Number.isInteger(item.exit_code)).toBe(
+				true,
+			);
+			expect(
+				item.failure_kind === null || typeof item.failure_kind === "string",
+			).toBe(true);
+			expect(typeof item.fallback_used).toBe("boolean");
 		}
+
+		const status = invokeMcpTool("autopilot.status", {}, context);
+		expect(status.ok).toBe(true);
+		if (!status.ok) {
+			throw new Error("status 실패");
+		}
+		expect(status.data.metrics).toBeDefined();
+		expect(status.data.codex_stage_metrics).toBeDefined();
+		expect(status.data.codex_last_failure_reason).toBeDefined();
 	});
 
 	test("autopilot.pause/status/resume는 상태 전이를 보장하고 manual resume은 거부한다", () => {
@@ -1422,6 +1688,132 @@ describe("MCP tools", () => {
 		expect(tickError.error_message).toContain("attempts=3/3");
 		expect(context.state.workflow.evidences).toHaveLength(0);
 		expect(context.state.workflow.todos).toHaveLength(0);
+	});
+
+	test("autopilot.tick은 주입된 domain mirror adapter의 retriable 실패를 codex 재시도 소진 매핑으로 유지한다", () => {
+		const adapter: DomainMirrorAdapter = {
+			analyzeAutopilotCandidateAttempt: ({ max_attempts }) => ({
+				kind: "failure",
+				classification: "retriable",
+				message: `adapter timeout (${max_attempts})`,
+				telemetry: {
+					attempt: 1,
+					duration_ms: null,
+					exit_code: null,
+					failure_kind: "timeout_retriable",
+					fallback_used: false,
+				},
+			}),
+		};
+		const context = createMcpContext(undefined, {
+			domainMirrorAdapter: adapter,
+		});
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
+		context.state.codex_auth.mode = "env";
+		context.state.codex_auth.api_key_present = true;
+
+		const tick = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 1 },
+			context,
+		);
+		expect(tick.ok).toBe(false);
+		const tickError = tick as {
+			ok: false;
+			error_code: string;
+			error_message: string;
+			retryable: boolean;
+		};
+		expect(tickError.error_code).toBe("E_CODEX_ANALYZE_RETRY_EXHAUSTED");
+		expect(tickError.retryable).toBe(true);
+		expect(tickError.error_message).toContain("adapter timeout");
+		expect(tickError.error_message).toContain("attempts=3/3");
+
+		const status = invokeMcpTool("autopilot.status", {}, context);
+		expect(status.ok).toBe(true);
+		if (!status.ok) {
+			throw new Error("status 실패");
+		}
+		expect(status.data.metrics.codex_stage_timeout).toBeGreaterThanOrEqual(1);
+		expect(
+			status.data.codex_stage.last_run_correlation.some(
+				(item) => item.analysis_stage === "codex_retriable_exhausted",
+			),
+		).toBe(true);
+	});
+
+	test("autopilot.tick은 주입된 domain mirror adapter의 terminal 실패를 임계치 매핑으로 유지한다", () => {
+		const adapter: DomainMirrorAdapter = {
+			analyzeAutopilotCandidateAttempt: () => ({
+				kind: "failure",
+				classification: "terminal",
+				message: "adapter terminal",
+				telemetry: {
+					attempt: 1,
+					duration_ms: null,
+					exit_code: 1,
+					failure_kind: "exit_non_zero",
+					fallback_used: false,
+				},
+			}),
+		};
+		const context = createMcpContext(undefined, {
+			domainMirrorAdapter: adapter,
+		});
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 2,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
+		context.state.codex_auth.mode = "env";
+		context.state.codex_auth.api_key_present = true;
+
+		const tick = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 2 },
+			context,
+		);
+		expect(tick.ok).toBe(false);
+		const tickError = tick as {
+			ok: false;
+			error_code: string;
+			error_message: string;
+			retryable: boolean;
+		};
+		expect(tickError.error_code).toBe("E_CODEX_ANALYZE_RETRY_EXHAUSTED");
+		expect(tickError.retryable).toBe(false);
+		expect(tickError.error_message).toContain("임계치");
+		expect(tickError.error_message).toContain("terminal=2");
+
+		const status = invokeMcpTool("autopilot.status", {}, context);
+		expect(status.ok).toBe(true);
+		if (!status.ok) {
+			throw new Error("status 실패");
+		}
+		expect(status.data.status).toBe("retrying");
+		expect(
+			status.data.codex_stage.last_run_correlation.some(
+				(item) => item.analysis_stage === "analysis_failed",
+			),
+		).toBe(true);
 	});
 
 	test("autopilot.full_auto tick은 stage 실패 임계치 초과 시 degraded 전환과 write 차단을 적용하고 sync 진단을 보존한다", () => {
@@ -1917,6 +2309,656 @@ describe("MCP tools", () => {
 		expect(
 			tick.data.analysis_proposals?.[0]?.candidate_payload.internet_message_id,
 		).toBe("");
+	});
+
+	test("autopilot.tick text attachment payload merge enforces deterministic ordering and truncation", () => {
+		const capturedPayloads: Array<{
+			message_pk: string;
+			body_text: string;
+		}> = [];
+		const adapter: DomainMirrorAdapter = {
+			analyzeAutopilotCandidateAttempt: ({ payload, attempt }) => {
+				capturedPayloads.push({
+					message_pk: payload.message_pk,
+					body_text: payload.body_text,
+				});
+				return {
+					kind: "raw_output",
+					raw_output: {
+						schema_version: CODEX_PROPOSAL_SCHEMA_VERSION,
+						proposal: {
+							snippet: `첨부 payload 분석 ${attempt}`,
+							confidence: 0.96,
+							todo_title: "[AUTO] 첨부 payload 검증",
+						},
+					},
+					telemetry: {
+						attempt,
+						duration_ms: 1,
+						exit_code: 0,
+						failure_kind: null,
+						fallback_used: true,
+					},
+				};
+			},
+		};
+		const context = createMcpContext(undefined, {
+			domainMirrorAdapter: adapter,
+		});
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+		invokeMcpTool("autopilot.set_mode", { mode: "review_first" }, context);
+
+		context.state.messages.clear();
+		context.state.attachments.clear();
+		context.state.threadMessages.set("inbox", ["att_text_msg"]);
+		context.state.deltaLinks.set("inbox", "inbox_1700000000000_delta");
+		context.state.messages.set("att_text_msg", {
+			message_pk: "att_text_msg",
+			provider_message_id: "graph_att_text_msg",
+			provider_thread_id: "inbox",
+			internet_message_id: "<att_text_msg@outlook.example.com>",
+			web_link: "https://outlook.office.com/mail/att_text_msg",
+			subject: "첨부 텍스트 병합 테스트",
+			from: "sender@local.test",
+			to: [],
+			cc: [],
+			received_at: new Date().toISOString(),
+			body_text: "본문 base",
+			has_attachments: true,
+			attachments: [],
+		});
+
+		const fixtureDir = mkdtempSync(join(tmpdir(), "mcp-att-text-"));
+		try {
+			const pathFirst = join(fixtureDir, "first.txt");
+			const pathSecond = join(fixtureDir, "second.txt");
+			const pathThird = join(fixtureDir, "third.txt");
+			writeFileSync(pathFirst, "A".repeat(1000), "utf8");
+			writeFileSync(pathSecond, "B".repeat(1000), "utf8");
+			writeFileSync(pathThird, "C".repeat(1000), "utf8");
+
+			context.state.attachments.set("missing", {
+				attachment_pk: "att_0",
+				graph_message_id: "graph_att_text_msg",
+				graph_attachment_id: "graph_att_missing",
+				message_pk: "att_text_msg",
+				file_name: "missing.txt",
+				content_type: "text/plain",
+				relative_path: join(fixtureDir, "missing.txt"),
+				size_bytes: 12,
+				sha256: "sha_missing",
+			});
+			context.state.attachments.set("second", {
+				attachment_pk: "att_2",
+				graph_message_id: "graph_att_text_msg",
+				graph_attachment_id: "graph_att_second",
+				message_pk: "att_text_msg",
+				file_name: "second.txt",
+				content_type: "text/plain",
+				relative_path: pathSecond,
+				size_bytes: 1000,
+				sha256: "sha_second",
+			});
+			context.state.attachments.set("first", {
+				attachment_pk: "att_1",
+				graph_message_id: "graph_att_text_msg",
+				graph_attachment_id: "graph_att_first",
+				message_pk: "att_text_msg",
+				file_name: "first.txt",
+				content_type: "text/plain",
+				relative_path: pathFirst,
+				size_bytes: 1000,
+				sha256: "sha_first",
+			});
+			context.state.attachments.set("third", {
+				attachment_pk: "att_3",
+				graph_message_id: "graph_att_text_msg",
+				graph_attachment_id: "graph_att_third",
+				message_pk: "att_text_msg",
+				file_name: "third.txt",
+				content_type: "text/plain",
+				relative_path: pathThird,
+				size_bytes: 1000,
+				sha256: "sha_third",
+			});
+
+			const tick = invokeMcpTool(
+				"autopilot.tick",
+				{ mail_folder: "inbox", max_messages_per_tick: 1 },
+				context,
+			);
+			expect(tick.ok).toBe(true);
+			if (!tick.ok) {
+				throw new Error("tick 실패");
+			}
+			expect(capturedPayloads).toHaveLength(1);
+			const mergedBodyText = capturedPayloads[0]?.body_text ?? "";
+			expect(mergedBodyText).toContain("\n\n[attachments]\n");
+			expect(mergedBodyText.length).toBeLessThanOrEqual(4000);
+			const firstIndex = mergedBodyText.indexOf("[attachment:first.txt]");
+			const secondIndex = mergedBodyText.indexOf("[attachment:second.txt]");
+			const thirdIndex = mergedBodyText.indexOf("[attachment:third.txt]");
+			expect(firstIndex).toBeGreaterThanOrEqual(0);
+			expect(secondIndex).toBeGreaterThan(firstIndex);
+			expect(thirdIndex).toBeGreaterThan(secondIndex);
+			expect(mergedBodyText).toContain(
+				`[attachment:first.txt] ${"A".repeat(800)}`,
+			);
+			expect(mergedBodyText).toContain(
+				`[attachment:second.txt] ${"B".repeat(800)}`,
+			);
+			expect(mergedBodyText).toContain(
+				`[attachment:third.txt] ${"C".repeat(200)}`,
+			);
+			expect(mergedBodyText).not.toContain("C".repeat(201));
+		} finally {
+			rmSync(fixtureDir, { recursive: true, force: true });
+		}
+	});
+
+	test("autopilot.tick attachment matrix extracts supported text formats deterministically", () => {
+		const capturedPayloads: Array<{
+			message_pk: string;
+			body_text: string;
+		}> = [];
+		const adapter: DomainMirrorAdapter = {
+			analyzeAutopilotCandidateAttempt: ({ payload, attempt }) => {
+				capturedPayloads.push({
+					message_pk: payload.message_pk,
+					body_text: payload.body_text,
+				});
+				return {
+					kind: "raw_output",
+					raw_output: {
+						schema_version: CODEX_PROPOSAL_SCHEMA_VERSION,
+						proposal: {
+							snippet: `attachment matrix ${attempt}`,
+							confidence: 0.95,
+							todo_title: "[AUTO] attachment matrix",
+						},
+					},
+					telemetry: {
+						attempt,
+						duration_ms: 1,
+						exit_code: 0,
+						failure_kind: null,
+						fallback_used: true,
+					},
+				};
+			},
+		};
+		const context = createMcpContext(undefined, {
+			domainMirrorAdapter: adapter,
+		});
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+		invokeMcpTool("autopilot.set_mode", { mode: "review_first" }, context);
+
+		context.state.messages.clear();
+		context.state.attachments.clear();
+		context.state.threadMessages.set("inbox", ["att_matrix_msg"]);
+		context.state.deltaLinks.set("inbox", "inbox_1700000000002_delta");
+		context.state.messages.set("att_matrix_msg", {
+			message_pk: "att_matrix_msg",
+			provider_message_id: "graph_att_matrix_msg",
+			provider_thread_id: "inbox",
+			internet_message_id: "<att_matrix_msg@outlook.example.com>",
+			web_link: "https://outlook.office.com/mail/att_matrix_msg",
+			subject: "attachment matrix",
+			from: "sender@local.test",
+			to: [],
+			cc: [],
+			received_at: new Date().toISOString(),
+			body_text: "matrix base",
+			has_attachments: true,
+			attachments: [],
+		});
+
+		const fixtureDir = mkdtempSync(join(tmpdir(), "mcp-att-matrix-"));
+		try {
+			const pdfPath = join(fixtureDir, "matrix.pdf");
+			const xlsxPath = join(fixtureDir, "matrix.xlsx");
+			const xlsPath = join(fixtureDir, "matrix.xls");
+			const pptxPath = join(fixtureDir, "matrix.pptx");
+			const pptPath = join(fixtureDir, "matrix.ppt");
+			const txtPath = join(fixtureDir, "matrix.txt");
+			const docxPath = join(fixtureDir, "matrix.docx");
+			const docPath = join(fixtureDir, "matrix.doc");
+
+			writeFileSync(pdfPath, "%PDF-1.4\nMATRIX_PDF_TEXT\n%%EOF", "utf8");
+			writeFileSync(
+				xlsxPath,
+				createStoredZipBuffer([
+					{
+						name: "xl/sharedStrings.xml",
+						content: "<sst><si><t>MATRIX_XLSX_TEXT</t></si></sst>",
+					},
+				]),
+			);
+			writeFileSync(xlsPath, "MATRIX_XLS_TEXT", "utf8");
+			writeFileSync(
+				pptxPath,
+				createStoredZipBuffer([
+					{
+						name: "ppt/slides/slide1.xml",
+						content: "<p:sld><a:t>MATRIX_PPTX_TEXT</a:t></p:sld>",
+					},
+				]),
+			);
+			writeFileSync(pptPath, "MATRIX_PPT_TEXT", "utf8");
+			writeFileSync(txtPath, "MATRIX_TXT_TEXT", "utf8");
+			writeFileSync(
+				docxPath,
+				createStoredZipBuffer([
+					{
+						name: "word/document.xml",
+						content: "<w:document><w:t>MATRIX_DOCX_TEXT</w:t></w:document>",
+					},
+				]),
+			);
+			writeFileSync(docPath, "MATRIX_DOC_TEXT", "utf8");
+
+			context.state.attachments.set("g", {
+				attachment_pk: "att_07",
+				graph_message_id: "graph_att_matrix_msg",
+				graph_attachment_id: "graph_att_docx",
+				message_pk: "att_matrix_msg",
+				file_name: "matrix.docx",
+				relative_path: docxPath,
+				size_bytes: 100,
+				sha256: "sha_docx",
+			});
+			context.state.attachments.set("b", {
+				attachment_pk: "att_02",
+				graph_message_id: "graph_att_matrix_msg",
+				graph_attachment_id: "graph_att_pdf",
+				message_pk: "att_matrix_msg",
+				file_name: "matrix.pdf",
+				relative_path: pdfPath,
+				size_bytes: 100,
+				sha256: "sha_pdf",
+			});
+			context.state.attachments.set("h", {
+				attachment_pk: "att_08",
+				graph_message_id: "graph_att_matrix_msg",
+				graph_attachment_id: "graph_att_doc",
+				message_pk: "att_matrix_msg",
+				file_name: "matrix.doc",
+				relative_path: docPath,
+				size_bytes: 100,
+				sha256: "sha_doc",
+			});
+			context.state.attachments.set("f", {
+				attachment_pk: "att_06",
+				graph_message_id: "graph_att_matrix_msg",
+				graph_attachment_id: "graph_att_txt",
+				message_pk: "att_matrix_msg",
+				file_name: "matrix.txt",
+				relative_path: txtPath,
+				size_bytes: 100,
+				sha256: "sha_txt",
+			});
+			context.state.attachments.set("a", {
+				attachment_pk: "att_01",
+				graph_message_id: "graph_att_matrix_msg",
+				graph_attachment_id: "graph_att_xlsx",
+				message_pk: "att_matrix_msg",
+				file_name: "matrix.xlsx",
+				relative_path: xlsxPath,
+				size_bytes: 100,
+				sha256: "sha_xlsx",
+			});
+			context.state.attachments.set("e", {
+				attachment_pk: "att_05",
+				graph_message_id: "graph_att_matrix_msg",
+				graph_attachment_id: "graph_att_ppt",
+				message_pk: "att_matrix_msg",
+				file_name: "matrix.ppt",
+				relative_path: pptPath,
+				size_bytes: 100,
+				sha256: "sha_ppt",
+			});
+			context.state.attachments.set("d", {
+				attachment_pk: "att_04",
+				graph_message_id: "graph_att_matrix_msg",
+				graph_attachment_id: "graph_att_pptx",
+				message_pk: "att_matrix_msg",
+				file_name: "matrix.pptx",
+				relative_path: pptxPath,
+				size_bytes: 100,
+				sha256: "sha_pptx",
+			});
+			context.state.attachments.set("c", {
+				attachment_pk: "att_03",
+				graph_message_id: "graph_att_matrix_msg",
+				graph_attachment_id: "graph_att_xls",
+				message_pk: "att_matrix_msg",
+				file_name: "matrix.xls",
+				relative_path: xlsPath,
+				size_bytes: 100,
+				sha256: "sha_xls",
+			});
+
+			const tick = invokeMcpTool(
+				"autopilot.tick",
+				{ mail_folder: "inbox", max_messages_per_tick: 1 },
+				context,
+			);
+			expect(tick.ok).toBe(true);
+			if (!tick.ok) {
+				throw new Error("tick 실패");
+			}
+			expect(tick.data.review_candidates).toBe(1);
+			expect(tick.data.analysis_proposals).toHaveLength(1);
+			expect(capturedPayloads).toHaveLength(1);
+
+			const mergedBodyText = capturedPayloads[0]?.body_text ?? "";
+			expect(mergedBodyText).toContain("\n\n[attachments]\n");
+			expect(mergedBodyText).toContain("MATRIX_PDF_TEXT");
+			expect(mergedBodyText).toContain("MATRIX_XLSX_TEXT");
+			expect(mergedBodyText).toContain("MATRIX_XLS_TEXT");
+			expect(mergedBodyText).toContain("MATRIX_PPTX_TEXT");
+			expect(mergedBodyText).toContain("MATRIX_PPT_TEXT");
+			expect(mergedBodyText).toContain("MATRIX_TXT_TEXT");
+			expect(mergedBodyText).toContain("MATRIX_DOCX_TEXT");
+			expect(mergedBodyText).toContain("MATRIX_DOC_TEXT");
+
+			const orderedLabels = [
+				"matrix.xlsx",
+				"matrix.pdf",
+				"matrix.xls",
+				"matrix.pptx",
+				"matrix.ppt",
+				"matrix.txt",
+				"matrix.docx",
+				"matrix.doc",
+			];
+			let previousIndex = -1;
+			for (const label of orderedLabels) {
+				const nextIndex = mergedBodyText.indexOf(`[attachment:${label}]`);
+				expect(nextIndex).toBeGreaterThan(previousIndex);
+				previousIndex = nextIndex;
+			}
+		} finally {
+			rmSync(fixtureDir, { recursive: true, force: true });
+		}
+	});
+
+	test("autopilot.tick attachment matrix keeps candidate-local success when corrupt or missing extraction fails", () => {
+		const capturedPayloads: Array<{
+			message_pk: string;
+			body_text: string;
+		}> = [];
+		const adapter: DomainMirrorAdapter = {
+			analyzeAutopilotCandidateAttempt: ({ payload, attempt }) => {
+				capturedPayloads.push({
+					message_pk: payload.message_pk,
+					body_text: payload.body_text,
+				});
+				return {
+					kind: "raw_output",
+					raw_output: {
+						schema_version: CODEX_PROPOSAL_SCHEMA_VERSION,
+						proposal: {
+							snippet: `corrupt isolation ${attempt}`,
+							confidence: 0.93,
+							todo_title: "[AUTO] corrupt isolation",
+						},
+					},
+					telemetry: {
+						attempt,
+						duration_ms: 1,
+						exit_code: 0,
+						failure_kind: null,
+						fallback_used: true,
+					},
+				};
+			},
+		};
+		const context = createMcpContext(undefined, {
+			domainMirrorAdapter: adapter,
+		});
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+		invokeMcpTool("autopilot.set_mode", { mode: "review_first" }, context);
+
+		context.state.messages.clear();
+		context.state.attachments.clear();
+		context.state.threadMessages.set("inbox", ["att_failure_msg"]);
+		context.state.deltaLinks.set("inbox", "inbox_1700000000003_delta");
+		context.state.messages.set("att_failure_msg", {
+			message_pk: "att_failure_msg",
+			provider_message_id: "graph_att_failure_msg",
+			provider_thread_id: "inbox",
+			internet_message_id: "<att_failure_msg@outlook.example.com>",
+			web_link: "https://outlook.office.com/mail/att_failure_msg",
+			subject: "attachment failure isolation",
+			from: "sender@local.test",
+			to: [],
+			cc: [],
+			received_at: new Date().toISOString(),
+			body_text: "failure base",
+			has_attachments: true,
+			attachments: [],
+		});
+
+		const fixtureDir = mkdtempSync(join(tmpdir(), "mcp-att-failure-"));
+		try {
+			const okTxtPath = join(fixtureDir, "ok.txt");
+			const okPdfPath = join(fixtureDir, "ok.pdf");
+			const corruptDocxPath = join(fixtureDir, "corrupt.docx");
+
+			writeFileSync(okTxtPath, "OK_ATTACHMENT_TEXT", "utf8");
+			writeFileSync(okPdfPath, "%PDF-1.4\nOK_ATTACHMENT_PDF\n%%EOF", "utf8");
+			writeFileSync(corruptDocxPath, "not-a-zip-docx", "utf8");
+
+			context.state.attachments.set("ok-txt", {
+				attachment_pk: "att_1",
+				graph_message_id: "graph_att_failure_msg",
+				graph_attachment_id: "graph_att_ok_txt",
+				message_pk: "att_failure_msg",
+				file_name: "ok.txt",
+				relative_path: okTxtPath,
+				size_bytes: 100,
+				sha256: "sha_ok_txt",
+			});
+			context.state.attachments.set("missing", {
+				attachment_pk: "att_2",
+				graph_message_id: "graph_att_failure_msg",
+				graph_attachment_id: "graph_att_missing_pdf",
+				message_pk: "att_failure_msg",
+				file_name: "missing.pdf",
+				relative_path: join(fixtureDir, "missing.pdf"),
+				size_bytes: 100,
+				sha256: "sha_missing",
+			});
+			context.state.attachments.set("corrupt", {
+				attachment_pk: "att_3",
+				graph_message_id: "graph_att_failure_msg",
+				graph_attachment_id: "graph_att_corrupt_docx",
+				message_pk: "att_failure_msg",
+				file_name: "corrupt.docx",
+				relative_path: corruptDocxPath,
+				size_bytes: 100,
+				sha256: "sha_corrupt",
+			});
+			context.state.attachments.set("ok-pdf", {
+				attachment_pk: "att_4",
+				graph_message_id: "graph_att_failure_msg",
+				graph_attachment_id: "graph_att_ok_pdf",
+				message_pk: "att_failure_msg",
+				file_name: "ok.pdf",
+				relative_path: okPdfPath,
+				size_bytes: 100,
+				sha256: "sha_ok_pdf",
+			});
+
+			const tick = invokeMcpTool(
+				"autopilot.tick",
+				{ mail_folder: "inbox", max_messages_per_tick: 1 },
+				context,
+			);
+			expect(tick.ok).toBe(true);
+			if (!tick.ok) {
+				throw new Error("tick 실패");
+			}
+			expect(tick.data.review_candidates).toBe(1);
+			expect(tick.data.analysis_proposals).toHaveLength(1);
+			expect(capturedPayloads).toHaveLength(1);
+
+			const mergedBodyText = capturedPayloads[0]?.body_text ?? "";
+			expect(mergedBodyText).toContain("OK_ATTACHMENT_TEXT");
+			expect(mergedBodyText).toContain("OK_ATTACHMENT_PDF");
+			expect(mergedBodyText).not.toContain("missing.pdf");
+			expect(mergedBodyText).not.toContain("corrupt.docx");
+
+			expect(tick.data.run_correlation).toHaveLength(1);
+			const taxonomy = tick.data.run_correlation[0];
+			expect(taxonomy?.analysis_stage).toBe("proposal");
+			expect(taxonomy?.persistence_stage).toBe("skipped_review_first");
+			expect(taxonomy?.failure_kind).toBeNull();
+
+			const status = invokeMcpTool("autopilot.status", {}, context);
+			expect(status.ok).toBe(true);
+			if (!status.ok) {
+				throw new Error("status 실패");
+			}
+			expect(status.data.metrics.codex_stage_success).toBeGreaterThanOrEqual(1);
+			expect(status.data.metrics.codex_stage_fail).toBe(0);
+			expect(status.data.metrics.codex_stage_schema_fail).toBe(0);
+		} finally {
+			rmSync(fixtureDir, { recursive: true, force: true });
+		}
+	});
+
+	test("autopilot.tick attachment requires user confirmation routes non-text attachments to review candidate", () => {
+		let adapterInvocationCount = 0;
+		const adapter: DomainMirrorAdapter = {
+			analyzeAutopilotCandidateAttempt: ({ attempt }) => {
+				adapterInvocationCount += 1;
+				return {
+					kind: "raw_output",
+					raw_output: {
+						schema_version: CODEX_PROPOSAL_SCHEMA_VERSION,
+						proposal: {
+							snippet: "호출되면 안됨",
+							confidence: 0.95,
+							todo_title: "[AUTO] 비텍스트 첨부",
+						},
+					},
+					telemetry: {
+						attempt,
+						duration_ms: 1,
+						exit_code: 0,
+						failure_kind: null,
+						fallback_used: true,
+					},
+				};
+			},
+		};
+		const context = createMcpContext(undefined, {
+			domainMirrorAdapter: adapter,
+		});
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
+		context.state.codex_auth.mode = "env";
+		context.state.codex_auth.api_key_present = true;
+
+		context.state.messages.clear();
+		context.state.attachments.clear();
+		context.state.threadMessages.set("inbox", ["att_confirm_msg"]);
+		context.state.deltaLinks.set("inbox", "inbox_1700000000001_delta");
+		context.state.messages.set("att_confirm_msg", {
+			message_pk: "att_confirm_msg",
+			provider_message_id: "graph_att_confirm_msg",
+			provider_thread_id: "inbox",
+			internet_message_id: "<att_confirm_msg@outlook.example.com>",
+			web_link: "https://outlook.office.com/mail/att_confirm_msg",
+			subject: "비텍스트 첨부 확인",
+			from: "sender@local.test",
+			to: [],
+			cc: [],
+			received_at: new Date().toISOString(),
+			body_text: "본문",
+			has_attachments: true,
+			attachments: [],
+		});
+		context.state.attachments.set("image", {
+			attachment_pk: "att_img",
+			graph_message_id: "graph_att_confirm_msg",
+			graph_attachment_id: "graph_att_image",
+			message_pk: "att_confirm_msg",
+			file_name: "evidence.png",
+			content_type: "image/png",
+			relative_path: "unused/evidence.png",
+			size_bytes: 20,
+			sha256: "sha_image",
+		});
+		context.state.attachments.set("image_jpg", {
+			attachment_pk: "att_img_jpg",
+			graph_message_id: "graph_att_confirm_msg",
+			graph_attachment_id: "graph_att_image_jpg",
+			message_pk: "att_confirm_msg",
+			file_name: "photo.jpg",
+			content_type: "image/jpeg",
+			relative_path: "unused/photo.jpg",
+			size_bytes: 20,
+			sha256: "sha_image_jpg",
+		});
+
+		const tick = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 1 },
+			context,
+		);
+		expect(tick.ok).toBe(true);
+		if (!tick.ok) {
+			throw new Error("tick 실패");
+		}
+		expect(adapterInvocationCount).toBe(0);
+		expect(tick.data.review_candidates).toBe(1);
+		expect(tick.data.auto_evidence_created).toBe(0);
+		expect(tick.data.auto_todo_created).toBe(0);
+		expect(context.state.workflow.evidences).toHaveLength(0);
+		expect(context.state.workflow.todos).toHaveLength(0);
 	});
 
 	test("workflow.create_evidence는 idempotency를 보장하고 confidence 기본값을 사용한다", () => {

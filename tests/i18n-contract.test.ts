@@ -52,6 +52,23 @@ describe("i18n contract bootstrap", () => {
 		}
 	});
 
+	test("머신 토큰/열거값은 로컬라이즈되지 않는 계약 키로 고정된다", () => {
+		const requiredMachineTokens = [
+			"manual",
+			"review_first",
+			"full_auto",
+			"error_code",
+			"message_pk",
+			"mail_folder",
+		] as const;
+
+		for (const token of requiredMachineTokens) {
+			expect(NON_TRANSLATABLE_CONTRACT_KEYS).toContain(token);
+			expect(isNonTranslatableContractToken(token)).toBe(true);
+			expect(token).toMatch(/^[a-z_]+$/);
+		}
+	});
+
 	test("계약 경계 토큰은 계약 소스에 그대로 존재한다", () => {
 		const mcpSource = readFileSync("src/domain/mcp.ts", "utf8");
 		const sidepanelHtml = readFileSync("extension/sidepanel.html", "utf8");

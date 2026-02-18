@@ -207,6 +207,34 @@ describe("Dashboard/Search/Timeline 계약 고정", () => {
 	});
 
 	test("계약 위반 시 명시적으로 실패한다", () => {
+		const overviewInputInvalidLimit = parseDashboardGetOverviewInput({
+			top_counterparties_limit: 0,
+		});
+		expect(overviewInputInvalidLimit.ok).toBe(false);
+		if (!overviewInputInvalidLimit.ok) {
+			expect(overviewInputInvalidLimit.errors[0]?.path).toBe(
+				"top_counterparties_limit",
+			);
+		}
+
+		const overviewInputInvalidBoolean = parseDashboardGetOverviewInput({
+			include_drilldowns: "yes",
+		});
+		expect(overviewInputInvalidBoolean.ok).toBe(false);
+		if (!overviewInputInvalidBoolean.ok) {
+			expect(overviewInputInvalidBoolean.errors[0]?.path).toBe(
+				"include_drilldowns",
+			);
+		}
+
+		const overviewInputInvalidTimezone = parseDashboardGetOverviewInput({
+			timezone: "   ",
+		});
+		expect(overviewInputInvalidTimezone.ok).toBe(false);
+		if (!overviewInputInvalidTimezone.ok) {
+			expect(overviewInputInvalidTimezone.errors[0]?.path).toBe("timezone");
+		}
+
 		const searchInvalid = parseSearchQueryOutput({
 			items: [
 				{
@@ -266,5 +294,91 @@ describe("Dashboard/Search/Timeline 계약 고정", () => {
 				(error) => error.path === "events[0].payload",
 			),
 		).toBe(true);
+
+		const searchInvalidPdfLocator = parseSearchQueryOutput({
+			items: [
+				{
+					result_id: "search:pdf-bad",
+					source_type: "mail",
+					source_id: "msg:pdf-bad",
+					title: "broken-pdf",
+					snippet: "broken-pdf",
+					score: 1,
+					occurred_at: "2026-02-18T01:05:00.000Z",
+					evidence_locators: [
+						{
+							evidence_id: "ev:pdf-bad",
+							source_kind: "attachment",
+							source_id: "att:pdf-bad",
+							locator: {
+								type: "pdf",
+							},
+						},
+					],
+					available_actions: ["jump_evidence"],
+				},
+			],
+		});
+
+		expect(searchInvalidPdfLocator.ok).toBe(false);
+		if (!searchInvalidPdfLocator.ok) {
+			expect(
+				searchInvalidPdfLocator.errors.some((error) =>
+					error.path.includes("evidence_locators[0].locator.page"),
+				),
+			).toBe(true);
+		}
+
+		const searchInvalidOutlookQuoteLocator = parseSearchQueryOutput({
+			items: [
+				{
+					result_id: "search:quote-bad",
+					source_type: "mail",
+					source_id: "msg:quote-bad",
+					title: "broken-quote",
+					snippet: "broken-quote",
+					score: 1,
+					occurred_at: "2026-02-18T01:05:00.000Z",
+					evidence_locators: [
+						{
+							evidence_id: "ev:quote-bad",
+							source_kind: "email",
+							source_id: "msg:quote-bad",
+							locator: {
+								type: "outlook_quote",
+							},
+						},
+					],
+					available_actions: ["jump_evidence"],
+				},
+			],
+		});
+
+		expect(searchInvalidOutlookQuoteLocator.ok).toBe(false);
+		if (!searchInvalidOutlookQuoteLocator.ok) {
+			expect(
+				searchInvalidOutlookQuoteLocator.errors.some((error) =>
+					error.path.includes("evidence_locators[0].locator.text_quote"),
+				),
+			).toBe(true);
+		}
+
+		const timelineInvalidNextCursor = parseTimelineListOutput({
+			events: [],
+			next_cursor: "",
+		});
+		expect(timelineInvalidNextCursor.ok).toBe(false);
+		if (!timelineInvalidNextCursor.ok) {
+			expect(timelineInvalidNextCursor.errors[0]?.path).toBe("next_cursor");
+		}
+
+		const searchInvalidTotalEstimate = parseSearchQueryOutput({
+			items: [],
+			total_estimate: -1,
+		});
+		expect(searchInvalidTotalEstimate.ok).toBe(false);
+		if (!searchInvalidTotalEstimate.ok) {
+			expect(searchInvalidTotalEstimate.errors[0]?.path).toBe("total_estimate");
+		}
 	});
 });
