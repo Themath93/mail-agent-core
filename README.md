@@ -41,6 +41,8 @@ Microsoft Graph API 기반으로 Outlook 메일과 첨부 파일을 로컬에서
 
 - `main`으로 병합할 때는 반드시 **버전 라벨**을 명시합니다.
 - PR 제목/본문·릴리즈 노트에는 버전, 핵심 변경점, 검증 결과를 간결히 기재합니다.
+- 버전 단일 소스는 `package.json`이며, 크롬 확장 버전(`extension/manifest.json`)과 릴리즈 태그(`v<major>.<minor>.<patch>`)를 동일 값으로 유지합니다.
+- 릴리즈 전 `bun run version:sync` -> `RELEASE_TAG=v<major>.<minor>.<patch> bun run version:check` 순서로 버전 정합성을 검증합니다.
 - 핵심기능은 CI 통과 + 테스트 커버리지 85% 이상 + TDD 기반 검증을 만족해야 병합 대상이 됩니다.
 - PR 본문은 `.github/PULL_REQUEST_TEMPLATE.md`를 사용하고, 커밋은 기능 단위로 작은 단위로 분리합니다.
 - 권장 커밋 메시지: `feat: 간결한 한국어 요약`, `fix: 간결한 한국어 요약`, `revert: 롤백 내용`

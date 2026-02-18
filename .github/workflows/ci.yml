@@ -30,6 +30,9 @@ jobs:
           echo "[CI] PR 템플릿 규칙 검증 시작"
           node ./.github/scripts/validate-pr-body.mjs
 
+      - name: Version contract
+        run: bun run version:check
+
       - name: Lint
         run: bun run lint
 
