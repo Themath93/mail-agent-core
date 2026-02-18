@@ -4,8 +4,9 @@ import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer as createNetServer } from "node:net";
-import { dirname } from "node:path";
+import { basename, dirname, extname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { inflateRawSync } from "node:zlib";
 
 const statePath = new URL("./state.json", import.meta.url);
 const configPath = new URL("./config.json", import.meta.url);
@@ -86,6 +87,14 @@ const defaultConfig = () => ({
 	client_id: "",
 	redirect_uri: "http://127.0.0.1:1270/mcp/callback",
 	callback_poll_ms: 1000,
+	codex_exec: {
+		enabled: false,
+		shadow_mode: false,
+		fallback_to_synthetic_on_error: true,
+		opencode_api_key_env: "OPENCODE_CODEX_API_KEY",
+		env_api_key_env: "CODEX_API_KEY",
+		env_fallback_only_ci_headless: true,
+	},
 	codex_auth: {
 		mode: "disabled",
 		api_key_env: "CODEX_API_KEY",
@@ -249,8 +258,10 @@ const normalizeState = (value) => {
 
 const normalizeConfig = (value) => {
 	const source = normalizeObject(value);
+	const codexExec = normalizeObject(source.codex_exec);
 	const codexAuth = normalizeObject(source.codex_auth);
 	const base = defaultConfig();
+	const codexExecBase = base.codex_exec;
 	const codexAuthBase = base.codex_auth;
 	const codexAuthMode =
 		isNonEmptyString(codexAuth.mode) &&
@@ -272,6 +283,30 @@ const normalizeConfig = (value) => {
 			source.callback_poll_ms >= 200
 				? source.callback_poll_ms
 				: base.callback_poll_ms,
+		codex_exec: {
+			enabled:
+				typeof codexExec.enabled === "boolean"
+					? codexExec.enabled
+					: codexExecBase.enabled,
+			shadow_mode:
+				typeof codexExec.shadow_mode === "boolean"
+					? codexExec.shadow_mode
+					: codexExecBase.shadow_mode,
+			fallback_to_synthetic_on_error:
+				typeof codexExec.fallback_to_synthetic_on_error === "boolean"
+					? codexExec.fallback_to_synthetic_on_error
+					: codexExecBase.fallback_to_synthetic_on_error,
+			opencode_api_key_env: isNonEmptyString(codexExec.opencode_api_key_env)
+				? codexExec.opencode_api_key_env.trim()
+				: codexExecBase.opencode_api_key_env,
+			env_api_key_env: isNonEmptyString(codexExec.env_api_key_env)
+				? codexExec.env_api_key_env.trim()
+				: codexExecBase.env_api_key_env,
+			env_fallback_only_ci_headless:
+				typeof codexExec.env_fallback_only_ci_headless === "boolean"
+					? codexExec.env_fallback_only_ci_headless
+					: codexExecBase.env_fallback_only_ci_headless,
+		},
 		codex_auth: {
 			mode: codexAuthMode,
 			api_key_env: isNonEmptyString(codexAuth.api_key_env)
@@ -305,7 +340,12 @@ const readConfig = () => {
 
 const pushLog = (state, level, event, message) => {
 	const logs = Array.isArray(state.logs) ? state.logs : [];
-	logs.push({ at: nowIso(), level, event, message });
+	logs.push({
+		at: nowIso(),
+		level,
+		event,
+		message: redactSensitiveText(message),
+	});
 	state.logs = logs.slice(-500);
 };
 
@@ -330,6 +370,8 @@ const AUTOPILOT_MAX_CONSECUTIVE_FAILURES = 3;
 const AUTOPILOT_CODEX_ANALYZE_TIMEOUT_MS = 1500;
 const AUTOPILOT_CODEX_ANALYZE_MAX_RETRIES = 2;
 const AUTOPILOT_CODEX_STAGE_FAILURE_THRESHOLD = 2;
+const CODEX_CLI_EXECUTABLE = "codex";
+const CODEX_CLI_TIMEOUT_GRACE_KILL_MS = 500;
 const AUTOPILOT_MAX_MESSAGES_PER_TICK = 30;
 const AUTOPILOT_MAX_ATTACHMENTS_PER_TICK = 10;
 const AUTOPILOT_DEFAULT_FOLDER = "inbox";
@@ -337,6 +379,221 @@ const AUTOPILOT_DEFAULT_DAYS_BACK = 1;
 const AUTOPILOT_REVIEW_MIN_CONFIDENCE = 0.75;
 const AUTOPILOT_AUTO_MIN_CONFIDENCE = 0.92;
 const CODEX_AUTH_ALLOWED_MODES = ["disabled", "env"];
+const CODEX_EXEC_AUTH_PRECEDENCE = Object.freeze([
+	"opencode_connected",
+	"env_fallback",
+]);
+const CODEX_EXEC_ALLOWED_ENV_FALLBACK_CONTEXTS = Object.freeze([
+	"ci",
+	"headless",
+]);
+const CODEX_EXEC_MODE_POLICY_MATRIX = Object.freeze({
+	manual: Object.freeze({
+		tick_allowed: false,
+		write_policy: "deny_all",
+		failure_policy: "fail_closed",
+	}),
+	review_first: Object.freeze({
+		tick_allowed: true,
+		write_policy: "analysis_only",
+		failure_policy: "fail_open_review",
+	}),
+	full_auto: Object.freeze({
+		tick_allowed: true,
+		write_policy: "workflow_persist",
+		failure_policy: "fail_closed_threshold",
+	}),
+	degraded: Object.freeze({
+		tick_allowed: false,
+		write_policy: "deny_all",
+		failure_policy: "fail_closed_until_resume",
+	}),
+});
+
+const isTruthyRuntimeFlag = (value) => {
+	if (!isNonEmptyString(value)) {
+		return false;
+	}
+	const normalized = value.trim().toLowerCase();
+	return normalized === "1" || normalized === "true" || normalized === "yes";
+};
+
+const SAFE_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const SENSITIVE_ENV_NAME_PATTERN =
+	/(api[_-]?key|token|secret|password|authorization)/i;
+const SENSITIVE_TEXT_KV_PATTERN =
+	/((?:api[_-]?key|token|secret|password|authorization)\s*[=:]\s*)([^\s,;]+)/gi;
+const SENSITIVE_TEXT_JSON_PATTERN =
+	/("(?:api[_-]?key|token|secret|password|authorization)"\s*:\s*)"[^"]*"/gi;
+const SENSITIVE_TEXT_BEARER_PATTERN = /(Bearer\s+)([^\s]+)/gi;
+const SENSITIVE_TEXT_QUERY_PATTERN =
+	/([?&](?:api[_-]?key|token|secret|password|authorization)=)([^&#\s]+)/gi;
+
+let cachedSensitiveEnvValues = null;
+
+const normalizeSafeEnvName = (value) => {
+	if (!isNonEmptyString(value)) {
+		return "invalid_env_name";
+	}
+	const trimmed = value.trim();
+	return SAFE_ENV_NAME_PATTERN.test(trimmed) ? trimmed : "invalid_env_name";
+};
+
+const resolveSensitiveEnvValues = () => {
+	if (cachedSensitiveEnvValues !== null) {
+		return cachedSensitiveEnvValues;
+	}
+	const values = [];
+	for (const [name, rawValue] of Object.entries(process.env)) {
+		if (!SENSITIVE_ENV_NAME_PATTERN.test(name)) {
+			continue;
+		}
+		if (!isNonEmptyString(rawValue)) {
+			continue;
+		}
+		if (rawValue.trim().length < 8) {
+			continue;
+		}
+		values.push(rawValue);
+	}
+	values.sort((left, right) => right.length - left.length);
+	cachedSensitiveEnvValues = values;
+	return values;
+};
+
+const redactSensitiveText = (value) => {
+	if (!isNonEmptyString(value)) {
+		return "";
+	}
+	let redacted = value;
+	redacted = redacted.replace(SENSITIVE_TEXT_BEARER_PATTERN, "$1[REDACTED]");
+	redacted = redacted.replace(SENSITIVE_TEXT_KV_PATTERN, "$1[REDACTED]");
+	redacted = redacted.replace(SENSITIVE_TEXT_JSON_PATTERN, '$1"[REDACTED]"');
+	redacted = redacted.replace(SENSITIVE_TEXT_QUERY_PATTERN, "$1[REDACTED]");
+	for (const secretValue of resolveSensitiveEnvValues()) {
+		if (!redacted.includes(secretValue)) {
+			continue;
+		}
+		redacted = redacted.split(secretValue).join("[REDACTED]");
+	}
+	return redacted;
+};
+
+const sanitizeLogRecord = (entry) => {
+	if (!entry || typeof entry !== "object") {
+		return null;
+	}
+	return {
+		at: safeIsoTimestamp(entry.at, nowIso()),
+		level: isNonEmptyString(entry.level) ? entry.level : "info",
+		event: isNonEmptyString(entry.event) ? entry.event : "unknown",
+		message: redactSensitiveText(entry.message),
+	};
+};
+
+const formatCodexAuthSource = (prefix, envName) =>
+	`${prefix}:${normalizeSafeEnvName(envName)}`;
+
+const sanitizeAutopilotForStatus = (autopilot) => {
+	const codexStage = normalizeObject(autopilot?.codex_stage);
+	const redactedLastError = redactSensitiveText(autopilot.last_error);
+	const redactedLastFailureReason = redactSensitiveText(
+		codexStage.last_failure_reason,
+	);
+	return {
+		mode: autopilot.mode,
+		status: autopilot.status,
+		paused: autopilot.paused,
+		in_flight_run_id: autopilot.in_flight_run_id,
+		last_error: redactedLastError,
+		consecutive_failures: autopilot.consecutive_failures,
+		last_tick_at: autopilot.last_tick_at,
+		metrics: autopilot.metrics,
+		codex_stage: {
+			...codexStage,
+			last_failure_reason: redactedLastFailureReason,
+		},
+		...buildCodexStageObservability({
+			...autopilot,
+			last_error: redactedLastError,
+			codex_stage: {
+				...codexStage,
+				last_failure_reason: redactedLastFailureReason,
+			},
+		}),
+	};
+};
+
+const sanitizeCodexExecContractForStatus = (runtimeContract) => ({
+	...runtimeContract,
+	flags: {
+		...runtimeContract.flags,
+		opencode_connected_api_key_env: normalizeSafeEnvName(
+			runtimeContract.flags.opencode_connected_api_key_env,
+		),
+		env_fallback_api_key_env: normalizeSafeEnvName(
+			runtimeContract.flags.env_fallback_api_key_env,
+		),
+	},
+});
+
+const isCiRuntime = () => isTruthyRuntimeFlag(process.env.CI);
+
+const isHeadlessRuntime = () =>
+	isTruthyRuntimeFlag(process.env.HEADLESS) ||
+	isTruthyRuntimeFlag(process.env.CODEX_HEADLESS) ||
+	isTruthyRuntimeFlag(process.env.PLAYWRIGHT_HEADLESS);
+
+const buildCodexExecRuntimeContract = (config) => {
+	const codexExecConfig = normalizeObject(config?.codex_exec);
+	const base = defaultConfig().codex_exec;
+	const flags = {
+		codex_exec_enabled:
+			typeof codexExecConfig.enabled === "boolean"
+				? codexExecConfig.enabled
+				: base.enabled,
+		codex_exec_shadow_mode:
+			typeof codexExecConfig.shadow_mode === "boolean"
+				? codexExecConfig.shadow_mode
+				: base.shadow_mode,
+		codex_exec_fallback_to_synthetic_on_error:
+			typeof codexExecConfig.fallback_to_synthetic_on_error === "boolean"
+				? codexExecConfig.fallback_to_synthetic_on_error
+				: base.fallback_to_synthetic_on_error,
+		opencode_connected_api_key_env: isNonEmptyString(
+			codexExecConfig.opencode_api_key_env,
+		)
+			? codexExecConfig.opencode_api_key_env.trim()
+			: base.opencode_api_key_env,
+		env_fallback_api_key_env: isNonEmptyString(codexExecConfig.env_api_key_env)
+			? codexExecConfig.env_api_key_env.trim()
+			: base.env_api_key_env,
+		env_fallback_only_ci_headless:
+			typeof codexExecConfig.env_fallback_only_ci_headless === "boolean"
+				? codexExecConfig.env_fallback_only_ci_headless
+				: base.env_fallback_only_ci_headless,
+	};
+
+	return {
+		flags,
+		auth_precedence: CODEX_EXEC_AUTH_PRECEDENCE,
+		env_fallback_allowed_contexts: CODEX_EXEC_ALLOWED_ENV_FALLBACK_CONTEXTS,
+		mode_policy_matrix: CODEX_EXEC_MODE_POLICY_MATRIX,
+	};
+};
+
+const resolveAutopilotModePolicy = (autopilot, runtimeContract) => {
+	if (autopilot.status === "degraded") {
+		return runtimeContract.mode_policy_matrix.degraded;
+	}
+	if (autopilot.mode === "manual") {
+		return runtimeContract.mode_policy_matrix.manual;
+	}
+	if (autopilot.mode === "review_first") {
+		return runtimeContract.mode_policy_matrix.review_first;
+	}
+	return runtimeContract.mode_policy_matrix.full_auto;
+};
 
 const redactSecret = (value) => {
 	if (!isNonEmptyString(value)) {
@@ -387,8 +644,76 @@ const resolveCodexAuth = (config) => {
 	return {
 		ok: true,
 		enabled: true,
-		source: `env:${apiKeyEnv}`,
+		source: formatCodexAuthSource("env", apiKeyEnv),
 		redacted: redactSecret(apiKey),
+	};
+};
+
+const resolveCodexExecAuth = (config, runtimeContract) => {
+	const opencodeEnv =
+		runtimeContract.flags.opencode_connected_api_key_env ??
+		"OPENCODE_CODEX_API_KEY";
+	const opencodeApiKey = process.env[opencodeEnv];
+	if (isNonEmptyString(opencodeApiKey)) {
+		return {
+			ok: true,
+			enabled: true,
+			source: formatCodexAuthSource("opencode_connected", opencodeEnv),
+			redacted: redactSecret(opencodeApiKey),
+		};
+	}
+
+	if (!runtimeContract.flags.env_fallback_only_ci_headless) {
+		const envName = runtimeContract.flags.env_fallback_api_key_env;
+		const apiKey = process.env[envName];
+		if (!isNonEmptyString(apiKey)) {
+			return {
+				ok: false,
+				error: errorResponse(
+					"E_CODEX_AUTH_REQUIRED",
+					`${envName} 환경변수 설정이 필요합니다.`,
+				),
+				logMessage: `missing codex env fallback: ${envName}`,
+			};
+		}
+		return {
+			ok: true,
+			enabled: true,
+			source: formatCodexAuthSource("env_fallback", envName),
+			redacted: redactSecret(apiKey),
+		};
+	}
+
+	if (!isCiRuntime() && !isHeadlessRuntime()) {
+		return {
+			ok: false,
+			error: errorResponse(
+				"E_CODEX_AUTH_REQUIRED",
+				"opencode 연결 인증이 필요합니다. env fallback 은 CI/headless 런타임에서만 허용됩니다.",
+			),
+			logMessage:
+				"codex env fallback denied outside ci/headless runtime context",
+		};
+	}
+
+	const envName = runtimeContract.flags.env_fallback_api_key_env;
+	const envApiKey = process.env[envName];
+	if (!isNonEmptyString(envApiKey)) {
+		return {
+			ok: false,
+			error: errorResponse(
+				"E_CODEX_AUTH_REQUIRED",
+				`${envName} 환경변수 설정이 필요합니다.`,
+			),
+			logMessage: `missing codex env fallback: ${envName}`,
+		};
+	}
+
+	return {
+		ok: true,
+		enabled: true,
+		source: formatCodexAuthSource("env_fallback", envName),
+		redacted: redactSecret(envApiKey),
 	};
 };
 
@@ -463,6 +788,14 @@ const setCodexStageRunCorrelation = (state, runCorrelation) => {
 		: [];
 };
 
+const createDefaultRunCorrelationTelemetry = (fallbackUsed = false) => ({
+	attempt: null,
+	duration_ms: null,
+	exit_code: null,
+	failure_kind: null,
+	fallback_used: fallbackUsed,
+});
+
 const buildCodexStageObservability = (autopilot) => ({
 	codex_stage_metrics: {
 		started: autopilot.metrics.codex_stage_started,
@@ -482,6 +815,360 @@ const normalizeSnippet = (value) =>
 
 const normalizeFingerprintBody = (value) =>
 	typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
+
+const AUTOPILOT_CANDIDATE_BODY_MAX_CHARS = 2000;
+const AUTOPILOT_CANDIDATE_BODY_WITH_ATTACHMENTS_MAX_CHARS = 4000;
+const AUTOPILOT_ATTACHMENT_TEXT_MAX_CHARS_PER_FILE = 800;
+const AUTOPILOT_ATTACHMENT_TEXT_MAX_CHARS_TOTAL = 1800;
+
+const SUPPORTED_TEXT_ATTACHMENT_EXTENSIONS = new Set([
+	"pdf",
+	"xlsx",
+	"xls",
+	"pptx",
+	"ppt",
+	"txt",
+	"docx",
+	"doc",
+]);
+
+const TEXT_ATTACHMENT_CONTENT_TYPES = new Set([
+	"application/pdf",
+	"text/plain",
+	"application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	"application/msword",
+	"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+	"application/vnd.ms-excel",
+	"application/vnd.openxmlformats-officedocument.presentationml.presentation",
+	"application/vnd.ms-powerpoint",
+]);
+
+const NON_TEXT_ATTACHMENT_EXTENSIONS = new Set([
+	"png",
+	"jpg",
+	"jpeg",
+	"gif",
+	"webp",
+	"bmp",
+	"svg",
+	"tif",
+	"tiff",
+	"heic",
+	"zip",
+	"rar",
+	"7z",
+	"mp3",
+	"wav",
+	"mp4",
+	"avi",
+	"mov",
+]);
+
+const decodeXmlEntities = (value) =>
+	value
+		.replace(/&amp;/g, "&")
+		.replace(/&lt;/g, "<")
+		.replace(/&gt;/g, ">")
+		.replace(/&quot;/g, '"')
+		.replace(/&apos;/g, "'");
+
+const getAttachmentExtension = (attachment) => {
+	const candidates = [
+		attachment?.file_name,
+		attachment?.graph_attachment_id,
+		attachment?.relative_path ? basename(attachment.relative_path) : "",
+	];
+	for (const candidate of candidates) {
+		if (!isNonEmptyString(candidate)) {
+			continue;
+		}
+		const extension = extname(candidate).replace(/^\./, "").toLowerCase();
+		if (extension.length > 0) {
+			return extension;
+		}
+	}
+	return "";
+};
+
+const resolveAttachmentFormatPolicy = (attachment) => {
+	const extension = getAttachmentExtension(attachment);
+	const contentType = isNonEmptyString(attachment?.content_type)
+		? attachment.content_type.trim().toLowerCase()
+		: "";
+
+	if (SUPPORTED_TEXT_ATTACHMENT_EXTENSIONS.has(extension)) {
+		return { kind: "text", format: extension };
+	}
+	if (TEXT_ATTACHMENT_CONTENT_TYPES.has(contentType)) {
+		if (contentType === "application/pdf") {
+			return { kind: "text", format: "pdf" };
+		}
+		if (contentType === "text/plain") {
+			return { kind: "text", format: "txt" };
+		}
+		if (
+			contentType ===
+			"application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+		) {
+			return { kind: "text", format: "docx" };
+		}
+		if (contentType === "application/msword") {
+			return { kind: "text", format: "doc" };
+		}
+		if (
+			contentType ===
+			"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+		) {
+			return { kind: "text", format: "xlsx" };
+		}
+		if (contentType === "application/vnd.ms-excel") {
+			return { kind: "text", format: "xls" };
+		}
+		if (
+			contentType ===
+			"application/vnd.openxmlformats-officedocument.presentationml.presentation"
+		) {
+			return { kind: "text", format: "pptx" };
+		}
+		if (contentType === "application/vnd.ms-powerpoint") {
+			return { kind: "text", format: "ppt" };
+		}
+	}
+
+	if (
+		(contentType.startsWith("image/") && contentType.length > 0) ||
+		(extension.length > 0 && NON_TEXT_ATTACHMENT_EXTENSIONS.has(extension)) ||
+		(contentType.length > 0 && !TEXT_ATTACHMENT_CONTENT_TYPES.has(contentType))
+	) {
+		return { kind: "requires_confirmation", format: extension || contentType };
+	}
+
+	return { kind: "unknown", format: "" };
+};
+
+const extractPrintableText = (buffer) => {
+	const latin1 = buffer.toString("latin1");
+	const chunks = latin1
+		.split(/[^\x20-\x7E\u00A0-\u00FF]+/)
+		.map((chunk) => chunk.trim())
+		.filter((chunk) => chunk.length >= 3);
+	return chunks.join(" ");
+};
+
+const parseZipEntries = (buffer) => {
+	const eocdSignature = 0x06054b50;
+	const cdfhSignature = 0x02014b50;
+	const lfhSignature = 0x04034b50;
+	let eocdOffset = -1;
+	for (
+		let index = Math.max(0, buffer.length - 65557);
+		index <= buffer.length - 22;
+		index += 1
+	) {
+		if (buffer.readUInt32LE(index) === eocdSignature) {
+			eocdOffset = index;
+		}
+	}
+	if (eocdOffset < 0) {
+		return [];
+	}
+
+	const centralDirectoryOffset = buffer.readUInt32LE(eocdOffset + 16);
+	const entryCount = buffer.readUInt16LE(eocdOffset + 10);
+	let cursor = centralDirectoryOffset;
+	const entries = [];
+
+	for (let index = 0; index < entryCount; index += 1) {
+		if (cursor + 46 > buffer.length) {
+			break;
+		}
+		if (buffer.readUInt32LE(cursor) !== cdfhSignature) {
+			break;
+		}
+		const compressionMethod = buffer.readUInt16LE(cursor + 10);
+		const compressedSize = buffer.readUInt32LE(cursor + 20);
+		const fileNameLength = buffer.readUInt16LE(cursor + 28);
+		const extraLength = buffer.readUInt16LE(cursor + 30);
+		const commentLength = buffer.readUInt16LE(cursor + 32);
+		const localHeaderOffset = buffer.readUInt32LE(cursor + 42);
+		const fileName = buffer
+			.slice(cursor + 46, cursor + 46 + fileNameLength)
+			.toString("utf8");
+
+		if (localHeaderOffset + 30 > buffer.length) {
+			break;
+		}
+		if (buffer.readUInt32LE(localHeaderOffset) !== lfhSignature) {
+			break;
+		}
+		const localNameLength = buffer.readUInt16LE(localHeaderOffset + 26);
+		const localExtraLength = buffer.readUInt16LE(localHeaderOffset + 28);
+		const dataStart =
+			localHeaderOffset + 30 + localNameLength + localExtraLength;
+		const dataEnd = dataStart + compressedSize;
+		if (dataEnd > buffer.length) {
+			break;
+		}
+
+		const compressed = buffer.slice(dataStart, dataEnd);
+		if (compressionMethod === 0) {
+			entries.push({ name: fileName, data: compressed });
+		} else if (compressionMethod === 8) {
+			entries.push({ name: fileName, data: inflateRawSync(compressed) });
+		}
+
+		cursor += 46 + fileNameLength + extraLength + commentLength;
+	}
+
+	return entries;
+};
+
+const extractTextFromZipXml = (buffer, entryNamePattern, tagPattern) => {
+	const entries = parseZipEntries(buffer)
+		.filter((entry) => entryNamePattern.test(entry.name))
+		.sort((a, b) => a.name.localeCompare(b.name));
+	const chunks = [];
+	for (const entry of entries) {
+		const xml = entry.data.toString("utf8");
+		for (const match of xml.matchAll(tagPattern)) {
+			chunks.push(decodeXmlEntities(match[1] ?? ""));
+		}
+	}
+	return chunks.join(" ");
+};
+
+const extractAttachmentTextByFormat = (buffer, format) => {
+	if (format === "txt") {
+		return buffer.toString("utf8");
+	}
+	if (format === "pdf") {
+		return extractPrintableText(buffer);
+	}
+	if (format === "docx") {
+		return extractTextFromZipXml(
+			buffer,
+			/^word\/.+\.xml$/i,
+			/<w:t[^>]*>(.*?)<\/w:t>/g,
+		);
+	}
+	if (format === "xlsx") {
+		return extractTextFromZipXml(
+			buffer,
+			/^xl\/.+\.xml$/i,
+			/<t[^>]*>(.*?)<\/t>/g,
+		);
+	}
+	if (format === "pptx") {
+		return extractTextFromZipXml(
+			buffer,
+			/^ppt\/slides\/.+\.xml$/i,
+			/<a:t[^>]*>(.*?)<\/a:t>/g,
+		);
+	}
+	if (format === "doc" || format === "xls" || format === "ppt") {
+		return extractPrintableText(buffer);
+	}
+	return "";
+};
+
+const resolveAttachmentAbsolutePath = (relativePath) => {
+	if (!isNonEmptyString(relativePath)) {
+		return null;
+	}
+	if (relativePath.startsWith("native-host/")) {
+		return fileURLToPath(new URL(`../${relativePath}`, import.meta.url));
+	}
+	if (relativePath.startsWith("./")) {
+		return fileURLToPath(new URL(relativePath, import.meta.url));
+	}
+	return fileURLToPath(new URL(`./${relativePath}`, import.meta.url));
+};
+
+const buildAttachmentTextContext = (state, message) => {
+	if (!message?.has_attachments) {
+		return {
+			merged_attachment_text: "",
+			requires_user_confirmation: false,
+		};
+	}
+
+	const records = Object.values(state.mailbox?.attachments || {})
+		.filter((item) => item?.message_pk === message.message_pk)
+		.sort((a, b) => {
+			const aKey = [
+				a.attachment_pk,
+				a.graph_attachment_id,
+				a.sha256,
+				a.relative_path,
+			]
+				.filter((part) => typeof part === "string")
+				.join("::");
+			const bKey = [
+				b.attachment_pk,
+				b.graph_attachment_id,
+				b.sha256,
+				b.relative_path,
+			]
+				.filter((part) => typeof part === "string")
+				.join("::");
+			return aKey.localeCompare(bKey);
+		});
+
+	const mergedParts = [];
+	let totalChars = 0;
+	for (const attachment of records) {
+		const policy = resolveAttachmentFormatPolicy(attachment);
+		if (policy.kind === "requires_confirmation") {
+			return {
+				merged_attachment_text: "",
+				requires_user_confirmation: true,
+			};
+		}
+		if (policy.kind !== "text") {
+			continue;
+		}
+
+		try {
+			const absolutePath = resolveAttachmentAbsolutePath(
+				attachment.relative_path,
+			);
+			if (!isNonEmptyString(absolutePath)) {
+				continue;
+			}
+			const raw = readFileSync(absolutePath);
+			const normalized = normalizeFingerprintBody(
+				extractAttachmentTextByFormat(raw, policy.format),
+			).slice(0, AUTOPILOT_ATTACHMENT_TEXT_MAX_CHARS_PER_FILE);
+			if (!isNonEmptyString(normalized)) {
+				continue;
+			}
+			if (totalChars >= AUTOPILOT_ATTACHMENT_TEXT_MAX_CHARS_TOTAL) {
+				break;
+			}
+			const remaining = AUTOPILOT_ATTACHMENT_TEXT_MAX_CHARS_TOTAL - totalChars;
+			const text = normalized.slice(0, remaining);
+			const label = isNonEmptyString(attachment.file_name)
+				? attachment.file_name
+				: isNonEmptyString(attachment.graph_attachment_id)
+					? attachment.graph_attachment_id
+					: attachment.attachment_pk;
+			mergedParts.push(`[attachment:${label}] ${text}`);
+			totalChars += text.length;
+		} catch (error) {
+			pushLog(
+				state,
+				"warn",
+				"attachment_extract",
+				`${message.message_pk ?? "unknown"}:${attachment.attachment_pk ?? "unknown"} ${String(error?.message ?? "extract_failed")}`,
+			);
+		}
+	}
+
+	return {
+		merged_attachment_text: mergedParts.join("\n"),
+		requires_user_confirmation: false,
+	};
+};
 
 const AUTOPILOT_FINGERPRINT_SCHEMA_VERSION = "v1";
 
@@ -2030,6 +2717,12 @@ const downloadAttachment = async (state, config, input) => {
 		graph_message_id: input.graph_message_id,
 		graph_attachment_id: input.graph_attachment_id,
 		message_pk: input.message_pk,
+		file_name: isNonEmptyString(result.payload.name)
+			? result.payload.name
+			: null,
+		content_type: isNonEmptyString(result.payload.contentType)
+			? result.payload.contentType
+			: null,
 		relative_path: relativePath,
 		size_bytes: bytes.length,
 		sha256,
@@ -2250,8 +2943,12 @@ const listAttachments = async (state, config, input) => {
 
 const getSystemHealth = (state) => {
 	const logs = Array.isArray(state.logs) ? state.logs : [];
-	const recent = logs.slice(-20);
+	const recent = logs
+		.slice(-20)
+		.map(sanitizeLogRecord)
+		.filter((item) => item !== null);
 	const autopilot = getAutopilotState(state);
+	const safeAutopilot = sanitizeAutopilotForStatus(autopilot);
 	return {
 		ok: true,
 		data: {
@@ -2267,16 +2964,7 @@ const getSystemHealth = (state) => {
 				? state.workflow.todos.length
 				: 0,
 			autopilot: {
-				mode: autopilot.mode,
-				status: autopilot.status,
-				paused: autopilot.paused,
-				in_flight_run_id: autopilot.in_flight_run_id,
-				last_error: autopilot.last_error,
-				consecutive_failures: autopilot.consecutive_failures,
-				last_tick_at: autopilot.last_tick_at,
-				metrics: autopilot.metrics,
-				codex_stage: autopilot.codex_stage,
-				...buildCodexStageObservability(autopilot),
+				...safeAutopilot,
 				persistence_authority: PHASE_1_PERSISTENCE_AUTHORITY,
 			},
 			last_log: recent.length > 0 ? recent[recent.length - 1] : null,
@@ -3127,6 +3815,183 @@ const buildAutoTodoTitle = (message) => {
 	return `[AUTO] ${subject} - 확인/처리 (${sender})`;
 };
 
+const buildCodexCliSpawnArgs = (args) => ["exec", ...args];
+
+const runCodexCliAdapter = async (
+	{
+		executable = CODEX_CLI_EXECUTABLE,
+		args = [],
+		timeout_ms = AUTOPILOT_CODEX_ANALYZE_TIMEOUT_MS,
+		cwd = undefined,
+		env = process.env,
+	},
+	{
+		spawnFn = spawn,
+		nowFn = Date.now,
+		setTimeoutFn = setTimeout,
+		clearTimeoutFn = clearTimeout,
+		killFn = process.kill,
+		platform = process.platform,
+	} = {},
+) => {
+	const startedAt = nowFn();
+	const spawnArgs = buildCodexCliSpawnArgs(
+		Array.isArray(args) ? args.filter((item) => typeof item === "string") : [],
+	);
+	const timeoutMs =
+		typeof timeout_ms === "number" &&
+		Number.isFinite(timeout_ms) &&
+		timeout_ms > 0
+			? Math.trunc(timeout_ms)
+			: AUTOPILOT_CODEX_ANALYZE_TIMEOUT_MS;
+	const stdoutChunks = [];
+	const stderrChunks = [];
+	const isWindows = platform === "win32";
+	const killProcess = (child, signal) => {
+		if (typeof child?.pid === "number" && child.pid > 0) {
+			if (!isWindows) {
+				try {
+					killFn(-child.pid, signal);
+				} catch {
+					// best effort
+				}
+			}
+		}
+		try {
+			child.kill(signal);
+		} catch {
+			// best effort
+		}
+	};
+
+	return new Promise((resolve) => {
+		let settled = false;
+		let timedOut = false;
+		let spawnError = null;
+		let timeoutHandle = null;
+		let forceKillHandle = null;
+		let child;
+
+		const finish = ({ exitCode, signalCode }) => {
+			if (settled) {
+				return;
+			}
+			settled = true;
+			if (timeoutHandle !== null) {
+				clearTimeoutFn(timeoutHandle);
+			}
+			if (forceKillHandle !== null) {
+				clearTimeoutFn(forceKillHandle);
+			}
+			const durationMs = Math.max(0, nowFn() - startedAt);
+			const stdout = Buffer.concat(stdoutChunks).toString("utf8");
+			const stderr = Buffer.concat(stderrChunks).toString("utf8");
+			const normalizedExitCode =
+				typeof exitCode === "number" ? exitCode : timedOut ? 124 : -1;
+			if (timedOut) {
+				resolve({
+					ok: false,
+					exit_code: 124,
+					duration_ms: durationMs,
+					stdout,
+					stderr,
+					failure_kind: "timeout_retriable",
+				});
+				return;
+			}
+			if (spawnError instanceof Error) {
+				resolve({
+					ok: false,
+					exit_code: normalizedExitCode,
+					duration_ms: durationMs,
+					stdout,
+					stderr: `${stderr}${stderr.length > 0 ? "\n" : ""}${spawnError.message}`,
+					failure_kind: "spawn_error",
+				});
+				return;
+			}
+			if (typeof exitCode === "number" && exitCode === 0) {
+				resolve({
+					ok: true,
+					exit_code: 0,
+					duration_ms: durationMs,
+					stdout,
+					stderr,
+					failure_kind: null,
+				});
+				return;
+			}
+			if (typeof exitCode === "number") {
+				resolve({
+					ok: false,
+					exit_code: exitCode,
+					duration_ms: durationMs,
+					stdout,
+					stderr,
+					failure_kind: "exit_non_zero",
+				});
+				return;
+			}
+			resolve({
+				ok: false,
+				exit_code: normalizedExitCode,
+				duration_ms: durationMs,
+				stdout,
+				stderr,
+				failure_kind:
+					typeof signalCode === "string" ? "signal_terminated" : "spawn_error",
+			});
+		};
+
+		try {
+			child = spawnFn(executable, spawnArgs, {
+				cwd,
+				env,
+				shell: false,
+				detached: !isWindows,
+				stdio: ["ignore", "pipe", "pipe"],
+			});
+		} catch (error) {
+			spawnError = error instanceof Error ? error : new Error(String(error));
+			finish({ exitCode: -1, signalCode: null });
+			return;
+		}
+
+		if (child.stdout) {
+			child.stdout.on("data", (chunk) => {
+				stdoutChunks.push(
+					Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)),
+				);
+			});
+		}
+		if (child.stderr) {
+			child.stderr.on("data", (chunk) => {
+				stderrChunks.push(
+					Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)),
+				);
+			});
+		}
+
+		timeoutHandle = setTimeoutFn(() => {
+			timedOut = true;
+			killProcess(child, "SIGTERM");
+			forceKillHandle = setTimeoutFn(() => {
+				if (settled) {
+					return;
+				}
+				killProcess(child, "SIGKILL");
+			}, CODEX_CLI_TIMEOUT_GRACE_KILL_MS);
+		}, timeoutMs);
+
+		child.once("error", (error) => {
+			spawnError = error instanceof Error ? error : new Error(String(error));
+		});
+		child.once("close", (exitCode, signalCode) => {
+			finish({ exitCode, signalCode });
+		});
+	});
+};
+
 const CODEX_PROPOSAL_SCHEMA_VERSION = "codex_proposal.v1";
 
 const isRecord = (value) =>
@@ -3370,37 +4235,239 @@ const resolveCodexAttemptFailure = (message, attempt) => {
 	};
 };
 
-const buildAutopilotCandidatePayload = (message) => {
+const buildAutopilotCandidatePayload = (state, message) => {
 	const subject = isNonEmptyString(message.subject)
 		? message.subject.trim()
 		: "무제 메일";
 	const from = isNonEmptyString(message.from) ? message.from.trim() : "unknown";
-	const bodyText = normalizeFingerprintBody(
+	const baseBodyText = normalizeFingerprintBody(
 		isNonEmptyString(message.body_text) ? message.body_text : subject,
-	).slice(0, 2000);
+	).slice(0, AUTOPILOT_CANDIDATE_BODY_MAX_CHARS);
+	const attachmentTextContext = buildAttachmentTextContext(state, message);
 	const internetMessageId = isNonEmptyString(message.internet_message_id)
 		? message.internet_message_id.trim().toLowerCase()
 		: "";
+	const mergedBodyText = isNonEmptyString(
+		attachmentTextContext.merged_attachment_text,
+	)
+		? `${baseBodyText}\n\n[attachments]\n${attachmentTextContext.merged_attachment_text}`.slice(
+				0,
+				AUTOPILOT_CANDIDATE_BODY_WITH_ATTACHMENTS_MAX_CHARS,
+			)
+		: baseBodyText;
 	return {
-		message_pk: message.message_pk,
-		internet_message_id: internetMessageId,
-		received_at: message.received_at,
-		subject,
-		from,
-		body_text: bodyText,
-		has_attachments: Boolean(message.has_attachments),
+		payload: {
+			message_pk: message.message_pk,
+			internet_message_id: internetMessageId,
+			received_at: message.received_at,
+			subject,
+			from,
+			body_text: mergedBodyText,
+			has_attachments: Boolean(message.has_attachments),
+		},
+		requires_user_confirmation:
+			attachmentTextContext.requires_user_confirmation,
 	};
 };
 
-const analyzeAutopilotCandidate = (message) => {
-	const payload = buildAutopilotCandidatePayload(message);
+const CODEX_CANDIDATE_ALLOWED_METADATA_KEYS = Object.freeze([
+	"message_pk",
+	"internet_message_id",
+	"received_at",
+	"has_attachments",
+	"attempt",
+	"max_attempts",
+]);
+
+const buildCodexAnalyzeAllowedMetadata = (payload) => {
+	const metadata = {};
+	for (const key of CODEX_CANDIDATE_ALLOWED_METADATA_KEYS) {
+		if (!Object.prototype.hasOwnProperty.call(payload, key)) {
+			continue;
+		}
+		metadata[key] = payload[key];
+	}
+	return metadata;
+};
+
+const buildCodexAnalyzeInputPayload = (payload) => ({
+	schema_version: "codex_candidate.v1",
+	candidate: {
+		message_pk: payload.message_pk,
+		internet_message_id: payload.internet_message_id,
+		received_at: payload.received_at,
+		subject: payload.subject,
+		from: payload.from,
+		body_text: payload.body_text,
+		has_attachments: payload.has_attachments,
+	},
+	metadata: buildCodexAnalyzeAllowedMetadata(payload),
+});
+
+const buildCodexAnalyzeArgs = (payload) => [
+	"--json",
+	"--input",
+	JSON.stringify(buildCodexAnalyzeInputPayload(payload)),
+];
+
+const resolveCodexAdapterFailure = (adapterResult) => {
+	if (adapterResult.failure_kind === "timeout_retriable") {
+		return {
+			classification: "retriable",
+			message:
+				isNonEmptyString(adapterResult.stderr) &&
+				adapterResult.stderr.trim().length > 0
+					? adapterResult.stderr.trim()
+					: `codex 분석이 ${AUTOPILOT_CODEX_ANALYZE_TIMEOUT_MS}ms 제한 시간을 초과했습니다.`,
+		};
+	}
+
+	const message =
+		isNonEmptyString(adapterResult.stderr) &&
+		adapterResult.stderr.trim().length > 0
+			? adapterResult.stderr.trim()
+			: `codex exec 실행에 실패했습니다. kind=${String(
+					adapterResult.failure_kind ?? "unknown",
+				)} exit=${String(adapterResult.exit_code ?? -1)}`;
+
+	return {
+		classification: "terminal",
+		message,
+	};
+};
+
+const analyzeAutopilotCandidateAttempt = async (
+	message,
+	payload,
+	runtimeContract,
+	runCodexCliAdapterFn,
+) => {
+	if (!runtimeContract.flags.codex_exec_enabled) {
+		const syntheticFailure = resolveCodexAttemptFailure(
+			message,
+			payload.attempt,
+		);
+		if (syntheticFailure !== null) {
+			return {
+				kind: "failure",
+				classification: syntheticFailure.classification,
+				message: syntheticFailure.message,
+				telemetry: {
+					attempt: payload.attempt,
+					duration_ms: null,
+					exit_code: null,
+					failure_kind:
+						syntheticFailure.classification === "retriable"
+							? "timeout_retriable"
+							: "analysis_fail",
+					fallback_used: true,
+				},
+			};
+		}
+		return {
+			kind: "raw_output",
+			raw_output: resolveCodexProposalRawOutput(message, payload),
+			telemetry: {
+				attempt: payload.attempt,
+				duration_ms: null,
+				exit_code: null,
+				failure_kind: null,
+				fallback_used: true,
+			},
+		};
+	}
+
+	const adapterResult = await runCodexCliAdapterFn({
+		args: buildCodexAnalyzeArgs(payload),
+		timeout_ms: AUTOPILOT_CODEX_ANALYZE_TIMEOUT_MS,
+	});
+	if (adapterResult.ok) {
+		return {
+			kind: "raw_output",
+			raw_output: adapterResult.stdout,
+			telemetry: {
+				attempt: payload.attempt,
+				duration_ms:
+					typeof adapterResult.duration_ms === "number"
+						? adapterResult.duration_ms
+						: null,
+				exit_code:
+					typeof adapterResult.exit_code === "number"
+						? adapterResult.exit_code
+						: null,
+				failure_kind: null,
+				fallback_used: false,
+			},
+		};
+	}
+
+	const adapterFailure = resolveCodexAdapterFailure(adapterResult);
+	return {
+		kind: "failure",
+		classification: adapterFailure.classification,
+		message: adapterFailure.message,
+		telemetry: {
+			attempt: payload.attempt,
+			duration_ms:
+				typeof adapterResult.duration_ms === "number"
+					? adapterResult.duration_ms
+					: null,
+			exit_code:
+				typeof adapterResult.exit_code === "number"
+					? adapterResult.exit_code
+					: null,
+			failure_kind: isNonEmptyString(adapterResult.failure_kind)
+				? adapterResult.failure_kind
+				: null,
+			fallback_used: false,
+		},
+	};
+};
+
+const analyzeAutopilotCandidate = async (
+	message,
+	runtimeContract,
+	{ runCodexCliAdapterFn = runCodexCliAdapter } = {},
+	state = null,
+) => {
+	const payloadResult = buildAutopilotCandidatePayload(state ?? {}, message);
+	const payload = payloadResult.payload;
+	if (payloadResult.requires_user_confirmation) {
+		return {
+			message,
+			payload,
+			proposal: null,
+			review_reason: "attachment_requires_user_confirmation",
+			attempt_count: 0,
+			telemetry: {
+				attempt: 0,
+				duration_ms: null,
+				exit_code: null,
+				failure_kind: null,
+				fallback_used: !runtimeContract.flags.codex_exec_enabled,
+			},
+		};
+	}
 	const maxAttempts = AUTOPILOT_CODEX_ANALYZE_MAX_RETRIES + 1;
 	let exhaustedRetriableMessage = null;
+	let lastAttemptTelemetry = {
+		attempt: 1,
+		duration_ms: null,
+		exit_code: null,
+		failure_kind: null,
+		fallback_used: !runtimeContract.flags.codex_exec_enabled,
+	};
 	for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-		const attemptFailure = resolveCodexAttemptFailure(message, attempt);
-		if (attemptFailure !== null) {
-			if (attemptFailure.classification === "retriable") {
-				exhaustedRetriableMessage = attemptFailure.message;
+		const attemptResult = await analyzeAutopilotCandidateAttempt(
+			message,
+			{ ...payload, attempt, max_attempts: maxAttempts },
+			runtimeContract,
+			runCodexCliAdapterFn,
+		);
+		lastAttemptTelemetry = attemptResult.telemetry;
+		if (attemptResult.kind === "failure") {
+			if (attemptResult.classification === "retriable") {
+				exhaustedRetriableMessage = attemptResult.message;
 				if (attempt < maxAttempts) {
 					continue;
 				}
@@ -3414,11 +4481,18 @@ const analyzeAutopilotCandidate = (message) => {
 				failure_class: "terminal",
 				failure_kind: "analysis_fail",
 				attempt_count: attempt,
-				failure_message: attemptFailure.message,
+				failure_message: attemptResult.message,
+				telemetry: {
+					attempt: attemptResult.telemetry.attempt,
+					duration_ms: attemptResult.telemetry.duration_ms,
+					exit_code: attemptResult.telemetry.exit_code,
+					failure_kind: "analysis_fail",
+					fallback_used: attemptResult.telemetry.fallback_used,
+				},
 			};
 		}
 
-		const codexOutput = resolveCodexProposalRawOutput(message, payload);
+		const codexOutput = attemptResult.raw_output;
 		const parsed = parseCodexProposalOutput(codexOutput);
 		if (!parsed.ok) {
 			return {
@@ -3433,6 +4507,13 @@ const analyzeAutopilotCandidate = (message) => {
 				failure_class: "terminal",
 				failure_kind: "schema_fail",
 				attempt_count: attempt,
+				telemetry: {
+					attempt: attemptResult.telemetry.attempt,
+					duration_ms: attemptResult.telemetry.duration_ms,
+					exit_code: attemptResult.telemetry.exit_code,
+					failure_kind: "schema_fail",
+					fallback_used: attemptResult.telemetry.fallback_used,
+				},
 			};
 		}
 		return {
@@ -3450,6 +4531,13 @@ const analyzeAutopilotCandidate = (message) => {
 			},
 			review_reason: null,
 			attempt_count: attempt,
+			telemetry: {
+				attempt: attemptResult.telemetry.attempt,
+				duration_ms: attemptResult.telemetry.duration_ms,
+				exit_code: attemptResult.telemetry.exit_code,
+				failure_kind: null,
+				fallback_used: attemptResult.telemetry.fallback_used,
+			},
 		};
 	}
 
@@ -3464,14 +4552,33 @@ const analyzeAutopilotCandidate = (message) => {
 		failure_message: `${
 			exhaustedRetriableMessage ?? "codex 분석 재시도 한도를 초과했습니다."
 		} (attempts=${maxAttempts}/${maxAttempts})`,
+		telemetry: {
+			attempt: lastAttemptTelemetry.attempt,
+			duration_ms: lastAttemptTelemetry.duration_ms,
+			exit_code: lastAttemptTelemetry.exit_code,
+			failure_kind: "timeout",
+			fallback_used: lastAttemptTelemetry.fallback_used,
+		},
 	};
 };
 
-const analyzeAutopilotCandidates = (state, candidates) =>
-	candidates
-		.map((message) => {
+const analyzeAutopilotCandidates = async (
+	state,
+	candidates,
+	runtimeContract,
+	{ runCodexCliAdapterFn = runCodexCliAdapter } = {},
+) => {
+	const analyzed = await Promise.all(
+		candidates.map(async (message) => {
 			try {
-				return analyzeAutopilotCandidate(message);
+				return await analyzeAutopilotCandidate(
+					message,
+					runtimeContract,
+					{
+						runCodexCliAdapterFn,
+					},
+					state,
+				);
 			} catch {
 				pushLog(
 					state,
@@ -3481,27 +4588,34 @@ const analyzeAutopilotCandidates = (state, candidates) =>
 				);
 				return {
 					message,
-					payload: buildAutopilotCandidatePayload(message),
+					payload: buildAutopilotCandidatePayload(state, message).payload,
 					proposal: null,
 					review_reason: "analysis_failed",
 					failure_kind: "analysis_fail",
+					telemetry: {
+						attempt: 1,
+						duration_ms: null,
+						exit_code: null,
+						failure_kind: "analysis_fail",
+						fallback_used: !runtimeContract.flags.codex_exec_enabled,
+					},
 				};
 			}
-		})
-		.map((result) => {
-			if (
-				result.review_reason === "codex_schema_invalid" &&
-				result.parse_error
-			) {
-				pushLog(
-					state,
-					"warn",
-					"codex_schema_invalid",
-					`${result.message.message_pk ?? "unknown"}: ${result.parse_error.code} ${result.parse_error.message}`,
-				);
-			}
-			return result;
-		});
+		}),
+	);
+
+	return analyzed.map((result) => {
+		if (result.review_reason === "codex_schema_invalid" && result.parse_error) {
+			pushLog(
+				state,
+				"warn",
+				"codex_schema_invalid",
+				`${result.message.message_pk ?? "unknown"}: ${result.parse_error.code} ${result.parse_error.message}`,
+			);
+		}
+		return result;
+	});
+};
 
 const buildAutopilotStageFailureMatrix = (
 	analyzedCandidates,
@@ -3584,19 +4698,13 @@ const resumeAutopilot = (state) => {
 
 const getAutopilotStatus = (state) => {
 	const autopilot = getAutopilotState(state);
+	const runtimeContract = buildCodexExecRuntimeContract(readConfig());
+	const safeAutopilot = sanitizeAutopilotForStatus(autopilot);
 	return {
 		ok: true,
 		data: {
-			mode: autopilot.mode,
-			status: autopilot.status,
-			paused: autopilot.paused,
-			in_flight_run_id: autopilot.in_flight_run_id,
-			last_error: autopilot.last_error,
-			consecutive_failures: autopilot.consecutive_failures,
-			last_tick_at: autopilot.last_tick_at,
-			metrics: autopilot.metrics,
-			codex_stage: autopilot.codex_stage,
-			...buildCodexStageObservability(autopilot),
+			...safeAutopilot,
+			codex_exec_contract: sanitizeCodexExecContractForStatus(runtimeContract),
 			persistence_authority: PHASE_1_PERSISTENCE_AUTHORITY,
 		},
 	};
@@ -3604,13 +4712,15 @@ const getAutopilotStatus = (state) => {
 
 const runAutopilotTick = async (state, config, input) => {
 	const autopilot = getAutopilotState(state);
-	if (autopilot.mode === "manual") {
+	const runtimeContract = buildCodexExecRuntimeContract(config);
+	const modePolicy = resolveAutopilotModePolicy(autopilot, runtimeContract);
+	if (!modePolicy.tick_allowed && autopilot.mode === "manual") {
 		return errorResponse(
 			"E_POLICY_DENIED",
 			"manual 모드입니다. autopilot.set_mode 후 실행하세요.",
 		);
 	}
-	if (autopilot.status === "degraded") {
+	if (!modePolicy.tick_allowed && autopilot.status === "degraded") {
 		return errorResponse(
 			"E_POLICY_DENIED",
 			`autopilot 이 degraded 상태입니다. ${autopilot.last_error ?? "복구 후 resume 하세요."}`,
@@ -3669,6 +4779,9 @@ const runAutopilotTick = async (state, config, input) => {
 		candidate_stage: "selected",
 		analysis_stage: "review",
 		persistence_stage: "not_run",
+		...createDefaultRunCorrelationTelemetry(
+			!runtimeContract.flags.codex_exec_enabled,
+		),
 	}));
 	const runCorrelationByMessagePk = new Map(
 		runCorrelation.map((item) => [item.message_pk, item]),
@@ -3684,7 +4797,9 @@ const runAutopilotTick = async (state, config, input) => {
 	}
 
 	if (candidates.length > 0) {
-		const codexAuth = resolveCodexAuth(config);
+		const codexAuth = runtimeContract.flags.codex_exec_enabled
+			? resolveCodexExecAuth(config, runtimeContract)
+			: resolveCodexAuth(config);
 		if (!codexAuth.ok) {
 			autopilot.codex_stage.last_failure_reason = codexAuth.error.error_message;
 			updateCodexStageStatusFromMetrics(state);
@@ -3704,11 +4819,22 @@ const runAutopilotTick = async (state, config, input) => {
 		}
 	}
 
-	const analyzedCandidates = analyzeAutopilotCandidates(state, candidates);
+	const analyzedCandidates = await analyzeAutopilotCandidates(
+		state,
+		candidates,
+		runtimeContract,
+	);
 	for (const analyzed of analyzedCandidates) {
 		const correlation = runCorrelationByMessagePk.get(
 			analyzed.message.message_pk,
 		);
+		if (correlation) {
+			correlation.attempt = analyzed.telemetry.attempt;
+			correlation.duration_ms = analyzed.telemetry.duration_ms;
+			correlation.exit_code = analyzed.telemetry.exit_code;
+			correlation.failure_kind = analyzed.telemetry.failure_kind;
+			correlation.fallback_used = analyzed.telemetry.fallback_used;
+		}
 		if (analyzed.proposal !== null) {
 			incrementAutopilotMetric(state, "codex_stage_success", 1);
 			if (correlation) {
@@ -4085,9 +5211,35 @@ const consumeMessages = async () => {
 	}
 };
 
-process.stdin.on("data", (chunk) => {
-	inputBuffer = Buffer.concat([inputBuffer, chunk]);
-	messageQueue = messageQueue.then(consumeMessages).catch(() => {
-		sendMessage(errorResponse("E_UNKNOWN", "native host queue error", true));
+const startHostRuntime = () => {
+	process.stdin.on("data", (chunk) => {
+		inputBuffer = Buffer.concat([inputBuffer, chunk]);
+		messageQueue = messageQueue.then(consumeMessages).catch(() => {
+			sendMessage(errorResponse("E_UNKNOWN", "native host queue error", true));
+		});
 	});
+};
+
+const isMainModule = () => {
+	if (!isNonEmptyString(process.argv[1])) {
+		return false;
+	}
+	return process.argv[1] === fileURLToPath(import.meta.url);
+};
+
+if (isMainModule()) {
+	startHostRuntime();
+}
+
+export const __hostTestables = Object.freeze({
+	buildCodexExecRuntimeContract,
+	analyzeAutopilotCandidate,
+	buildCodexCliSpawnArgs,
+	runCodexCliAdapter,
+	redactSensitiveText,
+	buildCodexAnalyzeInputPayload,
+	getSystemHealth,
+	getAutopilotStatus,
+	sanitizeAutopilotForStatus,
+	sanitizeCodexExecContractForStatus,
 });

@@ -1,4 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { basename, extname, isAbsolute, resolve } from "node:path";
+import { inflateRawSync } from "node:zlib";
 
 import {
 	createMcpStorage,
@@ -346,6 +349,11 @@ export interface AutopilotRunCorrelation {
 		| "persisted"
 		| "review_candidate"
 		| "not_run";
+	attempt: number | null;
+	duration_ms: number | null;
+	exit_code: number | null;
+	failure_kind: string | null;
+	fallback_used: boolean;
 }
 
 export interface AutopilotCodexStageStatus {
@@ -356,6 +364,35 @@ export interface AutopilotCodexStageStatus {
 	schema_fail: number;
 	last_failure_reason: string | null;
 	last_run_correlation: readonly AutopilotRunCorrelation[];
+}
+
+export type CodexExecAuthSource = "opencode_connected" | "env_fallback";
+
+export interface CodexExecModePolicyEntry {
+	tick_allowed: boolean;
+	write_policy: "deny_all" | "analysis_only" | "workflow_persist";
+	failure_policy:
+		| "fail_closed"
+		| "fail_open_review"
+		| "fail_closed_threshold"
+		| "fail_closed_until_resume";
+}
+
+export interface CodexExecRuntimeContract {
+	flags: {
+		codex_exec_enabled: boolean;
+		codex_exec_shadow_mode: boolean;
+		codex_exec_fallback_to_synthetic_on_error: boolean;
+		env_fallback_only_ci_headless: boolean;
+	};
+	auth_precedence: readonly CodexExecAuthSource[];
+	env_fallback_allowed_contexts: readonly ("ci" | "headless")[];
+	mode_policy_matrix: {
+		manual: CodexExecModePolicyEntry;
+		review_first: CodexExecModePolicyEntry;
+		full_auto: CodexExecModePolicyEntry;
+		degraded: CodexExecModePolicyEntry;
+	};
 }
 
 export interface AutopilotStatusOutput {
@@ -376,6 +413,7 @@ export interface AutopilotStatusOutput {
 		schema_fail: number;
 	};
 	codex_last_failure_reason?: string | null;
+	codex_exec_contract?: CodexExecRuntimeContract;
 	persistence_authority: PersistenceAuthorityPolicy;
 }
 
@@ -413,6 +451,11 @@ export interface AutopilotCandidatePayload {
 	has_attachments: boolean;
 }
 
+interface AutopilotCandidatePayloadBuildResult {
+	payload: AutopilotCandidatePayload;
+	requires_user_confirmation: boolean;
+}
+
 export interface AutopilotAnalysisProposal {
 	message_pk: string;
 	subject: string;
@@ -422,6 +465,44 @@ export interface AutopilotAnalysisProposal {
 	confidence: number;
 	todo_title: string;
 	candidate_payload: AutopilotCandidatePayload;
+}
+
+export interface DomainMirrorAnalyzeAttemptInput {
+	message: MailStoreMessage;
+	payload: AutopilotCandidatePayload;
+	attempt: number;
+	max_attempts: number;
+}
+
+export type DomainMirrorAnalyzeAttemptResult =
+	| {
+			kind: "raw_output";
+			raw_output: unknown;
+			telemetry: {
+				attempt: number;
+				duration_ms: number | null;
+				exit_code: number | null;
+				failure_kind: string | null;
+				fallback_used: boolean;
+			};
+	  }
+	| {
+			kind: "failure";
+			classification: "retriable" | "terminal";
+			message: string;
+			telemetry: {
+				attempt: number;
+				duration_ms: number | null;
+				exit_code: number | null;
+				failure_kind: string | null;
+				fallback_used: boolean;
+			};
+	  };
+
+export interface DomainMirrorAdapter {
+	analyzeAutopilotCandidateAttempt: (
+		input: DomainMirrorAnalyzeAttemptInput,
+	) => DomainMirrorAnalyzeAttemptResult;
 }
 
 export const CODEX_PROPOSAL_SCHEMA_VERSION = "codex_proposal.v1";
@@ -534,6 +615,7 @@ export interface McpCodexAuthState {
 	mode: McpCodexAuthMode;
 	api_key_env_var: string;
 	api_key_present: boolean;
+	opencode_connected_present?: boolean;
 }
 
 export interface McpAttachmentRecord {
@@ -541,6 +623,8 @@ export interface McpAttachmentRecord {
 	graph_message_id: string;
 	graph_attachment_id: string;
 	message_pk: string;
+	file_name?: string;
+	content_type?: string;
 	relative_path: string;
 	size_bytes: number;
 	sha256: string;
@@ -585,6 +669,11 @@ export interface McpRuntimeState {
 export interface McpRuntimeContext {
 	state: McpRuntimeState;
 	storage: McpStorage;
+	domainMirrorAdapter: DomainMirrorAdapter;
+}
+
+export interface CreateMcpContextOptions {
+	domainMirrorAdapter?: DomainMirrorAdapter;
 }
 
 const fallbackUrl = "http://127.0.0.1:1270/mcp/callback";
@@ -669,11 +758,13 @@ const createRuntimeState = (): McpRuntimeState => ({
 		mode: "disabled",
 		api_key_env_var: "CODEX_API_KEY",
 		api_key_present: false,
+		opencode_connected_present: false,
 	},
 });
 
 export const createMcpContext = (
 	initial?: Partial<McpRuntimeState>,
+	options: CreateMcpContextOptions = {},
 ): McpRuntimeContext => ({
 	state: {
 		...createRuntimeState(),
@@ -687,6 +778,8 @@ export const createMcpContext = (
 		const adapter = createStateStorageAdapter(state);
 		return createMcpStorage(adapter);
 	})(),
+	domainMirrorAdapter:
+		options.domainMirrorAdapter ?? DEFAULT_DOMAIN_MIRROR_ADAPTER,
 });
 
 export const resetMcpContext = (context: McpRuntimeContext): void => {
@@ -1068,6 +1161,13 @@ const hasContextSignedIn = (context: McpRuntimeContext): boolean =>
 		: false;
 
 const requireCodexAuthContext = (context: McpRuntimeContext) => {
+	if (
+		CODEX_EXEC_RUNTIME_CONTRACT.flags.codex_exec_enabled &&
+		context.state.codex_auth.opencode_connected_present
+	) {
+		return null;
+	}
+
 	if (context.state.codex_auth.mode === "disabled") {
 		return null;
 	}
@@ -1083,6 +1183,16 @@ const requireCodexAuthContext = (context: McpRuntimeContext) => {
 		return errorResponse(
 			"E_CODEX_AUTH_REQUIRED",
 			`${context.state.codex_auth.api_key_env_var} 환경변수 설정이 필요합니다.`,
+		);
+	}
+
+	if (
+		CODEX_EXEC_RUNTIME_CONTRACT.flags.codex_exec_enabled &&
+		!isEnvFallbackAllowedForRuntime()
+	) {
+		return errorResponse(
+			"E_CODEX_AUTH_REQUIRED",
+			"opencode 연결 인증이 필요합니다. env fallback 은 CI/headless 런타임에서만 허용됩니다.",
 		);
 	}
 
@@ -1712,6 +1822,123 @@ const AUTOPILOT_MAX_CONSECUTIVE_FAILURES = 3;
 const AUTOPILOT_CODEX_ANALYZE_TIMEOUT_MS = 1_500;
 const AUTOPILOT_CODEX_ANALYZE_MAX_RETRIES = 2;
 const AUTOPILOT_CODEX_STAGE_FAILURE_THRESHOLD = 2;
+const AUTOPILOT_CANDIDATE_BODY_MAX_CHARS = 2_000;
+const AUTOPILOT_CANDIDATE_BODY_WITH_ATTACHMENTS_MAX_CHARS = 4_000;
+const AUTOPILOT_ATTACHMENT_TEXT_MAX_CHARS_PER_FILE = 800;
+const AUTOPILOT_ATTACHMENT_TEXT_MAX_CHARS_TOTAL = 1_800;
+
+const SUPPORTED_TEXT_ATTACHMENT_EXTENSIONS = new Set([
+	"pdf",
+	"xlsx",
+	"xls",
+	"pptx",
+	"ppt",
+	"txt",
+	"docx",
+	"doc",
+]);
+
+const TEXT_ATTACHMENT_CONTENT_TYPES = new Set([
+	"application/pdf",
+	"text/plain",
+	"application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	"application/msword",
+	"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+	"application/vnd.ms-excel",
+	"application/vnd.openxmlformats-officedocument.presentationml.presentation",
+	"application/vnd.ms-powerpoint",
+]);
+
+const NON_TEXT_ATTACHMENT_EXTENSIONS = new Set([
+	"png",
+	"jpg",
+	"jpeg",
+	"gif",
+	"webp",
+	"bmp",
+	"svg",
+	"tif",
+	"tiff",
+	"heic",
+	"zip",
+	"rar",
+	"7z",
+	"mp3",
+	"wav",
+	"mp4",
+	"avi",
+	"mov",
+]);
+const CODEX_EXEC_RUNTIME_CONTRACT: CodexExecRuntimeContract = Object.freeze({
+	flags: Object.freeze({
+		codex_exec_enabled: false,
+		codex_exec_shadow_mode: false,
+		codex_exec_fallback_to_synthetic_on_error: true,
+		env_fallback_only_ci_headless: true,
+	}),
+	auth_precedence: Object.freeze([
+		"opencode_connected",
+		"env_fallback",
+	] as const),
+	env_fallback_allowed_contexts: Object.freeze(["ci", "headless"] as const),
+	mode_policy_matrix: Object.freeze({
+		manual: Object.freeze({
+			tick_allowed: false,
+			write_policy: "deny_all",
+			failure_policy: "fail_closed",
+		}),
+		review_first: Object.freeze({
+			tick_allowed: true,
+			write_policy: "analysis_only",
+			failure_policy: "fail_open_review",
+		}),
+		full_auto: Object.freeze({
+			tick_allowed: true,
+			write_policy: "workflow_persist",
+			failure_policy: "fail_closed_threshold",
+		}),
+		degraded: Object.freeze({
+			tick_allowed: false,
+			write_policy: "deny_all",
+			failure_policy: "fail_closed_until_resume",
+		}),
+	}),
+});
+
+const isTruthyRuntimeFlag = (value: string | undefined): boolean => {
+	if (!isNonEmptyString(value)) {
+		return false;
+	}
+	const normalized = value.trim().toLowerCase();
+	return normalized === "1" || normalized === "true" || normalized === "yes";
+};
+
+const isCiRuntime = (): boolean => isTruthyRuntimeFlag(process.env.CI);
+
+const isHeadlessRuntime = (): boolean =>
+	isTruthyRuntimeFlag(process.env.HEADLESS) ||
+	isTruthyRuntimeFlag(process.env.CODEX_HEADLESS) ||
+	isTruthyRuntimeFlag(process.env.PLAYWRIGHT_HEADLESS);
+
+const isEnvFallbackAllowedForRuntime = (): boolean =>
+	!CODEX_EXEC_RUNTIME_CONTRACT.flags.env_fallback_only_ci_headless ||
+	isCiRuntime() ||
+	isHeadlessRuntime();
+
+const resolveAutopilotModePolicy = (
+	context: McpRuntimeContext,
+): CodexExecModePolicyEntry => {
+	if (context.state.autopilot.status === "degraded") {
+		return CODEX_EXEC_RUNTIME_CONTRACT.mode_policy_matrix.degraded;
+	}
+	if (context.state.autopilot.mode === "manual") {
+		return CODEX_EXEC_RUNTIME_CONTRACT.mode_policy_matrix.manual;
+	}
+	if (context.state.autopilot.mode === "review_first") {
+		return CODEX_EXEC_RUNTIME_CONTRACT.mode_policy_matrix.review_first;
+	}
+	return CODEX_EXEC_RUNTIME_CONTRACT.mode_policy_matrix.full_auto;
+};
 
 const PHASE_1_PERSISTENCE_AUTHORITY: PersistenceAuthorityPolicy = {
 	phase: "phase_1",
@@ -1763,6 +1990,7 @@ interface AutopilotCandidateAnalysisResult {
 	payload: AutopilotCandidatePayload;
 	proposal: AutopilotAnalysisProposal | null;
 	review_reason:
+		| "attachment_requires_user_confirmation"
 		| "empty_snippet"
 		| "analysis_failed"
 		| "codex_schema_invalid"
@@ -1773,6 +2001,13 @@ interface AutopilotCandidateAnalysisResult {
 	failure_kind?: "timeout" | "schema_fail" | "analysis_fail";
 	attempt_count?: number;
 	failure_message?: string;
+	telemetry: {
+		attempt: number;
+		duration_ms: number | null;
+		exit_code: number | null;
+		failure_kind: string | null;
+		fallback_used: boolean;
+	};
 }
 
 interface CodexRetryPlan {
@@ -2188,6 +2423,41 @@ const resolveCodexAttemptFailure = (
 	};
 };
 
+const DEFAULT_DOMAIN_MIRROR_ADAPTER: DomainMirrorAdapter = {
+	analyzeAutopilotCandidateAttempt: ({ message, payload, attempt }) => {
+		const attemptFailure = resolveCodexAttemptFailure(message, attempt);
+		if (attemptFailure !== null) {
+			return {
+				kind: "failure",
+				classification: attemptFailure.classification,
+				message: attemptFailure.message,
+				telemetry: {
+					attempt,
+					duration_ms: null,
+					exit_code: null,
+					failure_kind:
+						attemptFailure.classification === "retriable"
+							? "timeout_retriable"
+							: "analysis_fail",
+					fallback_used: true,
+				},
+			};
+		}
+
+		return {
+			kind: "raw_output",
+			raw_output: resolveCodexProposalRawOutput(message, payload),
+			telemetry: {
+				attempt,
+				duration_ms: null,
+				exit_code: null,
+				failure_kind: null,
+				fallback_used: true,
+			},
+		};
+	},
+};
+
 const selectAutopilotCandidates = (
 	context: McpRuntimeContext,
 	maxMessages: number,
@@ -2202,42 +2472,438 @@ const selectAutopilotCandidates = (
 		)
 		.slice(0, maxMessages);
 
-const buildAutopilotCandidatePayload = (
+const decodeXmlEntities = (value: string): string =>
+	value
+		.replace(/&amp;/g, "&")
+		.replace(/&lt;/g, "<")
+		.replace(/&gt;/g, ">")
+		.replace(/&quot;/g, '"')
+		.replace(/&apos;/g, "'");
+
+const getAttachmentExtension = (attachment: McpAttachmentRecord): string => {
+	const candidates = [
+		attachment.file_name,
+		attachment.graph_attachment_id,
+		attachment.relative_path ? basename(attachment.relative_path) : "",
+	];
+	for (const candidate of candidates) {
+		if (!isNonEmptyString(candidate)) {
+			continue;
+		}
+		const extension = extname(candidate).replace(/^\./, "").toLowerCase();
+		if (extension.length > 0) {
+			return extension;
+		}
+	}
+	return "";
+};
+
+const resolveAttachmentFormatPolicy = (attachment: McpAttachmentRecord) => {
+	const extension = getAttachmentExtension(attachment);
+	const contentType = isNonEmptyString(attachment.content_type)
+		? attachment.content_type.trim().toLowerCase()
+		: "";
+
+	if (SUPPORTED_TEXT_ATTACHMENT_EXTENSIONS.has(extension)) {
+		return { kind: "text" as const, format: extension };
+	}
+	if (TEXT_ATTACHMENT_CONTENT_TYPES.has(contentType)) {
+		if (contentType === "application/pdf") {
+			return { kind: "text" as const, format: "pdf" };
+		}
+		if (contentType === "text/plain") {
+			return { kind: "text" as const, format: "txt" };
+		}
+		if (
+			contentType ===
+			"application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+		) {
+			return { kind: "text" as const, format: "docx" };
+		}
+		if (contentType === "application/msword") {
+			return { kind: "text" as const, format: "doc" };
+		}
+		if (
+			contentType ===
+			"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+		) {
+			return { kind: "text" as const, format: "xlsx" };
+		}
+		if (contentType === "application/vnd.ms-excel") {
+			return { kind: "text" as const, format: "xls" };
+		}
+		if (
+			contentType ===
+			"application/vnd.openxmlformats-officedocument.presentationml.presentation"
+		) {
+			return { kind: "text" as const, format: "pptx" };
+		}
+		if (contentType === "application/vnd.ms-powerpoint") {
+			return { kind: "text" as const, format: "ppt" };
+		}
+	}
+
+	if (
+		(contentType.startsWith("image/") && contentType.length > 0) ||
+		(extension.length > 0 && NON_TEXT_ATTACHMENT_EXTENSIONS.has(extension)) ||
+		(contentType.length > 0 && !TEXT_ATTACHMENT_CONTENT_TYPES.has(contentType))
+	) {
+		return {
+			kind: "requires_confirmation" as const,
+			format: extension || contentType,
+		};
+	}
+
+	return { kind: "unknown" as const, format: "" };
+};
+
+const extractPrintableText = (buffer: Buffer): string => {
+	const latin1 = buffer.toString("latin1");
+	const chunks = latin1
+		.split(/[^\x20-\x7E\u00A0-\u00FF]+/)
+		.map((chunk) => chunk.trim())
+		.filter((chunk) => chunk.length >= 3);
+	return chunks.join(" ");
+};
+
+interface ZipEntry {
+	name: string;
+	data: Buffer;
+}
+
+const parseZipEntries = (buffer: Buffer): ZipEntry[] => {
+	const eocdSignature = 0x06054b50;
+	const cdfhSignature = 0x02014b50;
+	const lfhSignature = 0x04034b50;
+	let eocdOffset = -1;
+	for (
+		let index = Math.max(0, buffer.length - 65_557);
+		index <= buffer.length - 22;
+		index += 1
+	) {
+		if (buffer.readUInt32LE(index) === eocdSignature) {
+			eocdOffset = index;
+		}
+	}
+	if (eocdOffset < 0) {
+		return [];
+	}
+
+	const centralDirectoryOffset = buffer.readUInt32LE(eocdOffset + 16);
+	const entryCount = buffer.readUInt16LE(eocdOffset + 10);
+	let cursor = centralDirectoryOffset;
+	const entries: ZipEntry[] = [];
+
+	for (let index = 0; index < entryCount; index += 1) {
+		if (cursor + 46 > buffer.length) {
+			break;
+		}
+		if (buffer.readUInt32LE(cursor) !== cdfhSignature) {
+			break;
+		}
+		const compressionMethod = buffer.readUInt16LE(cursor + 10);
+		const compressedSize = buffer.readUInt32LE(cursor + 20);
+		const fileNameLength = buffer.readUInt16LE(cursor + 28);
+		const extraLength = buffer.readUInt16LE(cursor + 30);
+		const commentLength = buffer.readUInt16LE(cursor + 32);
+		const localHeaderOffset = buffer.readUInt32LE(cursor + 42);
+		const fileName = buffer
+			.slice(cursor + 46, cursor + 46 + fileNameLength)
+			.toString("utf8");
+
+		if (localHeaderOffset + 30 > buffer.length) {
+			break;
+		}
+		if (buffer.readUInt32LE(localHeaderOffset) !== lfhSignature) {
+			break;
+		}
+		const localNameLength = buffer.readUInt16LE(localHeaderOffset + 26);
+		const localExtraLength = buffer.readUInt16LE(localHeaderOffset + 28);
+		const dataStart =
+			localHeaderOffset + 30 + localNameLength + localExtraLength;
+		const dataEnd = dataStart + compressedSize;
+		if (dataEnd > buffer.length) {
+			break;
+		}
+
+		const compressed = buffer.slice(dataStart, dataEnd);
+		if (compressionMethod === 0) {
+			entries.push({ name: fileName, data: compressed });
+		} else if (compressionMethod === 8) {
+			entries.push({ name: fileName, data: inflateRawSync(compressed) });
+		}
+
+		cursor += 46 + fileNameLength + extraLength + commentLength;
+	}
+
+	return entries;
+};
+
+const extractTextFromZipXml = (
+	buffer: Buffer,
+	entryNamePattern: RegExp,
+	tagPattern: RegExp,
+): string => {
+	const entries = parseZipEntries(buffer)
+		.filter((entry) => entryNamePattern.test(entry.name))
+		.sort((a, b) => a.name.localeCompare(b.name));
+	const chunks: string[] = [];
+	for (const entry of entries) {
+		const xml = entry.data.toString("utf8");
+		for (const match of xml.matchAll(tagPattern)) {
+			chunks.push(decodeXmlEntities(match[1] ?? ""));
+		}
+	}
+	return chunks.join(" ");
+};
+
+const extractAttachmentTextByFormat = (
+	buffer: Buffer,
+	format: string,
+): string => {
+	if (format === "txt") {
+		return buffer.toString("utf8");
+	}
+	if (format === "pdf") {
+		return extractPrintableText(buffer);
+	}
+	if (format === "docx") {
+		return extractTextFromZipXml(
+			buffer,
+			/^word\/.+\.xml$/i,
+			/<w:t[^>]*>(.*?)<\/w:t>/g,
+		);
+	}
+	if (format === "xlsx") {
+		return extractTextFromZipXml(
+			buffer,
+			/^xl\/.+\.xml$/i,
+			/<t[^>]*>(.*?)<\/t>/g,
+		);
+	}
+	if (format === "pptx") {
+		return extractTextFromZipXml(
+			buffer,
+			/^ppt\/slides\/.+\.xml$/i,
+			/<a:t[^>]*>(.*?)<\/a:t>/g,
+		);
+	}
+	if (format === "doc" || format === "xls" || format === "ppt") {
+		return extractPrintableText(buffer);
+	}
+	return "";
+};
+
+const resolveAttachmentAbsolutePath = (relativePath: string): string | null => {
+	if (!isNonEmptyString(relativePath)) {
+		return null;
+	}
+	if (isAbsolute(relativePath)) {
+		return relativePath;
+	}
+	return resolve(process.cwd(), relativePath);
+};
+
+const buildAttachmentTextContext = (
+	context: McpRuntimeContext,
 	message: MailStoreMessage,
-): AutopilotCandidatePayload => {
+) => {
+	if (!message.has_attachments) {
+		return {
+			merged_attachment_text: "",
+			requires_user_confirmation: false,
+		};
+	}
+
+	const records = Array.from(context.state.attachments.values())
+		.filter((item) => item.message_pk === message.message_pk)
+		.sort((a, b) => {
+			const aKey = [
+				a.attachment_pk,
+				a.graph_attachment_id,
+				a.sha256,
+				a.relative_path,
+			]
+				.filter((part) => typeof part === "string")
+				.join("::");
+			const bKey = [
+				b.attachment_pk,
+				b.graph_attachment_id,
+				b.sha256,
+				b.relative_path,
+			]
+				.filter((part) => typeof part === "string")
+				.join("::");
+			return aKey.localeCompare(bKey);
+		});
+
+	const mergedParts: string[] = [];
+	let totalChars = 0;
+	for (const attachment of records) {
+		const policy = resolveAttachmentFormatPolicy(attachment);
+		if (policy.kind === "requires_confirmation") {
+			return {
+				merged_attachment_text: "",
+				requires_user_confirmation: true,
+			};
+		}
+		if (policy.kind !== "text") {
+			continue;
+		}
+
+		try {
+			const absolutePath = resolveAttachmentAbsolutePath(
+				attachment.relative_path,
+			);
+			if (!isNonEmptyString(absolutePath)) {
+				continue;
+			}
+			const raw = readFileSync(absolutePath);
+			const normalized = normalizeFingerprintBody(
+				extractAttachmentTextByFormat(raw, policy.format),
+			).slice(0, AUTOPILOT_ATTACHMENT_TEXT_MAX_CHARS_PER_FILE);
+			if (!isNonEmptyString(normalized)) {
+				continue;
+			}
+			if (totalChars >= AUTOPILOT_ATTACHMENT_TEXT_MAX_CHARS_TOTAL) {
+				break;
+			}
+			const remaining = AUTOPILOT_ATTACHMENT_TEXT_MAX_CHARS_TOTAL - totalChars;
+			const text = normalized.slice(0, remaining);
+			const label = isNonEmptyString(attachment.file_name)
+				? attachment.file_name
+				: isNonEmptyString(attachment.graph_attachment_id)
+					? attachment.graph_attachment_id
+					: attachment.attachment_pk;
+			mergedParts.push(`[attachment:${label}] ${text}`);
+			totalChars += text.length;
+		} catch {}
+	}
+
+	return {
+		merged_attachment_text: mergedParts.join("\n"),
+		requires_user_confirmation: false,
+	};
+};
+
+const buildAutopilotCandidatePayload = (
+	context: McpRuntimeContext,
+	message: MailStoreMessage,
+): AutopilotCandidatePayloadBuildResult => {
 	const subject = isNonEmptyString(message.subject)
 		? message.subject.trim()
 		: "무제 메일";
 	const from = isNonEmptyString(message.from) ? message.from.trim() : "unknown";
-	const normalizedBody = normalizeFingerprintBody(
+	const baseBodyText = normalizeFingerprintBody(
 		isNonEmptyString(message.body_text) ? message.body_text : subject,
-	).slice(0, 2000);
+	).slice(0, AUTOPILOT_CANDIDATE_BODY_MAX_CHARS);
+	const attachmentTextContext = buildAttachmentTextContext(context, message);
 	const internetMessageId = isNonEmptyString(message.internet_message_id)
 		? message.internet_message_id.trim().toLowerCase()
 		: "";
+	const mergedBodyText = isNonEmptyString(
+		attachmentTextContext.merged_attachment_text,
+	)
+		? `${baseBodyText}\n\n[attachments]\n${attachmentTextContext.merged_attachment_text}`.slice(
+				0,
+				AUTOPILOT_CANDIDATE_BODY_WITH_ATTACHMENTS_MAX_CHARS,
+			)
+		: baseBodyText;
 
 	return {
-		message_pk: message.message_pk,
-		internet_message_id: internetMessageId,
-		received_at: message.received_at,
-		subject,
-		from,
-		body_text: normalizedBody,
-		has_attachments: message.has_attachments,
+		payload: {
+			message_pk: message.message_pk,
+			internet_message_id: internetMessageId,
+			received_at: message.received_at,
+			subject,
+			from,
+			body_text: mergedBodyText,
+			has_attachments: message.has_attachments,
+		},
+		requires_user_confirmation:
+			attachmentTextContext.requires_user_confirmation,
 	};
 };
 
+const createDefaultRunCorrelationTelemetry = () => ({
+	attempt: null,
+	duration_ms: null,
+	exit_code: null,
+	failure_kind: null,
+	fallback_used: true,
+});
+
+const buildCorrelationTelemetryFromCandidate = (
+	telemetry: {
+		attempt: number;
+		duration_ms: number | null;
+		exit_code: number | null;
+		failure_kind: string | null;
+		fallback_used: boolean;
+	},
+	overrides: Partial<{
+		failure_kind: string | null;
+	}> = {},
+) => ({
+	attempt: telemetry.attempt,
+	duration_ms: telemetry.duration_ms,
+	exit_code: telemetry.exit_code,
+	failure_kind:
+		overrides.failure_kind !== undefined
+			? overrides.failure_kind
+			: telemetry.failure_kind,
+	fallback_used: telemetry.fallback_used,
+});
+
 const analyzeAutopilotCandidate = (
+	context: McpRuntimeContext,
 	message: MailStoreMessage,
+	domainMirrorAdapter: DomainMirrorAdapter,
 ): AutopilotCandidateAnalysisResult => {
-	const payload = buildAutopilotCandidatePayload(message);
+	const payloadResult = buildAutopilotCandidatePayload(context, message);
+	const payload = payloadResult.payload;
+	if (payloadResult.requires_user_confirmation) {
+		return {
+			message,
+			payload,
+			proposal: null,
+			review_reason: "attachment_requires_user_confirmation",
+			attempt_count: 0,
+			telemetry: {
+				attempt: 0,
+				duration_ms: null,
+				exit_code: null,
+				failure_kind: null,
+				fallback_used: true,
+			},
+		};
+	}
 	const maxAttempts = AUTOPILOT_CODEX_ANALYZE_MAX_RETRIES + 1;
 	let exhaustedRetriableMessage: string | null = null;
+	let lastAttemptTelemetry: {
+		attempt: number;
+		duration_ms: number | null;
+		exit_code: number | null;
+		failure_kind: string | null;
+		fallback_used: boolean;
+	} = {
+		attempt: 1,
+		duration_ms: null,
+		exit_code: null,
+		failure_kind: null,
+		fallback_used: true,
+	};
 	for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-		const attemptFailure = resolveCodexAttemptFailure(message, attempt);
-		if (attemptFailure !== null) {
-			if (attemptFailure.classification === "retriable") {
-				exhaustedRetriableMessage = attemptFailure.message;
+		const attemptResult = domainMirrorAdapter.analyzeAutopilotCandidateAttempt({
+			message,
+			payload,
+			attempt,
+			max_attempts: maxAttempts,
+		});
+		lastAttemptTelemetry = attemptResult.telemetry;
+		if (attemptResult.kind === "failure") {
+			if (attemptResult.classification === "retriable") {
+				exhaustedRetriableMessage = attemptResult.message;
 				if (attempt < maxAttempts) {
 					continue;
 				}
@@ -2252,12 +2918,15 @@ const analyzeAutopilotCandidate = (
 				failure_class: "terminal",
 				failure_kind: "analysis_fail",
 				attempt_count: attempt,
-				failure_message: attemptFailure.message,
+				failure_message: attemptResult.message,
+				telemetry: buildCorrelationTelemetryFromCandidate(
+					attemptResult.telemetry,
+					{ failure_kind: "analysis_fail" },
+				),
 			};
 		}
 
-		const rawCodexOutput = resolveCodexProposalRawOutput(message, payload);
-		const parsedProposal = parseCodexProposalOutput(rawCodexOutput);
+		const parsedProposal = parseCodexProposalOutput(attemptResult.raw_output);
 		if (!parsedProposal.ok) {
 			return {
 				message,
@@ -2268,6 +2937,10 @@ const analyzeAutopilotCandidate = (
 				failure_class: "terminal",
 				failure_kind: "schema_fail",
 				attempt_count: attempt,
+				telemetry: buildCorrelationTelemetryFromCandidate(
+					attemptResult.telemetry,
+					{ failure_kind: "schema_fail" },
+				),
 			};
 		}
 
@@ -2286,6 +2959,9 @@ const analyzeAutopilotCandidate = (
 			},
 			review_reason: null,
 			attempt_count: attempt,
+			telemetry: buildCorrelationTelemetryFromCandidate(
+				attemptResult.telemetry,
+			),
 		};
 	}
 
@@ -2300,22 +2976,34 @@ const analyzeAutopilotCandidate = (
 		failure_message: `${
 			exhaustedRetriableMessage ?? "codex 분석 재시도 한도를 초과했습니다."
 		} (attempts=${maxAttempts}/${maxAttempts})`,
+		telemetry: buildCorrelationTelemetryFromCandidate(lastAttemptTelemetry, {
+			failure_kind: "timeout",
+		}),
 	};
 };
 
 const analyzeAutopilotCandidates = (
+	context: McpRuntimeContext,
 	candidates: readonly MailStoreMessage[],
+	domainMirrorAdapter: DomainMirrorAdapter,
 ): AutopilotCandidateAnalysisResult[] =>
 	candidates.map((message) => {
 		try {
-			return analyzeAutopilotCandidate(message);
+			return analyzeAutopilotCandidate(context, message, domainMirrorAdapter);
 		} catch {
 			return {
 				message,
-				payload: buildAutopilotCandidatePayload(message),
+				payload: buildAutopilotCandidatePayload(context, message).payload,
 				proposal: null,
 				review_reason: "analysis_failed",
 				failure_kind: "analysis_fail",
+				telemetry: {
+					attempt: 1,
+					duration_ms: null,
+					exit_code: null,
+					failure_kind: "analysis_fail",
+					fallback_used: true,
+				},
 			};
 		}
 	});
@@ -2641,6 +3329,7 @@ const handleAutopilotStatus = (
 		metrics: context.state.autopilot.metrics,
 		codex_stage: context.state.autopilot.codex_stage,
 		...buildCodexStageObservability(context),
+		codex_exec_contract: CODEX_EXEC_RUNTIME_CONTRACT,
 		persistence_authority: PHASE_1_PERSISTENCE_AUTHORITY,
 	});
 
@@ -2648,13 +3337,17 @@ const handleAutopilotTick = (
 	context: McpRuntimeContext,
 	input: AutopilotTickInput,
 ) => {
-	if (context.state.autopilot.mode === "manual") {
+	const modePolicy = resolveAutopilotModePolicy(context);
+	if (!modePolicy.tick_allowed && context.state.autopilot.mode === "manual") {
 		return errorResponse(
 			"E_POLICY_DENIED",
 			"manual 모드입니다. autopilot.set_mode 도구를 먼저 실행하세요.",
 		);
 	}
-	if (context.state.autopilot.status === "degraded") {
+	if (
+		!modePolicy.tick_allowed &&
+		context.state.autopilot.status === "degraded"
+	) {
 		return errorResponse(
 			"E_POLICY_DENIED",
 			`autopilot 이 성능 저하(degraded) 상태입니다. ${context.state.autopilot.last_error ?? "복구 후 재개(resume)하세요."}`,
@@ -2708,17 +3401,29 @@ const handleAutopilotTick = (
 			candidate_stage: "selected",
 			analysis_stage: "review",
 			persistence_stage: "not_run",
+			...createDefaultRunCorrelationTelemetry(),
 		}),
 	);
 	const runCorrelationByMessagePk = new Map(
 		runCorrelation.map((item) => [item.message_pk, item]),
 	);
 	context.state.autopilot.metrics.codex_stage_started += candidates.length;
-	const analyzedCandidates = analyzeAutopilotCandidates(candidates);
+	const analyzedCandidates = analyzeAutopilotCandidates(
+		context,
+		candidates,
+		context.domainMirrorAdapter ?? DEFAULT_DOMAIN_MIRROR_ADAPTER,
+	);
 	for (const analyzed of analyzedCandidates) {
 		const correlation = runCorrelationByMessagePk.get(
 			analyzed.message.message_pk,
 		);
+		if (correlation) {
+			correlation.attempt = analyzed.telemetry.attempt;
+			correlation.duration_ms = analyzed.telemetry.duration_ms;
+			correlation.exit_code = analyzed.telemetry.exit_code;
+			correlation.failure_kind = analyzed.telemetry.failure_kind;
+			correlation.fallback_used = analyzed.telemetry.fallback_used;
+		}
 		if (analyzed.proposal !== null) {
 			context.state.autopilot.metrics.codex_stage_success += 1;
 			if (correlation) {
