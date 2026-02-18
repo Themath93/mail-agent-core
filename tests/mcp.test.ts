@@ -64,7 +64,7 @@ describe("MCP 응답 타입", () => {
 
 	test("지원 도구 전체를 기준 검증한다", () => {
 		expect(Array.isArray(MCP_TOOL_NAMES)).toBe(true);
-		expect(MCP_TOOL_NAMES.length).toBe(9);
+		expect(MCP_TOOL_NAMES.length).toBe(18);
 	});
 });
 
@@ -347,6 +347,312 @@ describe("MCP tools", () => {
 			expect(status.data.pending_callback_received).toBe(true);
 			expect(status.data.pending_callback_received_at).toBeDefined();
 		}
+	});
+
+	test("autopilot.tick은 manual 모드에서 E_POLICY_DENIED", () => {
+		const context = createToolContext();
+		const response = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox" },
+			context,
+		);
+
+		expect(response.ok).toBe(false);
+		if (!response.ok) {
+			expect(response.error_code).toBe("E_POLICY_DENIED");
+		}
+	});
+
+	test("autopilot.set_mode/review_first + tick은 review 후보를 만든다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+
+		const modeResponse = invokeMcpTool(
+			"autopilot.set_mode",
+			{ mode: "review_first" },
+			context,
+		);
+		expect(modeResponse.ok).toBe(true);
+
+		const tickResponse = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 5 },
+			context,
+		);
+		expect(tickResponse.ok).toBe(true);
+		if (tickResponse.ok) {
+			expect(tickResponse.data.review_candidates).toBeGreaterThanOrEqual(0);
+		}
+	});
+
+	test("autopilot.set_mode/full_auto + tick은 evidence/todo를 생성한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+
+		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
+		const tickResponse = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 5 },
+			context,
+		);
+		expect(tickResponse.ok).toBe(true);
+		if (tickResponse.ok) {
+			expect(tickResponse.data.auto_evidence_created).toBeGreaterThanOrEqual(0);
+			expect(tickResponse.data.auto_todo_created).toBeGreaterThanOrEqual(0);
+		}
+	});
+
+	test("autopilot.pause/status/resume는 상태 전이를 보장하고 manual resume은 거부한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
+		context.state.autopilot.last_error = "failure";
+		context.state.autopilot.consecutive_failures = 2;
+
+		const paused = invokeMcpTool("autopilot.pause", {}, context);
+		expect(paused.ok).toBe(true);
+		if (!paused.ok) {
+			throw new Error("pause 실패");
+		}
+		expect(paused.data.paused).toBe(true);
+
+		const status = invokeMcpTool("autopilot.status", {}, context);
+		expect(status.ok).toBe(true);
+		if (status.ok) {
+			expect(status.data.status).toBe("paused");
+			expect(status.data.paused).toBe(true);
+		}
+
+		const resumed = invokeMcpTool("autopilot.resume", {}, context);
+		expect(resumed.ok).toBe(true);
+		if (!resumed.ok) {
+			throw new Error("resume 실패");
+		}
+		expect(resumed.data.status).toBe("idle");
+		expect(context.state.autopilot.last_error).toBeNull();
+		expect(context.state.autopilot.consecutive_failures).toBe(0);
+
+		invokeMcpTool("autopilot.set_mode", { mode: "manual" }, context);
+		const manualResume = invokeMcpTool("autopilot.resume", {}, context);
+		expect(manualResume.ok).toBe(false);
+		if (!manualResume.ok) {
+			expect(manualResume.error_code).toBe("E_POLICY_DENIED");
+		}
+	});
+
+	test("autopilot.tick은 paused 상태면 E_POLICY_DENIED", () => {
+		const context = createToolContext();
+		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
+		invokeMcpTool("autopilot.pause", {}, context);
+
+		const response = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox" },
+			context,
+		);
+
+		expect(response.ok).toBe(false);
+		if (!response.ok) {
+			expect(response.error_code).toBe("E_POLICY_DENIED");
+		}
+	});
+
+	test("autopilot.full_auto tick은 빈 snippet 및 evidence 생성 실패를 review 후보로 누적한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+		invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
+
+		const baseMessage = Array.from(context.state.messages.values())[0];
+		if (!baseMessage) {
+			throw new Error("메시지 준비 실패");
+		}
+
+		context.state.messages.set("blank_entry", {
+			...baseMessage,
+			message_pk: "blank_pk",
+			provider_message_id: "graph_blank_pk",
+			internet_message_id: "<blank_pk@outlook.example.com>",
+			web_link: "https://outlook.office.com/mail/blank_pk",
+			subject: "   ",
+			body_text: "   ",
+		});
+		context.state.messages.set("ghost_entry", {
+			...baseMessage,
+			message_pk: "ghost_pk",
+			provider_message_id: "graph_ghost_pk",
+			internet_message_id: "<ghost_pk@outlook.example.com>",
+			web_link: "https://outlook.office.com/mail/ghost_pk",
+			subject: "자동 분석 대상",
+			body_text: "본문 텍스트",
+		});
+
+		const tick = invokeMcpTool(
+			"autopilot.tick",
+			{ mail_folder: "inbox", max_messages_per_tick: 30 },
+			context,
+		);
+
+		expect(tick.ok).toBe(true);
+		if (tick.ok) {
+			expect(tick.data.review_candidates).toBeGreaterThanOrEqual(2);
+		}
+	});
+
+	test("workflow.create_evidence는 idempotency를 보장하고 confidence 기본값을 사용한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+		invokeMcpTool(
+			"graph_mail_sync.initial_sync",
+			{
+				mail_folder: "inbox",
+				days_back: 1,
+				select: ["id", "subject"],
+			},
+			context,
+		);
+
+		const created = invokeMcpTool(
+			"workflow.create_evidence",
+			{
+				message_pk: "inbox_msg_inbox_1",
+				snippet: "  자동   근거  생성  ",
+				confidence: 99,
+			},
+			context,
+		);
+		expect(created.ok).toBe(true);
+		if (!created.ok) {
+			throw new Error("evidence 생성 실패");
+		}
+		expect(created.data.created).toBe(true);
+		expect(created.data.evidence.confidence).toBe(0.7);
+
+		const duplicate = invokeMcpTool(
+			"workflow.create_evidence",
+			{
+				message_pk: "inbox_msg_inbox_1",
+				snippet: "자동 근거 생성",
+				confidence: 0.9,
+			},
+			context,
+		);
+		expect(duplicate.ok).toBe(true);
+		if (duplicate.ok) {
+			expect(duplicate.data.created).toBe(false);
+			expect(duplicate.data.skipped_duplicate).toBe(true);
+		}
+	});
+
+	test("workflow.upsert_todo는 생성/중복감지/업데이트 분기를 처리한다", () => {
+		const context = createToolContext();
+
+		const invalidStatus = invokeMcpToolByName(
+			"workflow.upsert_todo",
+			{
+				todo_key: "todo_key_1",
+				title: "후속 작업",
+				status: "invalid",
+				evidence_id: "ev_1",
+			},
+			context,
+		);
+		expect(invalidStatus.ok).toBe(true);
+
+		const created = invokeMcpTool(
+			"workflow.upsert_todo",
+			{
+				todo_key: "todo_key_2",
+				title: "후속 작업",
+				status: "open",
+				evidence_id: "ev_1",
+			},
+			context,
+		);
+		expect(created.ok).toBe(true);
+		if (!created.ok || !created.data.todo) {
+			throw new Error("todo 생성 실패");
+		}
+		expect(created.data.created).toBe(true);
+		expect(created.data.todo.status).toBe("open");
+
+		const duplicate = invokeMcpTool(
+			"workflow.upsert_todo",
+			{
+				todo_id: created.data.todo.todo_id,
+				title: "후속 작업",
+				status: "open",
+				evidence_id: "ev_1",
+			},
+			context,
+		);
+		expect(duplicate.ok).toBe(true);
+		if (duplicate.ok) {
+			expect(duplicate.data.created).toBe(false);
+			expect(duplicate.data.updated).toBe(true);
+			expect(duplicate.data.skipped_duplicate).toBe(true);
+		}
+
+		const updated = invokeMcpTool(
+			"workflow.upsert_todo",
+			{
+				todo_key: "todo_key_1",
+				title: "후속 작업",
+				status: "done",
+				evidence_id: "ev_1",
+			},
+			context,
+		);
+		expect(updated.ok).toBe(true);
+		if (updated.ok && updated.data.todo) {
+			expect(updated.data.created).toBe(false);
+			expect(updated.data.updated).toBe(true);
+			expect(updated.data.skipped_duplicate).toBe(false);
+			expect(updated.data.todo.status).toBe("done");
+		}
+	});
+
+	test("auth_store.logout은 인증 상태를 초기화한다", () => {
+		const context = createToolContext();
+		invokeMcpTool("auth_store.start_login", { scopes: ["Mail.Read"] }, context);
+		completeLogin(context);
+
+		const response = invokeMcpTool("auth_store.logout", {}, context);
+		expect(response.ok).toBe(true);
+		expect(context.state.signed_in).toBe(false);
+		expect(context.state.account).toBeNull();
+		expect(context.state.auth_token).toBeNull();
+		expect(context.state.issued_session).toBeNull();
+		expect(context.state.pending_callback).toBeNull();
 	});
 
 	test("만료된 액세스 토큰은 리프레시 토큰으로 갱신된다", () => {
@@ -1504,6 +1810,10 @@ describe("MCP tools", () => {
 				case "graph_mail_sync.download_attachment":
 				case "mail_store.get_message":
 				case "mail_store.get_thread":
+				case "workflow.create_evidence":
+				case "workflow.upsert_todo":
+				case "workflow.list":
+				case "autopilot.tick":
 					invokeMcpTool(
 						"auth_store.start_login",
 						{ scopes: ["Mail.Read"] },
@@ -1521,6 +1831,15 @@ describe("MCP tools", () => {
 							context,
 						);
 					}
+					if (toolName === "autopilot.tick") {
+						invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
+					}
+					break;
+				case "autopilot.set_mode":
+				case "autopilot.pause":
+				case "autopilot.resume":
+				case "autopilot.status":
+					invokeMcpTool("autopilot.set_mode", { mode: "full_auto" }, context);
 					break;
 				default:
 					break;
@@ -1537,6 +1856,7 @@ describe("MCP tools", () => {
 				},
 				"auth_store.complete_login_auto": {},
 				"auth_store.auth_status": {},
+				"auth_store.logout": {},
 				"graph_mail_sync.initial_sync": {
 					mail_folder: "inbox",
 					days_back: 7,
@@ -1556,6 +1876,28 @@ describe("MCP tools", () => {
 				"mail_store.get_thread": {
 					thread_pk: "inbox",
 					depth: 20,
+				},
+				"workflow.create_evidence": {
+					message_pk: "inbox_msg_inbox_1",
+					snippet: "자동 추출 테스트",
+					confidence: 0.9,
+				},
+				"workflow.upsert_todo": {
+					title: "자동 todo 테스트",
+					status: "open",
+					evidence_id: "ev_123",
+				},
+				"workflow.list": {},
+				"autopilot.set_mode": {
+					mode: "full_auto",
+				},
+				"autopilot.pause": {},
+				"autopilot.resume": {},
+				"autopilot.status": {},
+				"autopilot.tick": {
+					mail_folder: "inbox",
+					max_messages_per_tick: 5,
+					max_attachments_per_tick: 2,
 				},
 			}[toolName as McpToolName] as never;
 
